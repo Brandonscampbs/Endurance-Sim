@@ -55,6 +55,7 @@ tire:
   tir_file: "Real-Car-Data-And-Stats/Tire Models from TTC/Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir"
   static_camber_front_deg: -1.25
   static_camber_rear_deg: -1.25
+  grip_scale: 0.4643  # TTC-to-car calibration from Michigan 2025 endurance telemetry
 
 suspension:
   roll_stiffness_front_nm_per_deg: 238.0
