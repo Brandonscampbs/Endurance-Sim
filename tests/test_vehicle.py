@@ -175,3 +175,30 @@ class TestVehicleConfigOptionalFields:
         config = VehicleConfig.from_yaml(tmp_path / "cfg.yaml")
         assert config.tire is not None and config.tire.tir_file == "path/to/tire.tir"
         assert config.suspension is not None and config.suspension.front_track_mm == 1194.0
+
+
+class TestCT16EVTireSuspensionLoading:
+    def test_ct16ev_tire_config_loaded(self, ct16ev_config_path):
+        config = VehicleConfig.from_yaml(ct16ev_config_path)
+        assert config.tire is not None
+        assert config.tire.tir_file == (
+            "Real-Car-Data-And-Stats/Tire Models from TTC/"
+            "Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir"
+        )
+        assert config.tire.static_camber_front_deg == -1.25
+
+    def test_ct16ev_suspension_config_loaded(self, ct16ev_config_path):
+        config = VehicleConfig.from_yaml(ct16ev_config_path)
+        assert config.suspension is not None
+        assert config.suspension.roll_stiffness_front_nm_per_deg == 238.0
+        assert config.suspension.front_track_mm == 1194.0
+
+
+class TestInitExports:
+    def test_tire_config_importable(self):
+        from fsae_sim.vehicle import TireConfig
+        assert TireConfig is not None
+
+    def test_suspension_config_importable(self):
+        from fsae_sim.vehicle import SuspensionConfig
+        assert SuspensionConfig is not None

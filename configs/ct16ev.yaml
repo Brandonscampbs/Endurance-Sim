@@ -1,22 +1,23 @@
 name: CT-16EV
 year: 2025
-description: "2025 competition car - Michigan Endurance"
+description: "2025 competition car - Michigan Endurance (DSS #301)"
 
 vehicle:
-  mass_kg: 270.0
-  frontal_area_m2: 1.2
-  drag_coefficient: 0.5
+  mass_kg: 278.0  # DSS: 210 kg car + 68 kg driver
+  frontal_area_m2: 1.0  # DSS reference area
+  drag_coefficient: 1.502  # DSS: CdA=1.502 from 431N drag at 80 kph
   rolling_resistance: 0.015
-  wheelbase_m: 1.53
+  wheelbase_m: 1.549  # DSS: 1549 mm
+  downforce_coefficient: 2.18  # DSS: ClA=2.18 m² (625N at 80 kph)
 
 powertrain:
-  motor_speed_max_rpm: 2900
-  brake_speed_rpm: 2400
-  torque_limit_inverter_nm: 85.0
+  motor_speed_max_rpm: 2900  # Inverter setting (EMRAX 228 capable of 6500)
+  brake_speed_rpm: 2400  # Inverter field-weakening onset
+  torque_limit_inverter_nm: 85.0  # IQ=170A setting
   torque_limit_lvcu_nm: 150.0
   iq_limit_a: 170.0
   id_limit_a: 30.0
-  gear_ratio: 3.5
+  gear_ratio: 3.818  # DSS: final drive ratio
   drivetrain_efficiency: 0.92
 
 battery:
@@ -25,7 +26,7 @@ battery:
     series: 110
     parallel: 4
   cell_voltage_min_v: 2.55
-  cell_voltage_max_v: 4.195
+  cell_voltage_max_v: 4.20  # DSS: 4.2V fully charged
   discharged_soc_pct: 2.0
   soc_taper:
     threshold_pct: 85.0
@@ -47,3 +48,18 @@ battery:
       max_current_a: 35.0
     - temp_c: 65.0
       max_current_a: 0.0
+
+tire:
+  tir_file: "Real-Car-Data-And-Stats/Tire Models from TTC/Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir"
+  static_camber_front_deg: -1.25
+  static_camber_rear_deg: -1.25
+
+suspension:
+  roll_stiffness_front_nm_per_deg: 238.0
+  roll_stiffness_rear_nm_per_deg: 258.0
+  roll_center_height_front_mm: 88.9
+  roll_center_height_rear_mm: 63.5
+  roll_camber_front_deg_per_deg: -0.5
+  roll_camber_rear_deg_per_deg: -0.554
+  front_track_mm: 1194.0
+  rear_track_mm: 1168.0
