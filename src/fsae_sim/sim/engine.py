@@ -73,6 +73,8 @@ class SimulationEngine:
 
         if _HAS_TIRE_MODELS and tire_cfg is not None and susp_cfg is not None:
             tire_model = PacejkaTireModel(tire_cfg.tir_file)
+            if tire_cfg.grip_scale != 1.0:
+                tire_model.apply_grip_scale(tire_cfg.grip_scale)
             load_transfer = LoadTransferModel(vehicle.vehicle, susp_cfg)
             cornering_solver = CorneringSolver(
                 tire_model,

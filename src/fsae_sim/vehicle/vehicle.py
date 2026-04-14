@@ -29,6 +29,7 @@ class TireConfig:
     tir_file: str
     static_camber_front_deg: float
     static_camber_rear_deg: float
+    grip_scale: float = 1.0  # TTC-to-car grip calibration factor
 
 
 @dataclass(frozen=True)
