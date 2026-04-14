@@ -171,14 +171,26 @@ class VehicleDynamics:
         if normal_load < 1.0 or f_lat_needed < 1.0:
             return 0.0
 
-        peak_fy = self.tire_model.peak_lateral_force(normal_load)
-        if f_lat_needed >= peak_fy:
-            # Tire is saturated — find the slip angle at peak Fy
+        # Use pi/2 as the upper search bound, consistent with peak_lateral_force.
+        _ALPHA_MAX = math.pi / 2.0
+
+        # Pacejka models can produce a small non-zero Fy at alpha=0 due to
+        # residual camber/alignment effects.  When f_lat_needed is less than
+        # that residual, both bracket endpoints have the same sign and brentq
+        # would raise.  The demanded lateral force is already met at zero slip.
+        fy_at_zero = abs(self.tire_model.lateral_force(0.0, normal_load))
+        if f_lat_needed <= fy_at_zero:
+            return 0.0
+
+        # When demand exceeds what the tire can produce within [0, _ALPHA_MAX],
+        # the tire is saturated — return the slip angle at the bracket ceiling.
+        fy_at_max = abs(self.tire_model.lateral_force(_ALPHA_MAX, normal_load))
+        if f_lat_needed >= fy_at_max:
             result = minimize_scalar(
                 lambda a: -abs(
                     self.tire_model.lateral_force(a, normal_load)
                 ),
-                bounds=(0.001, math.pi / 4.0),
+                bounds=(0.001, _ALPHA_MAX),
                 method="bounded",
             )
             return abs(result.x)
@@ -189,7 +201,7 @@ class VehicleDynamics:
                 self.tire_model.lateral_force(a, normal_load)
             ) - f_lat_needed,
             0.0,
-            math.pi / 4.0,
+            _ALPHA_MAX,
             xtol=1e-4,
         )
 

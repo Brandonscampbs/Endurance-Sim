@@ -255,3 +255,43 @@ class TestTractionClamping:
         throttle_mask = result.states["action"] == "throttle"
         if throttle_mask.any():
             assert result.states.loc[throttle_mask, "drive_force_n"].max() <= 200.01
+
+
+class TestCorneringDragIntegration:
+    """Verify engine passes curvature to total_resistance."""
+
+    def test_corner_segments_have_higher_resistance(
+        self, vehicle_config, battery_model,
+    ):
+        """A track with corners should produce higher resistance than all-straight."""
+        straight_track = Track(
+            name="straight",
+            segments=[
+                Segment(i, i * 50.0, 50.0, curvature=0.0, grade=0.0)
+                for i in range(10)
+            ],
+        )
+        curvy_track = Track(
+            name="curvy",
+            segments=[
+                Segment(i, i * 50.0, 50.0, curvature=0.04, grade=0.0)
+                for i in range(10)
+            ],
+        )
+        strategy = FullThrottleStrategy()
+        engine_straight = SimulationEngine(
+            vehicle_config, straight_track, strategy, battery_model,
+        )
+        engine_curvy = SimulationEngine(
+            vehicle_config, curvy_track, strategy, battery_model,
+        )
+        r_straight = engine_straight.run(num_laps=1)
+        r_curvy = engine_curvy.run(num_laps=1)
+
+        # Curvy track should consume more energy (higher resistance)
+        assert r_curvy.total_energy_kwh > r_straight.total_energy_kwh
+        # Curvy track resistance column should show higher values
+        assert (
+            r_curvy.states["resistance_force_n"].mean()
+            > r_straight.states["resistance_force_n"].mean()
+        )
