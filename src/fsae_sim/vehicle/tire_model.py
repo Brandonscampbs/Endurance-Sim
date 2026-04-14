@@ -203,7 +203,8 @@ class PacejkaTireModel:
         pky3 = self._lat("PKY3")
 
         pky1_fz0 = pky1 * fz0
-        sin_arg = pky2 * math.atan(fz / pky1_fz0) if abs(pky1_fz0) > 1e-9 else 0.0
+        pky2_fz0 = pky2 * fz0
+        sin_arg = 2.0 * math.atan(fz / pky2_fz0) if abs(pky2_fz0) > 1e-9 else 0.0
         kya = (
             pky1_fz0
             * math.sin(sin_arg)
@@ -306,7 +307,8 @@ class PacejkaTireModel:
         pky2 = self._lat("PKY2")
         pky3 = self._lat("PKY3")
         pky1_fz0 = pky1 * fz0
-        sin_arg = pky2 * math.atan(fz / pky1_fz0) if abs(pky1_fz0) > 1e-9 else 0.0
+        pky2_fz0 = pky2 * fz0
+        sin_arg = 2.0 * math.atan(fz / pky2_fz0) if abs(pky2_fz0) > 1e-9 else 0.0
         kx = abs(
             pky1_fz0
             * math.sin(sin_arg)

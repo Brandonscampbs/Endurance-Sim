@@ -179,7 +179,7 @@ class SimulationEngine:
                     motor_rpm = self.powertrain.motor_rpm_from_speed(avg_speed)
 
                     # Resistance forces (for logging)
-                    resist_f = self.dynamics.total_resistance(avg_speed, segment.grade)
+                    resist_f = self.dynamics.total_resistance(avg_speed, segment.grade, segment.curvature)
                     drive_f = self.powertrain.wheel_force(motor_torque) if motor_torque > 0 else 0.0
                     regen_f = 0.0
                     net_force = drive_f - resist_f
@@ -208,7 +208,7 @@ class SimulationEngine:
                         regen_f = 0.0
 
                     # 4. Resistive forces
-                    resist_f = self.dynamics.total_resistance(speed, segment.grade)
+                    resist_f = self.dynamics.total_resistance(speed, segment.grade, segment.curvature)
 
                     # 5. Net force and speed resolution
                     net_force = drive_f + regen_f - resist_f
@@ -225,7 +225,7 @@ class SimulationEngine:
                         motor_torque = cmd.throttle_pct * max_torque
                     elif cmd.action == ControlAction.BRAKE:
                         max_torque = self.powertrain.max_motor_torque(motor_rpm)
-                        motor_torque = -cmd.brake_pct * max_torque * self.powertrain._REGEN_EFFICIENCY_FACTOR
+                        motor_torque = -cmd.brake_pct * max_torque
                     else:
                         motor_torque = 0.0
 

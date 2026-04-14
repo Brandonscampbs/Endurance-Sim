@@ -9,6 +9,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from scipy.optimize import brentq, minimize_scalar
+
 from fsae_sim.vehicle.vehicle import VehicleParams
 
 if TYPE_CHECKING:
@@ -104,12 +106,151 @@ class VehicleDynamics:
         angle = math.atan(grade)
         return self.vehicle.mass_kg * self.GRAVITY_M_S2 * math.sin(angle)
 
-    def total_resistance(self, speed_ms: float, grade: float = 0.0) -> float:
-        """Sum of all resistance forces (N) at given speed and grade."""
+    def cornering_drag(self, speed_ms: float, curvature: float) -> float:
+        """Drag force (N) from tire slip angles during cornering.
+
+        When the car corners, tires operate at slip angles that create a
+        longitudinal drag component. Uses the Pacejka tire model when
+        available, otherwise falls back to a small-angle analytical
+        approximation.
+
+        Args:
+            speed_ms: Vehicle speed (m/s).
+            curvature: Path curvature (1/m). 0 = straight.
+
+        Returns:
+            Cornering drag force (N), always >= 0.
+        """
+        if abs(curvature) < 1e-6 or speed_ms < 0.5:
+            return 0.0
+
+        # Total lateral force needed for the turn
+        f_lat_total = self.vehicle.mass_kg * speed_ms ** 2 * abs(curvature)
+
+        if (
+            self.tire_model is not None
+            and self.load_transfer is not None
+        ):
+            return self._cornering_drag_pacejka(speed_ms, curvature, f_lat_total)
+
+        return self._cornering_drag_analytical(f_lat_total)
+
+    def _cornering_drag_analytical(self, f_lat_total: float) -> float:
+        """Analytical cornering drag using small-angle approximation.
+
+        Assumes linear tire: Fy = C_alpha * alpha, so alpha = Fy/C_alpha,
+        and drag = Fy * sin(alpha) ~ Fy * alpha = Fy^2 / C_alpha.
+
+        C_alpha estimated from peak grip (mu=1.5) and typical FSAE peak
+        slip angle (~0.15 rad).
+        """
+        mu_peak = 1.5
+        alpha_peak = 0.15  # rad, typical FSAE tire
+        c_alpha_total = (
+            self.vehicle.mass_kg * self.GRAVITY_M_S2 * mu_peak / alpha_peak
+        )
+        return f_lat_total ** 2 / c_alpha_total
+
+    def _find_slip_angle(
+        self, f_lat_needed: float, normal_load: float,
+    ) -> float:
+        """Find slip angle (rad) that produces the needed lateral force.
+
+        Uses brentq root-finding on the Pacejka lateral_force function,
+        which is monotonic below peak slip angle. If demanded force
+        exceeds the tire's peak, returns the peak slip angle (tire
+        saturated).
+
+        Args:
+            f_lat_needed: Required lateral force magnitude (N).
+            normal_load: Tire normal load (N).
+
+        Returns:
+            Slip angle in radians (always >= 0).
+        """
+        if normal_load < 1.0 or f_lat_needed < 1.0:
+            return 0.0
+
+        # Use pi/2 as the upper search bound, consistent with peak_lateral_force.
+        _ALPHA_MAX = math.pi / 2.0
+
+        # Pacejka models can produce a small non-zero Fy at alpha=0 due to
+        # residual camber/alignment effects.  When f_lat_needed is less than
+        # that residual, both bracket endpoints have the same sign and brentq
+        # would raise.  The demanded lateral force is already met at zero slip.
+        fy_at_zero = abs(self.tire_model.lateral_force(0.0, normal_load))
+        if f_lat_needed <= fy_at_zero:
+            return 0.0
+
+        # When demand exceeds what the tire can produce within [0, _ALPHA_MAX],
+        # the tire is saturated — return the slip angle at the bracket ceiling.
+        fy_at_max = abs(self.tire_model.lateral_force(_ALPHA_MAX, normal_load))
+        if f_lat_needed >= fy_at_max:
+            result = minimize_scalar(
+                lambda a: -abs(
+                    self.tire_model.lateral_force(a, normal_load)
+                ),
+                bounds=(0.001, _ALPHA_MAX),
+                method="bounded",
+            )
+            return abs(result.x)
+
+        # Fy is monotonic below peak — brentq finds the unique root
+        return brentq(
+            lambda a: abs(
+                self.tire_model.lateral_force(a, normal_load)
+            ) - f_lat_needed,
+            0.0,
+            _ALPHA_MAX,
+            xtol=1e-4,
+        )
+
+    def _cornering_drag_pacejka(
+        self, speed_ms: float, curvature: float, f_lat_total: float,
+    ) -> float:
+        """Cornering drag using Pacejka tire model with load transfer.
+
+        Computes per-tire slip angles from lateral force demand distributed
+        by normal load, then sums the drag component (Fy * sin(alpha))
+        across all four tires.
+        """
+        # Lateral acceleration for load transfer
+        a_lat_g = speed_ms ** 2 * abs(curvature) / self.GRAVITY_M_S2
+
+        # Per-tire normal loads under cornering
+        fl, fr, rl, rr = self.load_transfer.tire_loads(
+            speed_ms, a_lat_g, 0.0,
+        )
+        loads = [fl, fr, rl, rr]
+        total_load = sum(loads)
+        if total_load < 1.0:
+            return 0.0
+
+        total_drag = 0.0
+        for fz in loads:
+            if fz < 1.0:
+                continue
+            # This tire's share of lateral force, proportional to load
+            f_lat_tire = f_lat_total * (fz / total_load)
+            # Find slip angle that produces this lateral force
+            alpha = self._find_slip_angle(f_lat_tire, fz)
+            # Drag component: lateral force projected onto velocity direction
+            fy_actual = abs(
+                self.tire_model.lateral_force(alpha, fz)
+            )
+            total_drag += fy_actual * math.sin(alpha)
+
+        return total_drag
+
+    def total_resistance(
+        self, speed_ms: float, grade: float = 0.0, curvature: float = 0.0,
+    ) -> float:
+        """Sum of all resistance forces (N) at given speed, grade, and curvature."""
         return (
             self.drag_force(speed_ms)
             + self.rolling_resistance_force(speed_ms)
             + self.grade_force(grade)
+            + self.cornering_drag(speed_ms, curvature)
         )
 
     # ------------------------------------------------------------------

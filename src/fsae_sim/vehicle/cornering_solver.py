@@ -152,7 +152,14 @@ class CorneringSolver:
             self._load_transfer.roll_stiffness_front
             + self._load_transfer.roll_stiffness_rear
         )
-        roll_angle_rad = total_lateral_force / k_total if k_total > 0 else 0.0
+        roll_moment_arm = (
+            self._load_transfer._cg_height_m
+            - self._load_transfer._rc_at_cg
+        )
+        roll_angle_rad = (
+            total_lateral_force * roll_moment_arm / k_total
+            if k_total > 0 else 0.0
+        )
 
         # Camber per tire due to roll
         # Roll-camber coefficients are in deg/deg; since we compute
