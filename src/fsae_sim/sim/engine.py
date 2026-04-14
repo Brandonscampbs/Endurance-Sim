@@ -225,7 +225,7 @@ class SimulationEngine:
                         motor_torque = cmd.throttle_pct * max_torque
                     elif cmd.action == ControlAction.BRAKE:
                         max_torque = self.powertrain.max_motor_torque(motor_rpm)
-                        motor_torque = -cmd.brake_pct * max_torque * self.powertrain._REGEN_EFFICIENCY_FACTOR
+                        motor_torque = -cmd.brake_pct * max_torque
                     else:
                         motor_torque = 0.0
 

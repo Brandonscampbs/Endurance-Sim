@@ -130,17 +130,18 @@ class TestLateralForce:
         # SV offset is small relative to peak force
         assert abs(fy) < 100.0
 
-    def test_positive_slip_positive_fy(self, tire_10psi: PacejkaTireModel) -> None:
-        """With PDY1<0 and PKY1<0 (right-side TTC convention), positive slip
-        angle produces positive Fy: By<0, Dy<0, so Dy*sin(C*atan(By*alpha))>0.
+    def test_positive_slip_negative_fy(self, tire_10psi: PacejkaTireModel) -> None:
+        """With PDY1<0 (right-side TTC convention), positive slip angle
+        produces negative Fy (SAE convention): Dy<0, By>0, so
+        Dy*sin(C*atan(By*alpha)) < 0.
         """
         fy = tire_10psi.lateral_force(0.1, 657.0)
-        assert fy > 0.0
-
-    def test_negative_slip_negative_fy(self, tire_10psi: PacejkaTireModel) -> None:
-        """Negative slip angle should produce negative Fy."""
-        fy = tire_10psi.lateral_force(-0.1, 657.0)
         assert fy < 0.0
+
+    def test_negative_slip_positive_fy(self, tire_10psi: PacejkaTireModel) -> None:
+        """Negative slip angle should produce positive Fy (SAE convention)."""
+        fy = tire_10psi.lateral_force(-0.1, 657.0)
+        assert fy > 0.0
 
     def test_antisymmetry(self, tire_10psi: PacejkaTireModel) -> None:
         """Fy(alpha) + Fy(-alpha) should be approximately 2*SVy.
