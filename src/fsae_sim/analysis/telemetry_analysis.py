@@ -35,6 +35,84 @@ class DriverZone:
 
 
 # ---------------------------------------------------------------------------
+# Tire grip calibration
+# ---------------------------------------------------------------------------
+
+
+def extract_tire_grip_scale(
+    aim_df: pd.DataFrame,
+    mass_kg: float,
+    cla: float,
+    tire_model,
+    fz_representative: float,
+    *,
+    min_speed_kmh: float = 15.0,
+    min_lat_g: float = 0.3,
+    percentile: float = 95.0,
+    rho: float = 1.225,
+) -> dict:
+    """Extract tire grip scale factor from endurance telemetry.
+
+    Computes the car's real effective friction coefficient from lateral
+    acceleration data and compares to the Pacejka model's peak mu.
+    The ratio is the LMUY scaling factor needed to calibrate TTC rig
+    data to on-car grip.
+
+    Args:
+        aim_df: AiM telemetry DataFrame with GPS LatAcc (g) and GPS Speed (km/h).
+        mass_kg: Total vehicle mass including driver (kg).
+        cla: Downforce coefficient * area (ClA, m^2).
+        tire_model: PacejkaTireModel instance (uncalibrated).
+        fz_representative: Representative per-tire normal load (N) for
+            computing Pacejka peak mu.
+        min_speed_kmh: Minimum speed to include (filters parking/pit).
+        min_lat_g: Minimum lateral G to include (filters straights).
+        percentile: Percentile for peak grip extraction (default 95th).
+        rho: Air density (kg/m^3).
+
+    Returns:
+        Dict with keys: grip_scale, effective_mu_95, pacejka_mu,
+        n_samples, peak_lat_g.
+    """
+    g = 9.81
+    speed_kmh = aim_df["GPS Speed"].values
+    lat_g = np.abs(aim_df["GPS LatAcc"].values)
+
+    # Filter: moving and cornering
+    mask = (speed_kmh > min_speed_kmh) & (lat_g > min_lat_g)
+    if np.sum(mask) < 10:
+        raise ValueError(
+            f"Not enough cornering samples: {np.sum(mask)} "
+            f"(need >= 10 with speed > {min_speed_kmh} km/h and |lat_g| > {min_lat_g})"
+        )
+
+    speed_ms = speed_kmh[mask] * (1000.0 / 3600.0)
+    lat_g_filtered = lat_g[mask]
+
+    # Effective mu: accounts for downforce augmenting normal force
+    lateral_force = mass_kg * lat_g_filtered * g
+    downforce = 0.5 * rho * cla * speed_ms ** 2
+    total_normal = mass_kg * g + downforce
+    effective_mu = lateral_force / total_normal
+
+    mu_at_percentile = float(np.percentile(effective_mu, percentile))
+
+    # Pacejka peak mu at representative load
+    pacejka_peak_fy = tire_model.peak_lateral_force(fz_representative)
+    pacejka_mu = pacejka_peak_fy / fz_representative
+
+    grip_scale = mu_at_percentile / pacejka_mu
+
+    return {
+        "grip_scale": float(grip_scale),
+        "effective_mu_95": float(mu_at_percentile),
+        "pacejka_mu": float(pacejka_mu),
+        "n_samples": int(np.sum(mask)),
+        "peak_lat_g": float(np.percentile(lat_g_filtered, percentile)),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 

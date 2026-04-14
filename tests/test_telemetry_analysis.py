@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from unittest.mock import MagicMock
 
 from fsae_sim.driver.strategy import ControlAction
 from fsae_sim.track.track import Segment, Track
@@ -13,6 +14,7 @@ from fsae_sim.analysis.telemetry_analysis import (
     extract_per_segment_actions,
     collapse_to_zones,
     detect_laps,
+    extract_tire_grip_scale,
     DriverZone,
 )
 
@@ -240,3 +242,58 @@ class TestDriverZone:
         assert zone.zone_id == 1
         assert zone.action == ControlAction.COAST
         assert zone.label == "Turn 1 entry"
+
+
+# ---------------------------------------------------------------------------
+# extract_tire_grip_scale
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTireGripScale:
+    def test_known_lateral_g(self):
+        """Synthetic data with known peak lateral G should produce expected scale."""
+        n = 1000
+        rng = np.random.default_rng(42)
+        lat_acc_g = rng.uniform(0.0, 1.3, size=n)
+        speed_kmh = rng.uniform(25.0, 60.0, size=n)
+
+        df = pd.DataFrame({
+            "GPS LatAcc": lat_acc_g,
+            "GPS Speed": speed_kmh,
+        })
+
+        tire_model = MagicMock()
+        tire_model.peak_lateral_force.return_value = 2.66 * 657.0
+
+        result = extract_tire_grip_scale(
+            aim_df=df,
+            mass_kg=288.0,
+            cla=2.18,
+            tire_model=tire_model,
+            fz_representative=657.0,
+        )
+
+        assert 0.3 < result["grip_scale"] < 0.6
+        assert result["effective_mu_95"] > 0
+        assert result["pacejka_mu"] == pytest.approx(2.66, rel=0.01)
+
+    def test_filters_low_speed_samples(self):
+        """Samples below 15 km/h should be excluded."""
+        # 5 low-speed high-G samples (should be excluded) + 15 high-speed low-G samples
+        df = pd.DataFrame({
+            "GPS LatAcc": [2.0] * 5 + [0.5] * 15,
+            "GPS Speed": [5.0] * 5 + [40.0] * 15,
+        })
+
+        tire_model = MagicMock()
+        tire_model.peak_lateral_force.return_value = 2.66 * 657.0
+
+        result = extract_tire_grip_scale(
+            aim_df=df,
+            mass_kg=288.0,
+            cla=2.18,
+            tire_model=tire_model,
+            fz_representative=657.0,
+        )
+
+        assert result["effective_mu_95"] < 1.0
