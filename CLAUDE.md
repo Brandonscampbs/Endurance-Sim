@@ -71,6 +71,8 @@ Marketplace: `VoltAgent/awesome-claude-code-subagents`
 
 ## Subagents and When to Use Them
 
+**Always use `model: "opus"` when deploying agents.** All Agent tool calls must specify the Opus 4.6 model to ensure maximum capability and reasoning quality.
+
 ### Core workflow (use frequently)
 - **`python-pro`** -- Default for all Python implementation. Use for module design, NumPy/SciPy patterns, packaging, type hints, and Pythonic idioms.
 - **`architect-reviewer`** -- Use when adding a new module, changing interfaces between modules, or before any structural refactor. Ask it to review proposed module boundaries and data flow.
