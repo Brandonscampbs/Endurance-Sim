@@ -50,6 +50,7 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 
 ## Architecture Guidance
 
+- **No bandaid fixes — root cause only**: Never apply superficial patches, fudge factors, or tuning hacks to make results match. Every fix must address the actual root cause. This is especially critical in simulation work: if the sim output is wrong, the physics model or inputs are wrong — find out why. Adding correction factors or clamping outputs to hide errors destroys the simulation's predictive value and makes every downstream result untrustworthy. A simulation that's honestly wrong is more useful than one that's been patched to look right.
 - **Modular by domain**: separate modules for battery model, drivetrain model, tire/vehicle dynamics, track representation, driver model, and lap simulation orchestration. Each module should be independently testable.
 - **Simulation correctness first**: validate every model against real data before adding complexity. Numerical accuracy matters more than abstraction elegance.
 - **Performance-aware from the start**: parameter sweeps and optimization will run thousands of simulations. Use NumPy/SciPy vectorized operations. Profile before optimizing, but don't create structures that prevent vectorization later.
