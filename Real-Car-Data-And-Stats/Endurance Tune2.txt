@@ -1,0 +1,43 @@
+Endurance Tune
+
+BMS 
+Discharge Limits:
+
+TEMP:
+30			-> 100A
+35			-> 85A
+40			-> 65A
+45*C		        -> 55A
+50*C			-> 45A
+55*C			-> 40A
+60*C			-> 35A
+65*C			-> 0A
+
+State of Charge:	
+
+@85% - 1A per 1%
+
+SOC Settings:
+
+Discharged SOC -> 2%
+
+
+Cell Settings:
+
+Minimum Cell Voltage	2.7v				-> 2.55v
+Maximum Cell Voltage	4.1v				-> 4.195v
+
+
+INVERTER
+
+Item			Numbers 		
+IQ			170 A			
+ID			30 A				
+Torque Limit	        85 Nm
+Motor Speed	        2900 RPM
+brake speed		2400 RPM
+
+LVCU 
+torque limit		150
+
+

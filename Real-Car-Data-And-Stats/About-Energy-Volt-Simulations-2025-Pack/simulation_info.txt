@@ -1,0 +1,47 @@
+# Voltt Simulation Export
+# ========================
+
+Simulation ID: e73a8007-836e-47ef-8a8f-2fccfd36651f
+Exported by: brandon.s.campbell@uconn.edu
+
+Configurations: 1
+Export Date: 4/13/2026, 11:34:27 AM
+
+# Configuration Details
+# ---------------------
+
+Configuration 1: 2025 Pack (Pack 110S4P)
+  Cell: Molicel P45B
+
+Output Levels: Cell and Pack (both included)
+
+Note: CSV filenames include _cell or _pack suffix to indicate the output level:
+  - _cell: Raw cell-level values (single cell simulation)
+  - _pack: Pack-level values (scaled by series/parallel configuration)
+
+Warnings:
+  1. 2025 Pack: Peak Current (65.1A) exceeded datasheet max continuous discharge: 45A limit (180A pack limit); results may be unreliable outside validated range
+  2. 2025 Pack: Peak Power (26,800W) exceeded datasheet max continuous discharge: 162W limit (71280W pack limit); results may be unreliable outside validated range
+
+# Simulation Inputs
+# -----------------
+
+## Load Profile
+Profile Type: Duty Cycle
+Duty Cycle: endurance_full [Power]
+
+## Environment Conditions
+Ambient Temperature: 25 °C
+Heat Transfer Coefficient: 0 W/m²K
+
+## Initial Conditions
+Initial SOC: 100 %
+Initial Temperature: 25 °C
+
+## Termination Conditions
+Min. Voltage [V]: 2.5 V
+Max Temperature: 80 °C
+
+
+# Each CSV file contains data for one simulation.
+# Column headers use the format: name [unit]

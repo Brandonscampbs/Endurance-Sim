@@ -1,0 +1,11 @@
+{
+  "interfaceFontSize": 14,
+  "showLineNumber": true,
+  "strictLineBreaks": false,
+  "readableLineLength": false,
+  "defaultViewMode": "preview",
+  "livePreview": true,
+  "showFrontmatter": false,
+  "foldHeading": true,
+  "foldIndent": true
+}

@@ -68,7 +68,7 @@ The following decisions were made during the initial architecture design. Each i
 | | CT-16EV (2025) | CT-17EV (2026) |
 |---|---|---|
 | Pack | 110S4P Molicel P45B | 100S4P Molicel P50B |
-| Mass | ~270 kg with driver | ~261 kg with driver (20 lbs lighter) |
+| Mass | 288 kg with driver (220 + 68) | ~279 kg with driver (~9 kg lighter) |
 | Cell voltage range | 2.55V – 4.195V | ~2.50V – 4.20V (TBD from P50B data) |
 | Everything else | Identical | Identical |
 
@@ -147,11 +147,11 @@ The 2025 competition car. We have full endurance telemetry and battery simulatio
 
 | Parameter | Estimate | Notes |
 |---|---|---|
-| Mass with driver | 270 kg | Needs weighing |
-| Frontal area | 1.2 m² | From CAD or measurement |
-| Drag coefficient | 0.5 | Typical FSAE, no aero package |
+| Mass with driver | 288 kg | DSS (220 kg car + 68 kg driver) |
+| CdA | 1.50 m² | DSS (431N drag at 80 kph, back-derived) |
+| ClA | 2.18 m² | DSS (625N downforce at 80 kph, back-derived) |
 | Rolling resistance | 0.015 | Typical for FSAE tires |
-| Gear ratio | 3.5 | Placeholder — need actual value |
+| Gear ratio | 3.6363 (40/11) | DSS |
 | Drivetrain efficiency | 92% | Estimate |
 
 ### CT-17EV (2026 Competition Car)
@@ -385,12 +385,12 @@ These values are estimates. Each one should be verified or measured before trust
 
 | Parameter | Current Value | How to Refine | Priority |
 |---|---|---|---|
-| Vehicle mass (CT-16EV) | 270 kg | Weigh the car with driver | High |
-| Vehicle mass (CT-17EV) | 261 kg | Weigh the car with driver | High |
-| Gear ratio | 3.5 | Measure or check team records | High |
+| Vehicle mass (CT-16EV) | 288 kg | DSS (220 kg car + 68 kg driver) | Resolved |
+| Vehicle mass (CT-17EV) | ~279 kg | ~9 kg lighter than CT-16EV | Medium |
+| Gear ratio | 3.6363 (40/11) | DSS | Resolved |
 | P50B discharge limits | Copied from P45B | Update from P50B datasheet | High |
-| Frontal area | 1.2 m² | Measure or extract from CAD | Medium |
-| Drag coefficient | 0.5 | Coastdown test or CFD | Medium |
+| CdA | 1.50 m² | DSS (back-derived from force data) | Resolved |
+| ClA | 2.18 m² | DSS (back-derived from force data) | Resolved |
 | Rolling resistance | 0.015 | Tire data or coastdown test | Medium |
 | Drivetrain efficiency | 92% | Dyno test or back-calculate from telemetry | Medium |
 
@@ -400,9 +400,9 @@ These values are estimates. Each one should be verified or measured before trust
 
 Repository scaffold, Docker dev environment, Dash dashboard skeleton, vehicle config system, data loaders, module interface stubs. 17 tests passing.
 
-### Phase 2 — Core Simulation (Next)
+### Phase 2 — Core Simulation (Nearly Done)
 
-The critical path. Build the simulation engine and validate it against real data.
+The critical path. Simulation engine built and validated against real data. Tier 3 upgrade (4-wheel Pacejka tire model) merged and validated (~2% energy error, 8/8 metrics pass). Driver model built (CalibratedStrategy, zone-based). Remaining: finalize driver model quality/accuracy validation checks.
 
 1. **Battery model** — Calibrate voltage-SOC curve against Voltt data for both P45B and P50B cells. Implement BMS discharge limits (temperature-dependent) and SOC taper. This is the most data-rich module — the Voltt simulations provide detailed cell behavior under the actual endurance duty cycle.
 
@@ -418,9 +418,9 @@ The critical path. Build the simulation engine and validate it against real data
 
 7. **Validation** — Run the full sim with CT-16EV config and ReplayStrategy on the Michigan track. Compare against real data channel-by-channel. Iterate until within 5% on key metrics.
 
-### Phase 3 — Optimization & Comparison
+### Phase 3 — Optimization & Comparison (Next)
 
-Once the sim is validated, use it to find answers.
+Once Phase 2 finalization is complete, use the sim to find answers.
 
 8. **Strategy abstraction** — Implement CoastingStrategy, ThresholdBrakingStrategy, and any other candidate strategies. Make them parameterizable.
 
@@ -432,7 +432,7 @@ Once the sim is validated, use it to find answers.
 
 12. **Dashboard buildout** — Populate all dashboard pages with real data from sweeps and comparisons.
 
-### Phase 4 — Scoring & Decision Support
+### Phase 4 — Scoring & Decision Support (Future)
 
 Turn simulation results into competition strategy recommendations.
 
@@ -477,8 +477,8 @@ Turn simulation results into competition strategy recommendations.
 │       ├── pareto.py
 │       └── lap_detail.py
 ├── configs/                   # Vehicle configuration YAML files
-│   ├── ct16ev.yaml            # 2025 car: 110S4P P45B, 270 kg
-│   └── ct17ev.yaml            # 2026 car: 100S4P P50B, 261 kg
+│   ├── ct16ev.yaml            # 2025 car: 110S4P P45B, 288 kg (with driver)
+│   └── ct17ev.yaml            # 2026 car: 100S4P P50B, ~279 kg (with driver)
 ├── Real-Car-Data-And-Stats/   # Raw telemetry and simulation data
 │   ├── 2025 Endurance Data.csv                        # AiM telemetry export
 │   ├── Endurance Tune2.txt                            # BMS/inverter parameters

@@ -3,7 +3,7 @@ year: 2025
 description: "2025 competition car - Michigan Endurance (DSS #301)"
 
 vehicle:
-  mass_kg: 278.0  # DSS: 210 kg car + 68 kg driver
+  mass_kg: 288.0  # DSS: 220 kg car + 68 kg driver
   frontal_area_m2: 1.0  # DSS reference area
   drag_coefficient: 1.502  # DSS: CdA=1.502 from 431N drag at 80 kph
   rolling_resistance: 0.015
@@ -17,7 +17,7 @@ powertrain:
   torque_limit_lvcu_nm: 150.0
   iq_limit_a: 170.0
   id_limit_a: 30.0
-  gear_ratio: 3.818  # DSS: final drive ratio
+  gear_ratio: 3.6363  # DSS: 40/11 teeth
   drivetrain_efficiency: 0.92
 
 battery:

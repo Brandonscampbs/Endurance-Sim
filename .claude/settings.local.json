@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(gh repo:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(claude /plugin install superpowers@claude-plugins-official)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(xargs grep:*)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(k\\) for k in d.get\\('plugins',{}\\).keys\\(\\) if 'super' in k.lower\\(\\)]\")",
+      "Bash(xargs -I {} head -10 {})",
+      "Bash(python -c ':*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)"
+    ]
+  }
+}

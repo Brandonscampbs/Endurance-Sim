@@ -21,12 +21,12 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 ### Key Vehicle Parameters (from DSS + Endurance Tune)
 | Parameter | Value | Source |
 |---|---|---|
-| Mass (car only) | 210 kg | DSS |
-| Mass (with 68 kg driver) | 278 kg | DSS |
+| Mass (car only) | 220 kg | DSS |
+| Mass (with 68 kg driver) | 288 kg | DSS |
 | Wheelbase | 1549 mm | DSS |
-| Final drive ratio | 3.818:1 | DSS |
-| CdA (drag coefficient x area) | ~1.5 m² | DSS (431N drag at 80 kph) |
-| ClA (downforce coeff x area) | ~2.18 m² | DSS (625N downforce at 80 kph) |
+| Final drive ratio | 3.6363:1 (40/11) | DSS |
+| CdA (drag coefficient x area) | 1.50 m² | DSS (431N drag at 80 kph, back-derived) |
+| ClA (downforce coeff x area) | 2.18 m² | DSS (625N downforce at 80 kph, back-derived) |
 | Motor | EMRAX 228 MV LC, 3-phase PMSM | DSS |
 | Motor peak / continuous | 230 Nm / 112 Nm | DSS (but inverter limits to 85 Nm) |
 | Inverter | Cascadia CM200DX | DSS |
@@ -44,9 +44,9 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 ## Project Roadmap
 
 1. **Baseline simulation + validation** (DONE) -- quasi-static lap sim with 4-wheel Pacejka tire model, validated against Michigan 2025 telemetry (~2% energy error, 8/8 metrics pass).
-2. **Calibrated driver model** (CURRENT) -- parameterized driver that reproduces real telemetry behavior. Parameters map to coachable actions: coast point, throttle ramp, corner approach, acceleration intensity.
-3. **Strategy + tune sweeps** -- run thousands of sims varying driver parameters (coast margins, throttle profiles, braking points) and car tune (max RPM, torque limit, regen intensity) to find the scoring-optimal combination for Endurance + Efficiency.
-4. **Driver coaching output** -- translate optimal parameters into actionable targets: "coast X meters before corners," "use Y% throttle out of hairpins," "target Z kWh total energy." Drivers train to match these.
+2. **Calibrated driver model** (DONE) -- zone-based driver model (`CalibratedStrategy`) calibrated from AiM telemetry. Collapses ~200 segments into ~30-40 coachable zones (throttle/coast/brake with intensity). FSAE scoring function (`FSAEScoring`) implements full Endurance + Efficiency scoring per D.12.13 / D.13.4, pre-configured with Michigan 2025 field data. Telemetry extraction pipeline in `analysis/telemetry_analysis.py`. Validation target: 3-5% error on time and energy vs telemetry.
+3. **Strategy + tune sweeps** (NEXT) -- run thousands of sims varying driver parameters (zone overrides via `CalibratedStrategy.with_zone_override()`) and car tune (max RPM, torque limit, regen intensity). Optimize combined `FSAEScoring.combined_score` (Endurance + Efficiency, max 375 pts). Foundation: zone-based driver model + scoring function from Phase 2.
+4. **Driver coaching output** -- translate optimal parameters into actionable targets using `CalibratedStrategy.to_driver_brief()`: "coast X meters before corners," "use Y% throttle out of hairpins," "target Z kWh total energy." Drivers train to match these.
 
 ## Architecture Guidance
 

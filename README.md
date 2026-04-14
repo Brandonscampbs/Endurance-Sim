@@ -7,7 +7,7 @@ Endurance simulation and optimization for UConn Formula SAE Electric. Predicts l
 | | CT-16EV (2025) | CT-17EV (2026) |
 |---|---|---|
 | Pack | 110S4P Molicel P45B | 100S4P Molicel P50B |
-| Mass | ~270 kg | ~261 kg |
+| Mass (with driver) | 288 kg | ~279 kg |
 | Motor/Inverter | Shared | Shared |
 | Controls | Shared | Shared |
 
@@ -88,14 +88,14 @@ pytest -v
 
 ## Roadmap
 
-### Phase 1 — Foundation ✅
+### Phase 1 — Foundation ✅ (Done)
 Repository scaffold, Docker, dashboard skeleton, vehicle configs, data loaders
 
-### Phase 2 — Core Simulation
-Battery model, powertrain model, vehicle dynamics, driver behavior extraction, simulation engine, validation against real data (5% target)
+### Phase 2 — Core Simulation (Nearly Done)
+Battery model, powertrain model, vehicle dynamics with 4-wheel Pacejka tire model, driver model (CalibratedStrategy, zone-based), simulation engine validated against real telemetry (~2% energy error, 8/8 metrics pass). Remaining: driver model finalization and quality/accuracy validation checks.
 
-### Phase 3 — Optimization & Comparison
+### Phase 3 — Optimization & Comparison (Next)
 Swappable strategies, parameter sweeps, car comparison, Pareto frontier, dashboard buildout
 
-### Phase 4 — Scoring & Decision Support
+### Phase 4 — Scoring & Decision Support (Future)
 FSAE scoring model, field estimation, points maximization, final decision dashboard

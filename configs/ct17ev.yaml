@@ -3,11 +3,11 @@ year: 2026
 description: "2026 competition car - 100S4P P50B, 20 lbs lighter"
 
 vehicle:
-  mass_kg: 261.0
-  frontal_area_m2: 1.2
-  drag_coefficient: 0.5
+  mass_kg: 279.0  # 220 kg car - 9 kg (20 lbs lighter) + 68 kg driver
+  frontal_area_m2: 1.0  # Same aero package as CT-16EV (DSS ref area)
+  drag_coefficient: 1.502  # CdA=1.502 from DSS (431N drag at 80 kph)
   rolling_resistance: 0.015
-  wheelbase_m: 1.53
+  wheelbase_m: 1.549
 
 powertrain:
   motor_speed_max_rpm: 2900
@@ -16,7 +16,7 @@ powertrain:
   torque_limit_lvcu_nm: 150.0
   iq_limit_a: 170.0
   id_limit_a: 30.0
-  gear_ratio: 3.5
+  gear_ratio: 3.6363  # 40/11 teeth
   drivetrain_efficiency: 0.92
 
 battery:
