@@ -12,7 +12,7 @@ from fsae_sim.vehicle.dynamics import VehicleDynamics
 def ct16ev_params():
     """CT-16EV vehicle parameters (DSS values)."""
     return VehicleParams(
-        mass_kg=278.0,
+        mass_kg=288.0,
         frontal_area_m2=1.0,
         drag_coefficient=1.502,
         rolling_resistance=0.015,
@@ -52,9 +52,9 @@ class TestRollingResistance:
         assert dynamics.rolling_resistance_force() > 0.0
 
     def test_rolling_resistance_value(self, dynamics):
-        """At 0 speed: F = 278 * 9.81 * 0.015 ≈ 40.9N"""
+        """At 0 speed: F = 288 * 9.81 * 0.015 ≈ 42.4N"""
         f = dynamics.rolling_resistance_force(0.0)
-        assert abs(f - 278 * 9.81 * 0.015) < 0.5
+        assert abs(f - 288 * 9.81 * 0.015) < 0.5
 
 
 class TestGradeForce:
@@ -76,10 +76,12 @@ class TestGradeForce:
 
 class TestTotalResistance:
 
-    def test_at_rest_equals_rolling_resistance(self, dynamics):
+    def test_at_rest_includes_parasitic_drag(self, dynamics):
         f = dynamics.total_resistance(0.0, 0.0)
         rr = dynamics.rolling_resistance_force()
-        assert abs(f - rr) < 1e-6
+        # Total resistance at rest = rolling resistance + parasitic drag (70N)
+        assert f > rr
+        assert abs(f - rr - 70.0) < 1e-6
 
     def test_increases_with_speed(self, dynamics):
         f10 = dynamics.total_resistance(10.0)
@@ -116,9 +118,9 @@ class TestAcceleration:
         assert a > 0.0
 
     def test_f_equals_ma(self, dynamics):
-        """1000N on 278kg → 3.60 m/s²"""
+        """1000N on 288kg → 3.47 m/s²"""
         a = dynamics.acceleration(1000.0)
-        assert abs(a - 1000.0 / 278.0) < 0.01
+        assert abs(a - 1000.0 / 288.0) < 0.01
 
 
 class TestResolveExitSpeed:
@@ -272,13 +274,15 @@ class TestEffectiveInertia:
     def test_m_effective_value(self, ct16ev_params, ct16ev_powertrain):
         """Verify m_effective calculation for CT-16EV.
 
+        Uses TIRE_RADIUS_M = 0.2042 from PowertrainModel.
         J_eff = 0.06 * 3.6363^2 * 0.92 + 4 * 0.3 = 1.930 kg*m^2
-        m_eff = 278 + 1.930 / 0.228^2 = 278 + 37.14 = 315.14 kg
+        m_eff = 288 + 1.930 / 0.2042^2 = 288 + 46.28 = 334.28 kg
         """
+        from fsae_sim.vehicle.powertrain_model import PowertrainModel
         dyn = VehicleDynamics(ct16ev_params, powertrain_config=ct16ev_powertrain)
         G = 3.6363
         eta = 0.92
-        r = 0.228
+        r = PowertrainModel.TIRE_RADIUS_M
         J_eff = 0.06 * G**2 * eta + 4 * 0.3
         expected = ct16ev_params.mass_kg + J_eff / r**2
         assert dyn.m_effective == pytest.approx(expected, rel=1e-4)

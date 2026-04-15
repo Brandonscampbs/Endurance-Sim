@@ -8,6 +8,7 @@ vehicle:
   drag_coefficient: 1.502  # CdA=1.502 from DSS (431N drag at 80 kph)
   rolling_resistance: 0.015
   wheelbase_m: 1.549
+  downforce_coefficient: 2.18  # DSS: ClA=2.18 m² (625N at 80 kph) — same aero as CT-16EV
   rotor_inertia_kg_m2: 0.06   # EMRAX 228 datasheet (same motor)
   wheel_inertia_kg_m2: 0.3    # per wheel estimate
 
@@ -20,6 +21,13 @@ powertrain:
   id_limit_a: 30.0
   gear_ratio: 3.6363  # 40/11 teeth
   drivetrain_efficiency: 0.92
+  lvcu_power_constant: 420.0
+  lvcu_rpm_scale: 0.1076
+  lvcu_omega_floor: 23.04
+  lvcu_pedal_deadzone_low: 0.1
+  lvcu_pedal_deadzone_high: 0.9
+  lvcu_overspeed_rpm: 6000.0
+  lvcu_overspeed_torque_nm: 30.0
 
 battery:
   cell_type: "P50B"
@@ -49,3 +57,19 @@ battery:
       max_current_a: 35.0
     - temp_c: 65.0
       max_current_a: 0.0
+
+tire:
+  tir_file: "Real-Car-Data-And-Stats/Tire Models from TTC/Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir"
+  static_camber_front_deg: -1.25
+  static_camber_rear_deg: -1.25
+  grip_scale: 0.4697  # TTC-to-car calibration from Michigan 2025 endurance telemetry
+
+suspension:
+  roll_stiffness_front_nm_per_deg: 238.0
+  roll_stiffness_rear_nm_per_deg: 258.0
+  roll_center_height_front_mm: 88.9
+  roll_center_height_rear_mm: 63.5
+  roll_camber_front_deg_per_deg: -0.5
+  roll_camber_rear_deg_per_deg: -0.554
+  front_track_mm: 1194.0
+  rear_track_mm: 1168.0

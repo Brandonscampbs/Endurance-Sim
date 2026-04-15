@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from fsae_sim.data.loader import load_aim_csv, load_voltt_csv
+from fsae_sim.data.loader import load_cleaned_csv, load_voltt_csv
 from fsae_sim.track.track import Track
 from fsae_sim.vehicle import VehicleConfig
 from fsae_sim.vehicle.battery_model import BatteryModel
@@ -20,11 +20,11 @@ from fsae_sim.analysis.validation import validate_full_endurance, detect_lap_bou
 def main():
     # ── Load everything ──
     config = VehicleConfig.from_yaml("configs/ct16ev.yaml")
-    _, aim_df = load_aim_csv("Real-Car-Data-And-Stats/2025 Endurance Data.csv")
+    _, aim_df = load_cleaned_csv("Real-Car-Data-And-Stats/CleanedEndurance.csv")
     voltt_df = load_voltt_csv(
         "Real-Car-Data-And-Stats/About-Energy-Volt-Simulations-2025-Pack/2025_Pack_cell.csv"
     )
-    track = Track.from_telemetry("Real-Car-Data-And-Stats/2025 Endurance Data.csv")
+    track = Track.from_telemetry(df=aim_df)
 
     # Battery with two-step calibration
     battery = BatteryModel(config.battery, cell_capacity_ah=4.5)

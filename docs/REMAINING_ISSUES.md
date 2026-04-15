@@ -1,8 +1,8 @@
 # Remaining Simulator Issues
 
 Post-merge audit of all physics, performance, and correctness issues.
-Originally written 2026-04-14, updated 2026-04-14 after cornering drag
-implementation and physics bug fixes on `feat/cornering-drag` branch.
+Originally written 2026-04-14. Updated 2026-04-15 with status audit
+(5 fixed, 2 partially fixed, 13 still open).
 
 ---
 
@@ -18,25 +18,12 @@ Roll angle formula now correctly uses
 
 ---
 
-### 2. BMS current limit does not feed back to speed
+### 2. ~~BMS current limit does not feed back to speed~~ FIXED
 
-**File:** `src/fsae_sim/sim/engine.py:240-244`
-
-```python
-if pack_current > max_current:
-    pack_current = max_current
-    elec_power = pack_current * pack_voltage
-    # speed is NOT recalculated
-```
-
-When the BMS clamps current (low SOC or high temperature), the energy
-accounting is corrected but the car still travels at the unclamped speed.
-This means the sim over-predicts speed in exactly the regime where strategy
-decisions matter most — end-of-endurance with SOC taper active.
-
-**Fix:** When pack current is clamped, back-solve for the maximum motor
-torque the limited power can sustain, recompute drive force, and re-resolve
-exit speed.
+**Fixed:** BMS current limit is now enforced upstream via
+`lvcu_torque_command()` / `lvcu_torque_ceiling()` before force computation.
+Speed is resolved from the already-limited torque/force, so the feedback
+loop is closed.
 
 ---
 
@@ -118,29 +105,12 @@ This is accurate within 1-3% for typical Pacejka parameters (C ~ 1.3-1.7,
 
 ## Significant — Affects Accuracy of Results
 
-### 6. Longitudinal tire model mirrors lateral coefficients
+### 6. ~~Longitudinal tire model mirrors lateral coefficients~~ FIXED
 
-**File:** `src/fsae_sim/vehicle/tire_model.py:258-335`
-
-The TTC .tir files have USE_MODE=2 (lateral-only data), so the Fx model
-copies the Fy structure with `|PDY1|` for peak mu. This is wrong because:
-
-- Longitudinal peak slip ratio is 0.08-0.15 vs lateral peak slip angle of
-  5-10 degrees
-- Longitudinal slip stiffness is much higher per unit slip
-- The combined force model (friction circle, lines 341-389) depends on both
-  pure-slip curves being correct
-
-For traction-limited acceleration out of slow corners — which is what FSAE
-endurance is about — the Fx curve shape directly determines exit speed.
-
-**Fix options:**
-- Use published longitudinal coefficients for Hoosier LC0 (some teams have
-  measured these on brake dynos)
-- Use a simplified Fx model: `Fx = mu_x * Fz * sin(C * atan(B * kappa))`
-  with B and C estimated from literature for racing slicks (B ~ 10-15, C ~
-  1.65)
-- Accept the current approximation but document the limitation
+**Fixed:** Full PAC2002 longitudinal model implemented using real PDX, PKX,
+PCX, PEX, PHX, PVX coefficients transplanted from TTC Round 6 R25B data
+and scaled to match the LC0's lateral grip envelope. See
+`scripts/transplant_fx_coefficients.py` for the transplant methodology.
 
 ---
 
@@ -320,14 +290,12 @@ physics is wrong.
 
 ---
 
-### 15. Motor efficiency is constant across all operating points
+### 15. ~~Motor efficiency is constant across all operating points~~ FIXED
 
-**File:** `src/fsae_sim/vehicle/powertrain_model.py:41` — `drivetrain_efficiency: 0.92`
-
-Real EMRAX 228 efficiency varies from ~80% (low speed, low torque) to ~96%
-(peak efficiency point). For energy prediction — which directly determines
-efficiency scoring — a 2D efficiency map `eta(torque, rpm)` from the EMRAX
-datasheet would improve accuracy without adding simulation time.
+**Fixed:** `MotorEfficiencyMap` class in `motor_efficiency.py` provides 2D
+RPM x torque lookup from EMRAX 228 data. Loaded automatically by the
+simulation engine when the CSV is available. Falls back to constant
+`drivetrain_efficiency` when not.
 
 ---
 
@@ -364,17 +332,12 @@ of more segments per lap.
 
 ## Minor / Low-Priority
 
-### 18. Hardcoded tire radius in powertrain model
+### 18. ~~Hardcoded tire radius in powertrain model~~ PARTIALLY FIXED
 
-**File:** `src/fsae_sim/vehicle/powertrain_model.py:33`
-
-```python
-TIRE_RADIUS_M: float = 0.228  # 10-inch FSAE wheel
-```
-
-This is the unloaded radius. Under load the tire compresses to ~0.222m
-(~3% difference). Acceptable but could use the Pacejka `loaded_radius()`
-for consistency.
+**Partially fixed:** Value updated from 0.228m to 0.2042m (correct
+UNLOADED_RADIUS from .tir file). Remaining nit: still a class constant
+rather than dynamically computed `loaded_radius()` (~3% difference under
+load).
 
 ---
 
@@ -417,15 +380,28 @@ cornering behavior will be wrong at speed.
 
 **Validation after fixes:** Driving time error 10.3% (was 33.5% before fixes, 12% pre-cornering-drag). Energy error 37% (unchanged — driven by #15, #7, #2).
 
-## Remaining Summary
+## Status Summary (updated 2026-04-15)
 
+### Fixed (5)
+| # | Issue |
+|---|-------|
+| 1 | Roll angle missing moment arm |
+| 2 | BMS current limit does not feed back to speed |
+| 6 | Longitudinal tire model mirrors lateral coefficients |
+| 11 | No cornering drag |
+| 15 | Motor efficiency is constant across all operating points |
+
+### Partially Fixed (2)
+| # | Issue | Remaining |
+|---|-------|-----------|
+| 3 | Regen efficiency double-counted | `regen_force()` uses F*eta instead of F/eta in generator mode |
+| 18 | Hardcoded tire radius | Value corrected (0.2042m) but still a class constant, not `loaded_radius()` |
+
+### Still Open (13)
 | # | Issue | Category | Sweep Impact | Effort |
 |---|-------|----------|-------------|--------|
-| 2 | BMS limit doesn't limit speed | Physics gap | End-of-endurance wrong | Medium |
-| 3 | Regen force direction (F*eta vs F/eta) | Physics bug | Regen force understated | Low |
 | 4 | No battery cooling | Physics gap | Temp monotonically rises | Medium |
 | 5 | Peak force optimizer bottleneck | Performance | Sweeps 100-1000x slow | Low |
-| 6 | Mirrored Fx model | Physics approx | Traction exits wrong | Medium |
 | 7 | Linear field-weakening | Physics approx | Mid-range torque -45% | Low |
 | 8 | R(T) independent | Physics gap | Voltage error at high T | Low |
 | 9 | EFmin = 0 | Scoring bug | Over-values efficiency | Low |
@@ -433,9 +409,7 @@ cornering behavior will be wrong at speed.
 | 12 | Python sim loop | Performance | Sweep throughput | High |
 | 13 | max_speed_ms unused | Feature gap | Calibrated model too fast | Low |
 | 14 | Effective mass has eta | Physics bug | 0.4% error | Low |
-| 15 | Constant motor efficiency | Physics approx | ~5-15% energy error | Medium |
 | 16 | Curvature from GPS accel | Data quality | Noisy corner speeds | Medium |
 | 17 | 5m segment resolution | Data quality | Misses tight corners | Low |
-| 18 | Hardcoded tire radius | Physics approx | ~3% RPM/force error | Low |
 | 19 | ISA air density | Physics approx | ~3% aero error | Low |
 | 20 | Downforce distribution | Config gap | Balance at speed wrong | Low |

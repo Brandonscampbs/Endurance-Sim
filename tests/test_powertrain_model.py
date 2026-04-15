@@ -4,9 +4,9 @@ All tests use the CT-16EV specification:
 - Motor:     EMRAX-like PMSM, max 2900 RPM, brake speed 2400 RPM
 - Inverter:  IQ=170 A, ID=30 A, torque limit 85 Nm
 - LVCU:      mechanical torque limit 150 Nm
-- Gear ratio: 3.5 single-speed
+- Gear ratio: 3.6363 (40/11 teeth)
 - Drivetrain efficiency: 92 %
-- Tire radius: 0.228 m (10-inch FSAE tyre)
+- Tire radius: 0.2042 m (Hoosier 16x7.5-10 LC0, UNLOADED_RADIUS from .tir file)
 
 Effective torque ceiling = min(85, 150) = 85 Nm (inverter-limited).
 """
@@ -33,7 +33,7 @@ def ct16ev_powertrain_config() -> PowertrainConfig:
         torque_limit_lvcu_nm=150.0,
         iq_limit_a=170.0,
         id_limit_a=30.0,
-        gear_ratio=3.5,
+        gear_ratio=3.6363,
         drivetrain_efficiency=0.92,
     )
 
@@ -77,17 +77,17 @@ class TestSpeedRPMConversion:
     def test_max_speed_at_max_rpm_in_fsae_range(self, model: PowertrainModel) -> None:
         """At 2900 RPM the vehicle speed must match the gear-ratio prediction.
 
-        With gear_ratio=3.5 and tire_radius=0.228 m:
-            wheel_rpm   = 2900 / 3.5 ≈ 828.6 rpm
-            speed_ms    = 828.6 * 0.228 * 2*pi / 60 ≈ 19.78 m/s ≈ 71.2 km/h
+        With gear_ratio=3.6363 and tire_radius=0.2042 m:
+            wheel_rpm   = 2900 / 3.6363 ≈ 797.5 rpm
+            speed_ms    = 797.5 * 0.2042 * 2*pi / 60 ≈ 17.05 m/s ≈ 61.4 km/h
 
-        FSAE competition speeds typically reach 60–80 km/h on straights, so
-        ~71 km/h is physically plausible for this drivetrain.
+        FSAE competition speeds typically reach 55–80 km/h on straights, so
+        ~61 km/h is physically plausible for this drivetrain.
         """
         speed_ms = model.speed_from_motor_rpm(2900.0)
         speed_kmh = speed_ms * 3.6
-        assert 65.0 < speed_kmh < 80.0, (
-            f"Expected ~71 km/h at max RPM, got {speed_kmh:.2f} km/h"
+        assert 55.0 < speed_kmh < 80.0, (
+            f"Expected ~61 km/h at max RPM, got {speed_kmh:.2f} km/h"
         )
 
     def test_rpm_scales_linearly_with_speed(self, model: PowertrainModel) -> None:
@@ -162,14 +162,14 @@ class TestWheelTorqueAndForce:
     def test_wheel_torque_equals_motor_times_ratio_times_efficiency(
         self, model: PowertrainModel
     ) -> None:
-        """wheel_torque = motor_torque * gear_ratio * drivetrain_efficiency."""
+        """wheel_torque = motor_torque * gear_ratio * gearbox_efficiency."""
         motor_torque = 50.0
-        expected = motor_torque * 3.5 * 0.92
+        expected = motor_torque * 3.6363 * PowertrainModel._GEARBOX_EFFICIENCY
         assert model.wheel_torque(motor_torque) == pytest.approx(expected)
 
     def test_wheel_torque_at_max_motor_torque(self, model: PowertrainModel) -> None:
-        """At full motor torque the wheel torque should be 85 * 3.5 * 0.92 Nm."""
-        expected = 85.0 * 3.5 * 0.92
+        """At full motor torque the wheel torque should be 85 * 3.6363 * 0.97 Nm."""
+        expected = 85.0 * 3.6363 * PowertrainModel._GEARBOX_EFFICIENCY
         assert model.wheel_torque(85.0) == pytest.approx(expected)
 
     def test_wheel_torque_zero_for_zero_motor_torque(
@@ -268,14 +268,17 @@ class TestRegenForce:
         half = model.regen_force(0.5, 10.0)
         assert abs(half - full / 2.0) < 1e-9
 
-    def test_regen_magnitude_less_than_drive_force(
+    def test_regen_magnitude_matches_drive_force(
         self, model: PowertrainModel
     ) -> None:
-        """Regen force magnitude should be less than peak drive force (losses)."""
+        """Regen and drive use the same gearbox efficiency path, so at the
+        same speed and demand they produce equal mechanical force magnitude.
+        Energy losses (motor+inverter efficiency) affect electrical_power(),
+        not the mechanical force at the wheels."""
         speed = 10.0
         drive = model.drive_force(1.0, speed)
         regen_mag = abs(model.regen_force(1.0, speed))
-        assert regen_mag < drive
+        assert regen_mag == pytest.approx(drive)
 
     def test_regen_brake_clamped_above_one(self, model: PowertrainModel) -> None:
         f_1 = model.regen_force(1.0, 10.0)
@@ -411,8 +414,8 @@ class TestCT16EVIntegration:
     ) -> None:
         """Peak tractive force at low speed should be physically reasonable.
 
-        Expected: 85 Nm * 3.5 * 0.92 / 0.228 m ≈ 1198 N.
-        Plausible range for FSAE EV: 900–1500 N.
+        Expected: 85 Nm * 3.6363 * 0.97 / 0.2042 m ≈ 1468 N.
+        Plausible range for FSAE EV: 900–1700 N.
         """
         force = model.drive_force(1.0, 1.0)  # 1 m/s ~ constant-torque region
         assert 900.0 < force < 1500.0, (
@@ -421,7 +424,7 @@ class TestCT16EVIntegration:
 
     def test_peak_force_calculation(self, model: PowertrainModel) -> None:
         """Verify peak force matches analytical calculation."""
-        expected = 85.0 * 3.5 * 0.92 / 0.228
+        expected = 85.0 * 3.6363 * PowertrainModel._GEARBOX_EFFICIENCY / PowertrainModel.TIRE_RADIUS_M
         actual = model.drive_force(1.0, 0.5)  # very low speed, constant-torque
         assert abs(actual - expected) < 1.0
 

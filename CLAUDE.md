@@ -17,6 +17,14 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 - **AiM telemetry** (`2025 Endurance Data.csv`): 20Hz CSV export from AiM Evo 5 data logger. Full Michigan endurance (~22 km, 21 laps, 1859s including driver change). Key channels: GPS Speed, GPS Lat/Lon, GPS LatAcc/LonAcc, RPM, Torque Feedback, Pack Voltage/Current, State of Charge, Pack Temp, Throttle Pos, Brake Pressure, LVCU Torque Req. Binary logs (`.xrk`, `.xrz`, `.drk`, `.rrk`) require AiM Race Studio.
 - **Endurance Tune2.txt**: BMS discharge limits, SOC taper, cell voltage bounds, inverter/motor parameter settings.
 - **About-Energy-Volt-Simulations/**: Voltt battery simulation export (110S4P, Molicel P45B). Two CSVs -- `_cell.csv` (single-cell level) and `_pack.csv` (pack-scaled). Used for battery model calibration (OCV-SOC curve, internal resistance).
+- **LVCU Code.txt**: LVCU firmware source — the torque command chain (`PowertrainModel.lvcu_torque_command()` and related methods) is a faithful translation of this file. Source of truth for `lvcu_power_constant`, `lvcu_rpm_scale`, `lvcu_omega_floor`, and pedal deadzone parameters in `PowertrainConfig`.
+- **emrax228_hv_cc_motor_map_long.csv**: EMRAX 228 motor efficiency map (speed_rpm, torque_Nm, efficiency_pct). Loaded by `MotorEfficiencyMap` for 2D operating-point-dependent motor+inverter efficiency. Falls back to constant `drivetrain_efficiency` if missing.
+- **Tire Models from TTC/**: PAC02 .tir files for Hoosier LC0 16x7.5-10 at multiple pressures (Round 8 TTC data). Primary: `Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir`. Longitudinal (Fx) coefficients transplanted from R25B donor data via `scripts/transplant_fx_coefficients.py`.
+- **CleanedEndurance.csv**: Cleaned AiM telemetry produced by `scripts/clean_endurance_data.py` (removes pre-start, driver change, post-finish). Uses `LFspeed` column (left-front wheel speed) instead of GPS Speed. Latin-1 encoding.
+
+### Known Issues (MUST READ)
+
+**`docs/REMAINING_ISSUES.md`** documents all known physics bugs, approximations, and code issues. As of 2026-04-15: 5 fixed, 2 partially fixed, 13 still open. **Read this before trusting simulation results or starting new physics work.**
 
 ### Key Vehicle Parameters (from DSS + Endurance Tune)
 | Parameter | Value | Source |
@@ -44,7 +52,7 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 ## Project Roadmap
 
 1. **Baseline simulation + validation** (DONE) -- quasi-static lap sim with 4-wheel Pacejka tire model, validated against Michigan 2025 telemetry (~2% energy error, 8/8 metrics pass).
-2. **Calibrated driver model** (DONE) -- zone-based driver model (`CalibratedStrategy`) calibrated from AiM telemetry. Collapses ~200 segments into ~30-40 coachable zones (throttle/coast/brake with intensity). FSAE scoring function (`FSAEScoring`) implements full Endurance + Efficiency scoring per D.12.13 / D.13.4, pre-configured with Michigan 2025 field data. Telemetry extraction pipeline in `analysis/telemetry_analysis.py`. Validation target: 3-5% error on time and energy vs telemetry.
+2. **Calibrated driver model + physics alignment** (IN PROGRESS) -- zone-based driver model (`CalibratedStrategy`) calibrated from AiM telemetry. Collapses ~200 segments into ~30-40 coachable zones (throttle/coast/brake with intensity). FSAE scoring function (`FSAEScoring`) implements full Endurance + Efficiency scoring per D.12.13 / D.13.4, pre-configured with Michigan 2025 field data. Telemetry extraction pipeline in `analysis/telemetry_analysis.py`. Validation target: 3-5% error on time and energy vs telemetry. **Blocking:** 13 open physics/code issues must be resolved before Phase 3 sweeps — see `docs/REMAINING_ISSUES.md`.
 3. **Strategy + tune sweeps** (NEXT) -- run thousands of sims varying driver parameters (zone overrides via `CalibratedStrategy.with_zone_override()`) and car tune (max RPM, torque limit, regen intensity). Optimize combined `FSAEScoring.combined_score` (Endurance + Efficiency, max 375 pts). Foundation: zone-based driver model + scoring function from Phase 2.
 4. **Driver coaching output** -- translate optimal parameters into actionable targets using `CalibratedStrategy.to_driver_brief()`: "coast X meters before corners," "use Y% throttle out of hairpins," "target Z kWh total energy." Drivers train to match these.
 
