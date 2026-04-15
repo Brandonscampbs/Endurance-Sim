@@ -9,8 +9,8 @@ scaling-factor support from TTC Round 8 Hoosier LC0 data.
 
 The longitudinal model uses coefficients transplanted from TTC Round 6
 Hoosier R25B (USE_MODE=4, Fx test data), scaled to match the LC0's
-lateral grip envelope per-pressure.  Combined-slip weighting functions
-(Gxa, Gyk) from the R25B replace the friction-ellipse approximation.
+lateral grip envelope per-pressure.  Combined-slip uses PAC2002 weighting
+functions (Gxa, Gyk, Svyk) from the R25B transplanted coefficients.
 """
 
 from __future__ import annotations
@@ -360,7 +360,7 @@ class PacejkaTireModel:
         return fx
 
     # ------------------------------------------------------------------
-    # Combined forces (friction-circle coupling)
+    # Combined forces (PAC2002 weighting functions)
     # ------------------------------------------------------------------
 
     def combined_forces(
@@ -370,11 +370,15 @@ class PacejkaTireModel:
         normal_load_n: float,
         camber_rad: float = 0.0,
     ) -> tuple[float, float]:
-        """Compute combined Fx, Fy with friction-circle coupling.
+        """Compute combined Fx, Fy using PAC2002 weighting functions.
 
-        When the resultant of pure-slip Fx0 and Fy0 exceeds the tyre's
-        peak force (friction circle), both forces are scaled down
-        proportionally so the resultant lies on the circle.
+        Uses Gxa (slip-angle reduction of Fx) and Gyk (slip-ratio
+        reduction of Fy) weighting functions from transplanted R25B
+        combined-slip coefficients, plus kappa-induced side force Svyk.
+
+        When combined-slip coefficients are zero (no data), the weighting
+        functions evaluate to 1.0 and Svyk to 0.0, so pure-slip forces
+        pass through unchanged.
 
         Args:
             slip_angle_rad: Slip angle (rad).
@@ -388,30 +392,88 @@ class PacejkaTireModel:
         fx0 = self.longitudinal_force(slip_ratio, normal_load_n, camber_rad)
         fy0 = self.lateral_force(slip_angle_rad, normal_load_n, camber_rad)
 
-        resultant = math.sqrt(fx0 ** 2 + fy0 ** 2)
-        if resultant < 1e-9:
-            return fx0, fy0
+        fz = max(normal_load_n, 1.0)
+        lfzo = self._sc("LFZO")
+        fz0 = self.fnomin * lfzo
+        dfz = (fz - fz0) / fz0 if fz0 > 0 else 0.0
 
-        # Peak force defines the friction circle radius
-        peak_fx = self.peak_longitudinal_force(normal_load_n, camber_rad)
-        peak_fy = self.peak_lateral_force(normal_load_n, camber_rad)
+        # === Gxa: slip-angle reduction of Fx ===
+        rbx1 = self._lon("RBX1")
+        rbx2 = self._lon("RBX2")
+        rcx1 = self._lon("RCX1")
+        rex1 = self._lon("REX1")
+        rex2 = self._lon("REX2")
+        rhx1 = self._lon("RHX1")
+        lxal = self._sc("LXAL")
 
-        # Elliptical friction circle: scale relative to each axis's peak
-        if peak_fx < 1e-9 or peak_fy < 1e-9:
-            return fx0, fy0
+        bxa = rbx1 * math.cos(math.atan(rbx2 * slip_ratio)) * lxal
+        cxa = rcx1
+        exa = rex1 + rex2 * dfz
+        exa = min(exa, 1.0)
+        alpha_s = slip_angle_rad + rhx1
 
-        # Normalized resultant on the friction ellipse
-        norm_x = fx0 / peak_fx
-        norm_y = fy0 / peak_fy
-        norm_resultant = math.sqrt(norm_x ** 2 + norm_y ** 2)
+        bxa_as = bxa * alpha_s
+        inner_xa = bxa_as - exa * (bxa_as - math.atan(bxa_as))
+        gxa_num = math.cos(cxa * math.atan(inner_xa))
 
-        if norm_resultant <= 1.0:
-            # Within the friction ellipse -- no scaling needed
-            return fx0, fy0
+        bxa_sh = bxa * rhx1
+        inner_xa0 = bxa_sh - exa * (bxa_sh - math.atan(bxa_sh))
+        gxa_den = math.cos(cxa * math.atan(inner_xa0))
 
-        # Scale both forces to sit on the ellipse boundary
-        scale = 1.0 / norm_resultant
-        return fx0 * scale, fy0 * scale
+        gxa = gxa_num / gxa_den if abs(gxa_den) > 1e-9 else 1.0
+
+        # === Gyk: slip-ratio reduction of Fy ===
+        rby1 = self._lat("RBY1")
+        rby2 = self._lat("RBY2")
+        rby3 = self._lat("RBY3")
+        rcy1 = self._lat("RCY1")
+        rey1 = self._lat("REY1")
+        rey2 = self._lat("REY2")
+        rhy1 = self._lat("RHY1")
+        rhy2 = self._lat("RHY2")
+        lyka = self._sc("LYKA")
+
+        byk = rby1 * math.cos(math.atan(rby2 * (slip_angle_rad - rby3))) * lyka
+        cyk = rcy1
+        eyk = rey1 + rey2 * dfz
+        eyk = min(eyk, 1.0)
+        kappa_s = slip_ratio + rhy1 + rhy2 * dfz
+
+        byk_ks = byk * kappa_s
+        inner_yk = byk_ks - eyk * (byk_ks - math.atan(byk_ks))
+        gyk_num = math.cos(cyk * math.atan(inner_yk))
+
+        sh_yk = rhy1 + rhy2 * dfz
+        byk_sh = byk * sh_yk
+        inner_yk0 = byk_sh - eyk * (byk_sh - math.atan(byk_sh))
+        gyk_den = math.cos(cyk * math.atan(inner_yk0))
+
+        gyk = gyk_num / gyk_den if abs(gyk_den) > 1e-9 else 1.0
+
+        # === Svyk: kappa-induced side force ===
+        rvy1 = self._lat("RVY1")
+        rvy2 = self._lat("RVY2")
+        rvy3 = self._lat("RVY3")
+        rvy4 = self._lat("RVY4")
+        rvy5 = self._lat("RVY5")
+        rvy6 = self._lat("RVY6")
+        lvyka = self._sc("LVYKA")
+        lmuy = self._sc("LMUY")
+
+        pdy1 = self._lat("PDY1")
+        pdy2 = self._lat("PDY2")
+        muy = abs(pdy1 + pdy2 * dfz) * lmuy
+
+        dvyk = (
+            muy * fz * (rvy1 + rvy2 * dfz + rvy3 * camber_rad)
+            * math.cos(math.atan(rvy4 * slip_angle_rad))
+        )
+        svyk = dvyk * math.sin(rvy5 * math.atan(rvy6 * slip_ratio)) * lvyka
+
+        fx = gxa * fx0
+        fy = gyk * fy0 + svyk
+
+        return fx, fy
 
     # ------------------------------------------------------------------
     # Peak force computation

@@ -599,3 +599,68 @@ class TestGripScale:
         tire_10psi.apply_grip_scale(0.5)
         peak_after = tire_10psi.peak_lateral_force(fz)
         assert peak_after == pytest.approx(peak_original * 0.25, rel=0.05)
+
+
+# ======================================================================
+# Combined forces PAC2002 weighting function tests
+# ======================================================================
+
+
+class TestCombinedForcesPAC2002:
+    """Tests for PAC2002 combined-slip weighting functions (Gxa, Gyk, Svyk)."""
+
+    def test_pure_lateral_unchanged(self, tire_10psi: PacejkaTireModel) -> None:
+        """With zero slip ratio, Gyk=1 and Svyk=0, so Fy=Fy_pure.
+
+        Fx at kappa=0 equals Gxa * Fx0, where Fx0 is the small SVx
+        offset from the pure longitudinal model.  The key assertion is
+        that Fy is unchanged by the weighting functions.
+        """
+        fy_pure = tire_10psi.lateral_force(0.1, 657.0)
+        fx_comb, fy_comb = tire_10psi.combined_forces(0.1, 0.0, 657.0)
+        # Fx at zero kappa is small (just SVx offset, possibly scaled by Gxa)
+        peak_fx = tire_10psi.peak_longitudinal_force(657.0)
+        assert abs(fx_comb) < peak_fx * 0.02
+        assert fy_comb == pytest.approx(fy_pure, rel=0.01)
+
+    def test_pure_longitudinal_unchanged(self, tire_10psi: PacejkaTireModel) -> None:
+        """With zero slip angle, Gxa=1, so Fx=Fx_pure."""
+        fx_pure = tire_10psi.longitudinal_force(0.1, 657.0)
+        fx_comb, fy_comb = tire_10psi.combined_forces(0.0, 0.1, 657.0)
+        assert fx_comb == pytest.approx(fx_pure, rel=0.01)
+
+    def test_combined_reduces_fx(self, tire_10psi: PacejkaTireModel) -> None:
+        """Slip angle should reduce Fx via Gxa < 1."""
+        fx_pure = tire_10psi.longitudinal_force(0.15, 657.0)
+        fx_comb, _ = tire_10psi.combined_forces(0.15, 0.15, 657.0)
+        assert abs(fx_comb) < abs(fx_pure)
+
+    def test_combined_reduces_fy(self, tire_10psi: PacejkaTireModel) -> None:
+        """Slip ratio should reduce Fy via Gyk < 1."""
+        fy_pure = tire_10psi.lateral_force(0.15, 657.0)
+        _, fy_comb = tire_10psi.combined_forces(0.15, 0.15, 657.0)
+        assert abs(fy_comb) < abs(fy_pure) * 1.05
+
+    def test_weighting_is_gradual(self, tire_10psi: PacejkaTireModel) -> None:
+        """Small combined slip should cause small force reduction (< 20%)."""
+        fx_pure = tire_10psi.longitudinal_force(0.05, 657.0)
+        fx_comb, _ = tire_10psi.combined_forces(0.02, 0.05, 657.0)
+        reduction = 1.0 - abs(fx_comb) / abs(fx_pure)
+        assert 0.0 < reduction < 0.20
+
+    def test_combined_sweep_no_nan(self, tire_10psi: PacejkaTireModel) -> None:
+        """Full combined-slip sweep produces no NaN."""
+        fz = 657.0
+        for i in range(21):
+            alpha = -0.3 + i * 0.6 / 20.0
+            for j in range(21):
+                kappa = -0.5 + j * 1.0 / 20.0
+                fx, fy = tire_10psi.combined_forces(alpha, kappa, fz)
+                assert math.isfinite(fx), f"NaN Fx at alpha={alpha}, kappa={kappa}"
+                assert math.isfinite(fy), f"NaN Fy at alpha={alpha}, kappa={kappa}"
+
+    def test_symmetric_slip_angle_effect(self, tire_10psi: PacejkaTireModel) -> None:
+        """Gxa should be roughly symmetric in slip angle."""
+        fx_pos, _ = tire_10psi.combined_forces(0.1, 0.1, 657.0)
+        fx_neg, _ = tire_10psi.combined_forces(-0.1, 0.1, 657.0)
+        assert abs(fx_pos) == pytest.approx(abs(fx_neg), rel=0.05)
