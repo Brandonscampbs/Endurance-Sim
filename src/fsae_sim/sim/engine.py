@@ -20,6 +20,14 @@ from fsae_sim.vehicle import VehicleConfig
 from fsae_sim.vehicle.battery_model import BatteryModel
 from fsae_sim.vehicle.dynamics import VehicleDynamics
 from fsae_sim.vehicle.powertrain_model import PowertrainModel
+
+try:
+    from fsae_sim.vehicle.motor_efficiency import MotorEfficiencyMap
+    _HAS_MOTOR_MAP = True
+except ImportError:
+    _HAS_MOTOR_MAP = False
+from pathlib import Path
+
 from fsae_sim.sim.speed_envelope import SpeedEnvelope
 
 try:
@@ -66,7 +74,15 @@ class SimulationEngine:
         self.track = track
         self.strategy = strategy
         self.battery_model = battery_model
-        self.powertrain = PowertrainModel(vehicle.powertrain)
+
+        # Load motor efficiency map if available
+        motor_map = None
+        if _HAS_MOTOR_MAP:
+            motor_map_path = Path("Real-Car-Data-And-Stats/emrax228_hv_cc_motor_map_long.csv")
+            if motor_map_path.exists():
+                motor_map = MotorEfficiencyMap(motor_map_path)
+
+        self.powertrain = PowertrainModel(vehicle.powertrain, efficiency_map=motor_map)
 
         tire_cfg = getattr(vehicle, "tire", None)
         susp_cfg = getattr(vehicle, "suspension", None)
@@ -194,9 +210,16 @@ class SimulationEngine:
                     # 2. Speed limit from pre-computed envelope
                     corner_limit = float(v_max[seg_idx])
 
+                    # 2b. BMS current limit for LVCU torque command
+                    bms_current_limit = self.battery_model.max_discharge_current(temp, soc)
+                    motor_rpm = self.powertrain.motor_rpm_from_speed(speed)
+
                     # 3. Compute forces based on driver action
                     if cmd.action == ControlAction.THROTTLE:
-                        drive_f = self.powertrain.drive_force(cmd.throttle_pct, speed)
+                        motor_torque = self.powertrain.lvcu_torque_command(
+                            cmd.throttle_pct, motor_rpm, bms_current_limit,
+                        )
+                        drive_f = self.powertrain.wheel_force(motor_torque)
                         drive_f = min(drive_f, self.dynamics.max_traction_force(speed))
                         regen_f = 0.0
                     elif cmd.action == ControlAction.BRAKE:
@@ -214,6 +237,7 @@ class SimulationEngine:
 
                     # 5. Net force and speed resolution
                     net_force = drive_f + regen_f - resist_f
+
                     exit_speed, seg_time = self.dynamics.resolve_exit_speed(
                         speed, segment.length_m, net_force, corner_limit,
                     )
@@ -222,9 +246,11 @@ class SimulationEngine:
                     avg_speed = (speed + exit_speed) / 2.0
                     motor_rpm = self.powertrain.motor_rpm_from_speed(avg_speed)
 
+                    # Recompute torque at resolved avg speed for accurate power calc
                     if cmd.action == ControlAction.THROTTLE:
-                        max_torque = self.powertrain.max_motor_torque(motor_rpm)
-                        motor_torque = cmd.throttle_pct * max_torque
+                        motor_torque = self.powertrain.lvcu_torque_command(
+                            cmd.throttle_pct, motor_rpm, bms_current_limit,
+                        )
                     elif cmd.action == ControlAction.BRAKE:
                         max_torque = self.powertrain.max_motor_torque(motor_rpm)
                         motor_torque = -cmd.brake_pct * max_torque
@@ -238,14 +264,10 @@ class SimulationEngine:
                 else:
                     pack_current = 0.0
 
-                # 8. Enforce BMS current limit
-                max_current = self.battery_model.max_discharge_current(temp, soc)
-                if pack_current > max_current:
-                    pack_current = max_current
-                    # Recalculate power with limited current
-                    elec_power = pack_current * pack_voltage
+                # BMS current limit is now enforced upstream via
+                # lvcu_torque_command — no after-the-fact clamp needed.
 
-                # 9. Step battery state
+                # 8. Step battery state
                 new_soc, new_temp, new_voltage = self.battery_model.step(
                     pack_current, seg_time, soc, temp,
                 )
