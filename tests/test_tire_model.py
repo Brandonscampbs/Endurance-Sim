@@ -78,6 +78,11 @@ class TestParser:
         assert tire_10psi.longitudinal["PCX1"] == pytest.approx(1.0)
         assert tire_10psi.longitudinal["PEX4"] == pytest.approx(-0.59049)
 
+    def test_combined_slip_coefficients_present(self, tire_10psi: PacejkaTireModel) -> None:
+        """Combined-slip R-coefficients should be non-zero after R25B transplant."""
+        assert tire_10psi.longitudinal.get("RBX1", 0.0) != 0.0
+        assert tire_10psi.lateral.get("RBY1", 0.0) != 0.0
+
     def test_scaling_all_ones(self, tire_10psi: PacejkaTireModel) -> None:
         """All scaling factors should be 1.0."""
         for key, val in tire_10psi.scaling.items():
@@ -339,7 +344,7 @@ class TestLongitudinalForcePAC2002:
 
 
 class TestCombinedForces:
-    """Verify friction-circle coupling for combined slip."""
+    """Verify combined-slip force behavior."""
 
     def test_pure_lateral_unchanged(self, tire_10psi: PacejkaTireModel) -> None:
         """With zero slip ratio, combined Fy should equal pure Fy.
