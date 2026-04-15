@@ -1,16 +1,20 @@
+import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import Sidebar from './components/Sidebar'
+import ValidationPage from './pages/validation/ValidationPage'
+import VisualizationPage from './pages/visualization/VisualizationPage'
+
 export default function App() {
   return (
-    <div className="min-h-screen bg-gray-950 text-gray-100 flex">
-      <aside className="w-56 bg-gray-900 border-r border-gray-800 p-4">
-        <h1 className="text-lg font-bold mb-6">FSAE Sim</h1>
-        <nav className="space-y-2">
-          <div className="text-sm text-gray-400">Validation</div>
-          <div className="text-sm text-gray-400">Visualization</div>
-        </nav>
-      </aside>
-      <main className="flex-1 p-6">
-        <p className="text-gray-500">App shell working.</p>
-      </main>
-    </div>
+    <BrowserRouter>
+      <div className="min-h-screen bg-gray-950 text-gray-100 flex">
+        <Sidebar />
+        <main className="flex-1 overflow-auto p-6">
+          <Routes>
+            <Route path="/" element={<ValidationPage />} />
+            <Route path="/visualization" element={<VisualizationPage />} />
+          </Routes>
+        </main>
+      </div>
+    </BrowserRouter>
   )
 }
