@@ -1,4 +1,4 @@
-import Plot from 'react-plotly.js'
+import Plot from '../../components/Plot'
 import type { TraceData, ValidationResponse } from '../../api/client'
 
 interface Props {

@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { useValidation, useAllLaps, useTrack, useLaps } from '../../api/client'
 import { useValidationStore } from '../../stores/validationStore'
 import LoadingSpinner from '../../components/LoadingSpinner'
@@ -20,9 +21,11 @@ export default function ValidationPage() {
     : 1
 
   // Set initial lap on first data load
-  if (lapsData && selectedLap === null) {
-    setSelectedLap(bestLap)
-  }
+  useEffect(() => {
+    if (lapsData && selectedLap === null) {
+      setSelectedLap(bestLap)
+    }
+  }, [lapsData, selectedLap, bestLap, setSelectedLap])
 
   return (
     <div className="space-y-6">

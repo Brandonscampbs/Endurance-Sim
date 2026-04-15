@@ -1,4 +1,4 @@
-import Plot from 'react-plotly.js'
+import Plot from '../../components/Plot'
 import type { TrackData, ValidationResponse } from '../../api/client'
 
 interface Props {
@@ -27,7 +27,7 @@ export default function TrackMaps({ track, validation }: Props) {
     ...validation.track_real_speed.filter(v => v > 0),
   )
 
-  const layout = (title: string): Partial<Plotly.Layout> => ({
+  const layout = (title: string) => ({
     title: { text: title, font: { color: '#9ca3af', size: 14 } },
     paper_bgcolor: 'transparent',
     plot_bgcolor: 'transparent',
@@ -37,14 +37,14 @@ export default function TrackMaps({ track, validation }: Props) {
     showlegend: false,
   })
 
-  const makeTrace = (speeds: number[]): Plotly.Data => ({
-    type: 'scatter',
-    mode: 'markers',
+  const makeTrace = (speeds: number[]) => ({
+    type: 'scatter' as const,
+    mode: 'markers' as const,
     x: xs,
     y: ys,
     marker: {
       color: speeds,
-      colorscale: COLOR_SCALE as unknown as Plotly.ColorScale,
+      colorscale: COLOR_SCALE,
       cmin: minSpeed,
       cmax: maxSpeed,
       size: 4,
