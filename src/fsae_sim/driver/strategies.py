@@ -1,5 +1,6 @@
 """Concrete driver strategy implementations.
 
+- PedalProfileStrategy: per-segment pedal profile from telemetry (primary)
 - ReplayStrategy: reproduce recorded telemetry behavior
 - CoastOnlyStrategy: full throttle on straights, coast into corners
 - ThresholdBrakingStrategy: coast + brake when speed exceeds corner limit
@@ -7,6 +8,8 @@
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -25,6 +28,20 @@ from fsae_sim.analysis.telemetry_analysis import (
     extract_per_segment_actions,
     collapse_to_zones,
 )
+
+
+@dataclass(frozen=True)
+class DriverParams:
+    """Tunable driver behavior parameters for sweeps.
+
+    All multipliers default to 1.0 (baseline = telemetry behavior).
+    """
+
+    throttle_scale: float = 1.0
+    brake_scale: float = 1.0
+    coast_throttle: float = 0.0
+    max_throttle: float = 1.0
+    max_brake: float = 1.0
 
 
 class ReplayStrategy(DriverStrategy):
@@ -52,10 +69,17 @@ class ReplayStrategy(DriverStrategy):
         lap_distance_m: float,
         *,
         wrap: bool = True,
+        electrical_power_w: np.ndarray | None = None,
     ) -> None:
         self._lap_distance_m = lap_distance_m
         self._total_distance_m = float(distances_m[-1])
         self._wrap = wrap
+        self._has_power = electrical_power_w is not None
+        if self._has_power:
+            self._power_interp = interp1d(
+                distances_m, electrical_power_w, kind="linear",
+                bounds_error=False, fill_value=(0.0, 0.0),
+            )
         self._throttle_interp = interp1d(
             distances_m, throttle_pct, kind="linear",
             bounds_error=False, fill_value=(float(throttle_pct[0]), float(throttle_pct[-1])),
@@ -125,6 +149,13 @@ class ReplayStrategy(DriverStrategy):
 
         mean_torque = float(np.mean(torque))
 
+        # Measured electrical power from pack: V × I (W).
+        # Positive = discharge, negative = regen/charging.
+        # This is the most accurate energy measurement — direct from
+        # the battery terminals, bypassing any torque sensor bias or
+        # motor efficiency model uncertainty.
+        elec_power = clean["Pack Voltage"].values * clean["Pack Current"].values
+
         # Extend interpolation data with a point beyond the last distance
         # so extrapolation uses reasonable values if sim distance exceeds
         # the AiM data range.
@@ -133,9 +164,10 @@ class ReplayStrategy(DriverStrategy):
         throttle_ext = np.append(throttle, 0.5)
         brake_ext = np.append(brake, 0.0)
         torque_ext = np.append(torque, mean_torque)
+        power_ext = np.append(elec_power, 0.0)
 
         return cls(dist_ext, throttle_ext, brake_ext, torque_ext,
-                   lap_distance_m, wrap=False)
+                   lap_distance_m, wrap=False, electrical_power_w=power_ext)
 
     def _resolve_distance(self, cumulative_distance_m: float) -> float:
         """Map cumulative sim distance to interpolation distance."""
@@ -146,6 +178,22 @@ class ReplayStrategy(DriverStrategy):
     def target_torque(self, distance_m: float) -> float:
         """Recorded motor torque (Nm) at given cumulative distance."""
         return float(self._torque_interp(self._resolve_distance(distance_m)))
+
+    @property
+    def has_electrical_power(self) -> bool:
+        """True if this replay includes measured V×I power data."""
+        return self._has_power
+
+    def measured_electrical_power(self, distance_m: float) -> float:
+        """Recorded Pack Voltage × Pack Current (W) at given distance.
+
+        Returns the actual electrical power measured at the battery
+        terminals.  Positive = discharging, negative = charging.
+        Only available when constructed with ``electrical_power_w``.
+        """
+        if not self._has_power:
+            return 0.0
+        return float(self._power_interp(self._resolve_distance(distance_m)))
 
     def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
         d = self._resolve_distance(state.distance)
@@ -463,3 +511,69 @@ class CalibratedStrategy(DriverStrategy):
                 label=label,
             ))
         return cls(driver_zones, track.num_segments, name=name)
+
+
+class PedalProfileStrategy(DriverStrategy):
+    """Per-segment pedal-profile driver model.
+
+    Stores raw throttle position and brake pressure per track segment,
+    extracted from telemetry.  At runtime, outputs pedal values that
+    the engine routes through ``lvcu_torque_command()`` — the same
+    firmware chain the real car uses.
+
+    For sweeps, ``DriverParams`` multipliers scale pedal inputs (driver
+    behavior) while ``PowertrainConfig`` changes affect LVCU processing
+    (car tune).  Both sweep independently.
+    """
+
+    name = "pedal_profile"
+
+    def __init__(
+        self,
+        throttle_pct: np.ndarray,
+        brake_pct: np.ndarray,
+        actions: np.ndarray,
+        ref_speed_ms: np.ndarray,
+        num_segments: int,
+        *,
+        params: DriverParams | None = None,
+    ) -> None:
+        if not (len(throttle_pct) == len(brake_pct) == len(actions) == len(ref_speed_ms) == num_segments):
+            raise ValueError(
+                f"All arrays must have the same length as num_segments ({num_segments}), "
+                f"got throttle={len(throttle_pct)}, brake={len(brake_pct)}, "
+                f"actions={len(actions)}, ref_speed={len(ref_speed_ms)}"
+            )
+        self._throttle_pct = np.asarray(throttle_pct, dtype=np.float64)
+        self._brake_pct = np.asarray(brake_pct, dtype=np.float64)
+        self._actions = np.asarray(actions, dtype=np.int32)
+        self._ref_speed_ms = np.asarray(ref_speed_ms, dtype=np.float64)
+        self._num_segments = num_segments
+        self.params = params or DriverParams()
+
+    @property
+    def num_segments(self) -> int:
+        return self._num_segments
+
+    def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
+        seg_idx = state.segment_idx % self._num_segments
+        action_code = int(self._actions[seg_idx])
+
+        if action_code == 1:  # THROTTLE
+            throttle = float(self._throttle_pct[seg_idx]) * self.params.throttle_scale
+            throttle = min(throttle, self.params.max_throttle)
+            throttle = max(0.0, min(1.0, throttle))
+            return ControlCommand(ControlAction.THROTTLE, throttle_pct=throttle, brake_pct=0.0)
+
+        elif action_code == 2:  # BRAKE
+            brake = float(self._brake_pct[seg_idx]) * self.params.brake_scale
+            brake = min(brake, self.params.max_brake)
+            brake = max(0.0, min(1.0, brake))
+            return ControlCommand(ControlAction.BRAKE, throttle_pct=0.0, brake_pct=brake)
+
+        else:  # COAST (0)
+            return ControlCommand(
+                ControlAction.COAST,
+                throttle_pct=max(0.0, min(1.0, self.params.coast_throttle)),
+                brake_pct=0.0,
+            )
