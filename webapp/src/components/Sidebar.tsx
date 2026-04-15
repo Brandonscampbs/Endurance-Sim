@@ -1,4 +1,6 @@
+import { useState } from 'react'
 import { NavLink } from 'react-router-dom'
+import { rerunSimulation } from '../api/client'
 
 const links = [
   { to: '/', label: 'Validation' },
@@ -6,6 +8,17 @@ const links = [
 ]
 
 export default function Sidebar() {
+  const [rerunning, setRerunning] = useState(false)
+
+  async function handleRerun() {
+    setRerunning(true)
+    try {
+      await rerunSimulation()
+    } finally {
+      setRerunning(false)
+    }
+  }
+
   return (
     <aside className="w-56 shrink-0 bg-gray-900 border-r border-gray-800 flex flex-col">
       <div className="p-4 border-b border-gray-800">
@@ -29,6 +42,15 @@ export default function Sidebar() {
           </NavLink>
         ))}
       </nav>
+      <div className="mt-auto p-3 border-t border-gray-800">
+        <button
+          onClick={handleRerun}
+          disabled={rerunning}
+          className="w-full px-3 py-2 rounded text-sm font-medium transition-colors bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-wait text-white"
+        >
+          {rerunning ? 'Rerunning...' : 'Rerun Simulation'}
+        </button>
+      </div>
     </aside>
   )
 }

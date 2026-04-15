@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { syncAnimIndex } from '../pages/visualization/animationState'
 
 export type CameraMode = 'chase' | 'birdseye' | 'orbit'
 
@@ -40,9 +41,27 @@ export const usePlaybackStore = create<PlaybackState>((set, get) => ({
   pause: () => set({ isPlaying: false }),
   togglePlay: () => set(s => ({ isPlaying: !s.isPlaying })),
   setSpeed: (speed) => set({ speed }),
-  setFrame: (f) => set({ currentFrame: Math.max(0, Math.min(f, get().totalFrames - 1)) }),
-  nextFrame: () => { const s = get(); if (s.currentFrame < s.totalFrames - 1) set({ currentFrame: s.currentFrame + 1 }) },
-  prevFrame: () => { const s = get(); if (s.currentFrame > 0) set({ currentFrame: s.currentFrame - 1 }) },
+  setFrame: (f) => {
+    const clamped = Math.max(0, Math.min(f, get().totalFrames - 1))
+    set({ currentFrame: clamped })
+    syncAnimIndex(clamped)
+  },
+  nextFrame: () => {
+    const s = get()
+    if (s.currentFrame < s.totalFrames - 1) {
+      const next = s.currentFrame + 1
+      set({ currentFrame: next })
+      syncAnimIndex(next)
+    }
+  },
+  prevFrame: () => {
+    const s = get()
+    if (s.currentFrame > 0) {
+      const prev = s.currentFrame - 1
+      set({ currentFrame: prev })
+      syncAnimIndex(prev)
+    }
+  },
   setTotalFrames: (n) => set({ totalFrames: n }),
   setCameraMode: (cameraMode) => set({ cameraMode }),
   toggleForces: () => set(s => ({ showForces: !s.showForces })),

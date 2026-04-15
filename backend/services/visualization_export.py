@@ -55,8 +55,8 @@ def _compute_tire_loads(
     longitudinal_g: float,
     mass_kg: float,
     cg_height_m: float = 0.2794,
-    front_track_m: float = 1.2,
-    rear_track_m: float = 1.2,
+    front_track_m: float = 1.194,
+    rear_track_m: float = 1.168,
     wheelbase_m: float = 1.549,
     weight_dist_front: float = 0.53,
 ) -> tuple[float, float, float, float]:
@@ -68,8 +68,8 @@ def _compute_tire_loads(
     long_transfer = mass_kg * longitudinal_g * _GRAVITY * cg_height_m / wheelbase_m / 2
 
     lat_g = speed_ms ** 2 * abs(curvature) / _GRAVITY
-    lat_transfer_front = mass_kg * lat_g * _GRAVITY * cg_height_m * 0.53 / front_track_m / 2
-    lat_transfer_rear = mass_kg * lat_g * _GRAVITY * cg_height_m * 0.47 / rear_track_m / 2
+    lat_transfer_front = mass_kg * lat_g * _GRAVITY * cg_height_m * 0.53 / front_track_m
+    lat_transfer_rear = mass_kg * lat_g * _GRAVITY * cg_height_m * 0.47 / rear_track_m
 
     sign = 1.0 if curvature >= 0 else -1.0
 
@@ -95,7 +95,7 @@ def _estimate_grip_utilization(
 def _compute_roll_pitch(
     lat_g: float,
     long_g: float,
-    roll_stiffness_nm_per_deg: float = 800.0,
+    roll_stiffness_nm_per_deg: float = 496.0,  # 238 front + 258 rear from DSS
     pitch_stiffness_nm_per_deg: float = 600.0,
     mass_kg: float = 288.0,
     cg_height_m: float = 0.2794,
@@ -114,11 +114,21 @@ def _compute_roll_pitch(
 
 def get_visualization_data(source: str = "sim") -> VisualizationResponse:
     """Build per-frame 3D visualization data for the best GPS quality lap."""
-    track_data = get_track_data()
     aim_df = get_telemetry()
     track = get_track()
+    vehicle = get_vehicle_config()
+    mass_kg = vehicle.vehicle.mass_kg + 68
+    gear_ratio = vehicle.powertrain.gear_ratio
+    tire_radius = 0.2042  # Hoosier 16x7.5-10 LC0 unloaded radius
 
-    lats, lons, dists = _load_best_lap_gps(aim_df, track)
+    # (#3) Pick the best lap ONCE and use the same lap for both centerline and frames
+    from backend.services.telemetry_service import get_lap_gps_quality
+    quality = get_lap_gps_quality()
+    best = min(quality, key=lambda q: q["gps_quality_score"])
+    best_lap_idx = best["lap_number"] - 1  # 0-based for _load_best_lap_gps
+
+    # (#4) Build centerline from the same lap, no speed filter, so distance axes match
+    lats, lons, dists = _load_best_lap_gps(aim_df, track, lap_idx=best_lap_idx)
     centerline = build_track_xy(lats, lons, dists, bin_size_m=1.0)
     cl_x = np.array([p.x for p in centerline])
     cl_y = np.array([p.y for p in centerline])
@@ -126,9 +136,6 @@ def get_visualization_data(source: str = "sim") -> VisualizationResponse:
 
     cs_x = CubicSpline(cl_d, cl_x)
     cs_y = CubicSpline(cl_d, cl_y)
-
-    vehicle = get_vehicle_config()
-    mass_kg = vehicle.vehicle.mass_kg + 68
 
     if source == "sim":
         result = run_single_lap_sim()
@@ -138,11 +145,11 @@ def get_visualization_data(source: str = "sim") -> VisualizationResponse:
         sim_speeds = np.interp(cl_d, sim_df["distance_m"].values, sim_df["speed_kmh"].values)
         track_speeds = [round(float(v), 1) for v in sim_speeds]
     else:
-        from backend.services.telemetry_service import get_lap_gps_quality
-        quality = get_lap_gps_quality()
-        best = min(quality, key=lambda q: q["gps_quality_score"])
         real_df = get_lap_data(best["lap_number"])
-        frames = _build_real_frames(real_df, cs_x, cs_y, cl_d, mass_kg)
+        frames = _build_real_frames(
+            real_df, cs_x, cs_y, cl_d, mass_kg,
+            gear_ratio=gear_ratio, tire_radius=tire_radius,
+        )
         total_time = best["time_s"]
         real_speeds = np.interp(cl_d, real_df["lap_distance_m"].values, real_df["GPS Speed"].values)
         track_speeds = [round(float(v), 1) for v in real_speeds]
@@ -225,50 +232,84 @@ def _build_sim_frames(
     return frames
 
 
+def _safe_float(val, default: float = 0.0) -> float:
+    """Extract a float from a pandas value, returning default if NaN or missing."""
+    if val is None:
+        return default
+    f = float(val)
+    if math.isnan(f):
+        return default
+    return f
+
+
 def _build_real_frames(
     real_df, cs_x, cs_y, cl_d, mass_kg: float,
+    gear_ratio: float = 3.6363,
+    tire_radius: float = 0.2042,
+    gearbox_efficiency: float = 0.97,
 ) -> list[Frame]:
     """Convert real telemetry into 3D frames."""
     frames = []
     max_d = cl_d[-1]
     t0 = real_df["Time"].iloc[0]
 
+    # Pre-compute brake normalization outside the loop (#2, #14)
+    has_rear_brake = "RBrakePressure" in real_df.columns
+    if has_rear_brake:
+        brake_col = real_df["RBrakePressure"]
+        brake_baseline = float(brake_col.median())
+        brake_max = float((brake_col - brake_baseline).clip(lower=0).max())
+        if brake_max <= 0:
+            brake_max = 1.0
+    else:
+        brake_baseline = 0.0
+        brake_max = 1.0
+
     for _, row in real_df.iterrows():
         d = float(row["lap_distance_m"])
-        if d < 0 or d >= max_d:
+        if d < 0 or d > max_d:  # (#17) use > instead of >= to keep end-of-lap frames
             continue
-        x = float(cs_x(d))
-        y = float(cs_y(d))
-        dx = float(cs_x(d, 1))
-        dy = float(cs_y(d, 1))
+        d_clamped = min(d, max_d - 0.01)
+        x = float(cs_x(d_clamped))
+        y = float(cs_y(d_clamped))
+        dx = float(cs_x(d_clamped, 1))
+        dy = float(cs_y(d_clamped, 1))
         heading = math.atan2(dy, dx)
 
         speed_kmh = float(row["GPS Speed"])
         speed_ms = speed_kmh / 3.6
         throttle = float(row["Throttle Pos"])
-        brake_raw = float(row.get("FBrakePressure", 0))
-        brake_max = real_df["FBrakePressure"].max() if "FBrakePressure" in real_df.columns else 1.0
-        brake_pct = (brake_raw / brake_max * 100) if brake_max > 0 else 0
+
+        # (#2) Use RBrakePressure (working sensor), zero-offset by baseline
+        if has_rear_brake:
+            brake_raw = max(0.0, float(row["RBrakePressure"]) - brake_baseline)
+            brake_pct = (brake_raw / brake_max * 100)
+        else:
+            brake_raw = 0.0
+            brake_pct = 0.0
 
         if throttle > 5:
             action = "throttle"
-        elif brake_raw > 2:
+        elif brake_raw > 1.0:
             action = "brake"
         else:
             action = "coast"
 
-        lat_g = float(row.get("GPS LatAcc", 0))
+        # (#11) NaN-safe reads for accelerometer channels
+        lat_g = _safe_float(row.get("GPS LatAcc"))
         curvature = lat_g * _GRAVITY / (speed_ms ** 2) if speed_ms > 1 else 0
 
-        torque_req = float(row.get("LVCU Torque Req", 0))
-        gear_ratio = 3.6363
-        tire_radius = 0.2042
-        drive_force = torque_req * gear_ratio / tire_radius * 0.97 if torque_req > 0 else 0
-        regen_force = abs(torque_req) * gear_ratio / tire_radius * 0.85 if torque_req < 0 else 0
+        # (#5) Use real longitudinal acceleration instead of hardcoded 0
+        long_g = _safe_float(row.get("GPS LonAcc"))
+
+        # (#15) Use passed parameters instead of hardcoded values
+        torque_req = _safe_float(row.get("LVCU Torque Req"))
+        # (#7) Both drive and regen use gearbox_efficiency for mechanical force
+        drive_force = torque_req * gear_ratio / tire_radius * gearbox_efficiency if torque_req > 0 else 0
+        regen_force = abs(torque_req) * gear_ratio / tire_radius * gearbox_efficiency if torque_req < 0 else 0
 
         fl_fx, fr_fx, rl_fx, rr_fx = distribute_drive_force(drive_force, regen_force)
         fl_fy, fr_fy, rl_fy, rr_fy = _compute_lateral_forces(speed_ms, curvature, mass_kg)
-        long_g = 0.0
         fl_fz, fr_fz, rl_fz, rr_fz = _compute_tire_loads(speed_ms, curvature, long_g, mass_kg)
 
         wheels = [
@@ -292,11 +333,11 @@ def _build_real_frames(
             speed_kmh=round(speed_kmh, 1),
             throttle_pct=round(throttle, 1),
             brake_pct=round(brake_pct, 1),
-            motor_rpm=round(float(row.get("RPM", 0)), 0),
-            motor_torque_nm=round(float(row.get("LVCU Torque Req", 0)), 1),
-            soc_pct=round(float(row.get("State of Charge", 0)), 2),
-            pack_voltage_v=round(float(row.get("Pack Voltage", 0)), 1),
-            pack_current_a=round(float(row.get("Pack Current", 0)), 1),
+            motor_rpm=round(_safe_float(row.get("Motor RPM")), 0),  # (#1) was "RPM"
+            motor_torque_nm=round(_safe_float(row.get("LVCU Torque Req")), 1),
+            soc_pct=round(_safe_float(row.get("State of Charge")), 2),
+            pack_voltage_v=round(_safe_float(row.get("Pack Voltage")), 1),
+            pack_current_a=round(_safe_float(row.get("Pack Current")), 1),
             roll_rad=round(roll_rad, 4),
             pitch_rad=round(pitch_rad, 4),
             action=action,

@@ -29,13 +29,13 @@ function TrackMinimap({ frame, data }: { frame: VizFrame; data: VisualizationRes
   const points = data.track_centerline_x
     .map((x, i) => {
       const nx = ((x - minX) / range) * 100
-      const ny = ((data.track_centerline_y[i] - minY) / range) * 100
+      const ny = 100 - ((data.track_centerline_y[i] - minY) / range) * 100
       return `${nx},${ny}`
     })
     .join(' ')
 
   const cx = ((frame.x - minX) / range) * 100
-  const cy = ((frame.y - minY) / range) * 100
+  const cy = 100 - ((frame.y - minY) / range) * 100
 
   return (
     <svg viewBox="-10 -10 120 120" className="w-full bg-gray-800/50 rounded">

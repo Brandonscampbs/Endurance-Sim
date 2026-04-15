@@ -2,48 +2,76 @@ import { useRef, useEffect } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
 import type { VisualizationResponse } from '../../api/client'
 import { usePlaybackStore } from '../../stores/playbackStore'
+import { animState } from './animationState'
 import WireframeCar from './WireframeCar'
 import ForceArrows from './ForceArrows'
 import TrackLine from './TrackLine'
 import CameraController from './CameraController'
 
+/** Push frame index to Zustand every N steps (for timeline + side panel) */
+const UI_SYNC_INTERVAL = 2
+
 function PlaybackLoop({ data }: { data: VisualizationResponse }) {
-  const isPlaying = usePlaybackStore(s => s.isPlaying)
-  const speed = usePlaybackStore(s => s.speed)
-  const currentFrame = usePlaybackStore(s => s.currentFrame)
-  const totalFrames = usePlaybackStore(s => s.totalFrames)
-  const setFrame = usePlaybackStore(s => s.setFrame)
-  const showForces = usePlaybackStore(s => s.showForces)
-  const showTrackColor = usePlaybackStore(s => s.showTrackColor)
   const accumulator = useRef(0)
+  const ticksSinceSync = useRef(0)
 
-  const frame = data.frames[currentFrame] ?? data.frames[0]
-
-  // Calculate time step between frames
-  const dt = currentFrame < totalFrames - 1
-    ? data.frames[currentFrame + 1].time_s - frame.time_s
-    : 0.05  // fallback
+  // Load frames into shared animation state
+  useEffect(() => {
+    animState.frames = data.frames
+    animState.index = 0
+    animState.frac = 0
+    usePlaybackStore.getState().setTotalFrames(data.frames.length)
+    usePlaybackStore.getState().setFrame(0)
+  }, [data])
 
   useFrame((_, delta) => {
-    if (!isPlaying) return
-    accumulator.current += delta * speed
-    if (accumulator.current >= dt && dt > 0) {
-      const steps = Math.floor(accumulator.current / dt)
-      accumulator.current -= steps * dt
-      const next = Math.min(currentFrame + steps, totalFrames - 1)
-      setFrame(next)
-      if (next >= totalFrames - 1) {
-        usePlaybackStore.getState().pause()
-      }
+    const store = usePlaybackStore.getState()
+    if (store.totalFrames === 0) return
+
+    if (!store.isPlaying) {
+      accumulator.current = 0
+      ticksSinceSync.current = 0
+      return
+    }
+
+    const frames = animState.frames
+    let idx = animState.index
+    if (idx >= store.totalFrames - 1) {
+      store.pause()
+      store.setFrame(idx)
+      return
+    }
+
+    accumulator.current += delta * store.speed
+
+    // Advance through frames as the accumulator allows
+    let dt = frames[idx + 1].time_s - frames[idx].time_s
+    while (dt > 0 && accumulator.current >= dt && idx < store.totalFrames - 2) {
+      accumulator.current -= dt
+      idx++
+      dt = frames[idx + 1].time_s - frames[idx].time_s
+      ticksSinceSync.current++
+    }
+
+    animState.index = idx
+    // Interpolation fraction: how far between frames[idx] and frames[idx+1]
+    animState.frac = dt > 0 ? Math.min(accumulator.current / dt, 1) : 0
+
+    // Throttled sync to Zustand for UI panels
+    if (ticksSinceSync.current >= UI_SYNC_INTERVAL) {
+      store.setFrame(idx)
+      ticksSinceSync.current = 0
     }
   })
 
+  const showTrackColor = usePlaybackStore(s => s.showTrackColor)
+
   return (
     <>
-      <WireframeCar frame={frame} />
-      {showForces && <ForceArrows frame={frame} />}
+      <WireframeCar />
+      <ForceArrows />
       <TrackLine data={data} showColors={showTrackColor} />
-      <CameraController frame={frame} />
+      <CameraController />
     </>
   )
 }
@@ -53,20 +81,11 @@ interface Props {
 }
 
 export default function Viewport({ data }: Props) {
-  useEffect(() => {
-    usePlaybackStore.getState().setTotalFrames(data.frames.length)
-  }, [data])
-
   return (
     <Canvas camera={{ position: [0, 10, 10], fov: 50 }} className="bg-gray-950">
-      {/* Lighting */}
       <ambientLight intensity={0.6} />
       <directionalLight position={[10, 20, 10]} intensity={0.4} />
-
-      {/* Ground grid */}
       <gridHelper args={[200, 100, '#1f2937', '#111827']} />
-
-      {/* Scene */}
       <PlaybackLoop data={data} />
     </Canvas>
   )

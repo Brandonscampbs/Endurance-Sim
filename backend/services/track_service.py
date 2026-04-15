@@ -27,7 +27,7 @@ def build_track_xy(
 
     # Degrees to meters (equirectangular)
     x_raw = (lons - lon_ref) * cos_lat * 111_320.0
-    y_raw = (lats - lat_ref) * 110_540.0
+    y_raw = (lats - lat_ref) * 111_132.92
 
     # Remove duplicate distances for spline
     mask = np.diff(distances, prepend=-1) > 0.01
@@ -87,37 +87,49 @@ def detect_sectors(
     return sectors
 
 
-def _load_best_lap_gps(aim_df: pd.DataFrame, track: Track) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract GPS data for the lap with the best quality."""
+def _load_best_lap_gps(
+    aim_df: pd.DataFrame,
+    track: Track,
+    lap_idx: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract GPS data for a lap.
+
+    Args:
+        aim_df: Full telemetry DataFrame.
+        track: Track object (unused, kept for API compat).
+        lap_idx: 0-based lap index. If None, auto-selects best quality lap.
+
+    Returns:
+        (lats, lons, distances) arrays with distance normalised to 0.
+    """
     boundaries = get_lap_boundaries()
     if not boundaries:
         raise ValueError("No laps detected in telemetry")
 
-    # Pick lap with the smoothest GPS heading (proxy for quality without PosAccuracy)
-    best_score = float("inf")
-    best_lap_idx = 0
-    for idx, (start, end, _) in enumerate(boundaries):
-        lap_slice = aim_df.iloc[start:end]
-        # Filter low speed samples
-        fast = lap_slice[lap_slice["GPS Speed"] > _MIN_SPEED_KMH]
-        if len(fast) < 20:
-            continue
-        if "GPS Heading" in fast.columns:
-            score = float(fast["GPS Heading"].diff().abs().std())
-            if not np.isnan(score) and score < best_score:
-                best_score = score
-                best_lap_idx = idx
-        else:
-            best_lap_idx = 0
-            break
+    if lap_idx is None:
+        # Pick lap with the smoothest GPS heading (proxy for quality)
+        best_score = float("inf")
+        best_lap_idx = 0
+        for idx, (start, end, _) in enumerate(boundaries):
+            lap_slice = aim_df.iloc[start:end]
+            fast = lap_slice[lap_slice["GPS Speed"] > _MIN_SPEED_KMH]
+            if len(fast) < 20:
+                continue
+            if "GPS Heading" in fast.columns:
+                score = float(fast["GPS Heading"].diff().abs().std())
+                if not np.isnan(score) and score < best_score:
+                    best_score = score
+                    best_lap_idx = idx
+            else:
+                best_lap_idx = 0
+                break
+        lap_idx = best_lap_idx
 
-    start, end, _ = boundaries[best_lap_idx]
+    start, end, _ = boundaries[lap_idx]
     lap_df = aim_df.iloc[start:end].copy()
 
-    # Filter low speed
-    mask = lap_df["GPS Speed"] > _MIN_SPEED_KMH
-    lap_df = lap_df[mask]
-
+    # Keep ALL rows (no speed filter) so the distance axis matches
+    # telemetry_service.get_lap_data() exactly.
     lats = lap_df["GPS Latitude"].values
     lons = lap_df["GPS Longitude"].values
     dists = lap_df["Distance on GPS Speed"].values

@@ -18,7 +18,7 @@ export default function Timeline({ data }: Props) {
     (e: React.MouseEvent<HTMLDivElement>) => {
       if (!barRef.current) return
       const rect = barRef.current.getBoundingClientRect()
-      const pct = (e.clientX - rect.left) / rect.width
+      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
       setFrame(Math.round(pct * (totalFrames - 1)))
     },
     [totalFrames, setFrame],

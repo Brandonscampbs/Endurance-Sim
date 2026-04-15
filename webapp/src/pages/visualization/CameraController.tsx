@@ -3,39 +3,47 @@ import { useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
 import { usePlaybackStore } from '../../stores/playbackStore'
-import type { VizFrame } from '../../api/client'
+import { animState, lerpAngle } from './animationState'
 
-interface Props {
-  frame: VizFrame
-}
-
-export default function CameraController({ frame }: Props) {
+export default function CameraController() {
   const cameraMode = usePlaybackStore(s => s.cameraMode)
   const { camera } = useThree()
   const target = useRef(new THREE.Vector3())
   const smoothPos = useRef(new THREE.Vector3())
 
-  useFrame(() => {
-    const carPos = new THREE.Vector3(frame.x, 0.3, frame.y)
-    target.current.lerp(carPos, 0.1)
+  useFrame((_, delta) => {
+    const curr = animState.current
+    if (!curr) return
 
-    if (cameraMode === 'chase') {
-      // Behind and above the car
+    // Interpolated position for smooth camera tracking
+    const next = animState.frames[animState.index + 1]
+    const t = animState.frac
+    const ix = next ? curr.x + (next.x - curr.x) * t : curr.x
+    const iy = next ? curr.y + (next.y - curr.y) * t : curr.y
+    const ih = next ? lerpAngle(curr.heading_rad, next.heading_rad, t) : curr.heading_rad
+
+    const carPos = new THREE.Vector3(ix, 0.3, iy)
+    // Frame-rate-independent smoothing: target rate = 60fps
+    const targetSmooth = 1 - Math.pow(1 - 0.1, delta * 60)
+    const camSmooth = 1 - Math.pow(1 - 0.05, delta * 60)
+    target.current.lerp(carPos, targetSmooth)
+
+    const mode = usePlaybackStore.getState().cameraMode
+    if (mode === 'chase') {
       const behind = new THREE.Vector3(
-        frame.x - Math.cos(frame.heading_rad) * 4,
+        ix - Math.cos(ih) * 4,
         2.5,
-        frame.y - Math.sin(frame.heading_rad) * 4,
+        iy - Math.sin(ih) * 4,
       )
-      smoothPos.current.lerp(behind, 0.05)
+      smoothPos.current.lerp(behind, camSmooth)
       camera.position.copy(smoothPos.current)
       camera.lookAt(target.current)
-    } else if (cameraMode === 'birdseye') {
-      const above = new THREE.Vector3(frame.x, 15, frame.y)
-      smoothPos.current.lerp(above, 0.1)
+    } else if (mode === 'birdseye') {
+      const above = new THREE.Vector3(ix, 15, iy)
+      smoothPos.current.lerp(above, targetSmooth)
       camera.position.copy(smoothPos.current)
       camera.lookAt(target.current)
     }
-    // 'orbit' mode is handled by OrbitControls -- we just update the target
   })
 
   if (cameraMode === 'orbit') {

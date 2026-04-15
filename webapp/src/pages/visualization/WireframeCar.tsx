@@ -1,6 +1,7 @@
 import { useRef } from 'react'
+import { useFrame } from '@react-three/fiber'
 import { Group } from 'three'
-import type { VizFrame } from '../../api/client'
+import { animState, lerpAngle } from './animationState'
 
 // CT-16EV dimensions in meters
 const WHEELBASE = 1.549
@@ -25,26 +26,42 @@ function Wheel({ position }: { position: [number, number, number] }) {
   )
 }
 
-interface Props {
-  frame: VizFrame
-}
-
-export default function WireframeCar({ frame }: Props) {
+export default function WireframeCar() {
   const groupRef = useRef<Group>(null)
 
+  useFrame(() => {
+    const curr = animState.current
+    if (!curr || !groupRef.current) return
+
+    const next = animState.frames[animState.index + 1]
+    if (next) {
+      const t = animState.frac
+      groupRef.current.position.set(
+        curr.x + (next.x - curr.x) * t,
+        0,
+        curr.y + (next.y - curr.y) * t,
+      )
+      groupRef.current.rotation.set(
+        curr.roll_rad + (next.roll_rad - curr.roll_rad) * t,
+        -(lerpAngle(curr.heading_rad, next.heading_rad, t)),
+        curr.pitch_rad + (next.pitch_rad - curr.pitch_rad) * t,
+      )
+    } else {
+      groupRef.current.position.set(curr.x, 0, curr.y)
+      groupRef.current.rotation.set(
+        curr.roll_rad,
+        -curr.heading_rad,
+        curr.pitch_rad,
+      )
+    }
+  })
+
   return (
-    <group
-      ref={groupRef}
-      position={[frame.x, 0, frame.y]}
-      rotation={[frame.pitch_rad, -frame.heading_rad + Math.PI / 2, frame.roll_rad]}
-    >
-      {/* Chassis */}
+    <group ref={groupRef}>
       <mesh position={[0, CHASSIS_HEIGHT / 2 + WHEEL_RADIUS, 0]}>
         <boxGeometry args={[WHEELBASE, CHASSIS_HEIGHT, TRACK_WIDTH]} />
         <meshBasicMaterial color="#d1d5db" wireframe />
       </mesh>
-
-      {/* Wheels */}
       {wheelPositions.map((pos, i) => (
         <Wheel key={i} position={pos} />
       ))}

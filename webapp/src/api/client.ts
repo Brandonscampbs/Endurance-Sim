@@ -1,4 +1,4 @@
-import useSWR from 'swr'
+import useSWR, { mutate } from 'swr'
 
 const API_BASE = '/api'
 
@@ -6,6 +6,13 @@ async function fetcher<T>(url: string): Promise<T> {
   const res = await fetch(url)
   if (!res.ok) throw new Error(`API error: ${res.status}`)
   return res.json()
+}
+
+/** Clear all backend caches and refetch all SWR data. */
+export async function rerunSimulation(): Promise<void> {
+  await fetch(`${API_BASE}/cache/clear`, { method: 'POST' })
+  // Revalidate every SWR key so the UI refreshes
+  await mutate(() => true, undefined, { revalidate: true })
 }
 
 // Types matching backend Pydantic models
