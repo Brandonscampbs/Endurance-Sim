@@ -12,7 +12,7 @@ import sys
 
 import numpy as np
 
-from fsae_sim.data.loader import load_aim_csv, load_voltt_csv
+from fsae_sim.data.loader import load_aim_csv, load_cleaned_csv, load_voltt_csv
 from fsae_sim.track.track import Track
 from fsae_sim.vehicle import VehicleConfig
 from fsae_sim.vehicle.battery_model import BatteryModel
@@ -30,11 +30,11 @@ def main():
     # ── Load data ──
     print("\n[1/6] Loading data...")
     config = VehicleConfig.from_yaml("configs/ct16ev.yaml")
-    _, aim_df = load_aim_csv("Real-Car-Data-And-Stats/2025 Endurance Data.csv")
+    _, aim_df = load_cleaned_csv("Real-Car-Data-And-Stats/CleanedEndurance.csv")
     voltt_df = load_voltt_csv(
         "Real-Car-Data-And-Stats/About-Energy-Volt-Simulations-2025-Pack/2025_Pack_cell.csv"
     )
-    track = Track.from_telemetry("Real-Car-Data-And-Stats/2025 Endurance Data.csv")
+    track = Track.from_telemetry(df=aim_df)
 
     print(f"  Track: {track.name}, {track.num_segments} segments, "
           f"{track.total_distance_m:.0f}m per lap")
@@ -86,10 +86,11 @@ def main():
     battery.calibrate_pack_from_telemetry(aim_df)
 
     engine = SimulationEngine(config, track, strategy, battery)
+    # Start temp from telemetry: real car started at 29°C
     result = engine.run(
         num_laps=22,
         initial_soc_pct=95.0,
-        initial_temp_c=25.0,
+        initial_temp_c=29.0,
     )
 
     print(f"  Completed {result.laps_completed} laps")
