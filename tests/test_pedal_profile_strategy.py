@@ -223,3 +223,89 @@ class TestWithParams:
         step2 = step1.with_params(brake_scale=1.5)
         assert step2.params.throttle_scale == 0.9
         assert step2.params.brake_scale == 1.5
+
+
+# ---------------------------------------------------------------------------
+# from_telemetry()
+# ---------------------------------------------------------------------------
+
+class TestFromTelemetry:
+    """Test calibration from synthetic telemetry data."""
+
+    def _make_telemetry(self, n_samples: int = 500, lap_distance: float = 50.0) -> pd.DataFrame:
+        """Synthetic telemetry: 2 laps, throttle/coast/brake pattern."""
+        dist_per_lap = np.linspace(0, lap_distance, n_samples // 2, endpoint=False)
+        dist = np.concatenate([dist_per_lap, dist_per_lap + lap_distance])
+        speed = np.full(len(dist), 40.0)  # 40 km/h constant
+
+        # Pattern: first 70% throttle, next 15% coast, last 15% brake
+        n_half = n_samples // 2
+        throttle = np.zeros(len(dist))
+        brake_f = np.full(len(dist), -18.5)  # bad front sensor (like real data)
+        brake_r = np.zeros(len(dist))
+
+        for offset in [0, n_half]:
+            seg_size = n_half
+            t_end = int(seg_size * 0.7)
+            c_end = int(seg_size * 0.85)
+            throttle[offset:offset + t_end] = 60.0  # 60% pedal
+            brake_r[offset + c_end:offset + seg_size] = 15.0  # 15 bar
+
+        # Need GPS columns for lap detection
+        lat = np.linspace(42.0, 42.001, n_half)
+        lat = np.concatenate([lat, lat])
+        lon = np.full(len(dist), -83.5)
+
+        return pd.DataFrame({
+            "Distance on GPS Speed": dist,
+            "GPS Speed": speed,
+            "Throttle Pos": throttle,
+            "FBrakePressure": brake_f,
+            "RBrakePressure": brake_r,
+            "GPS Latitude": lat,
+            "GPS Longitude": lon,
+            "GPS LatAcc": np.zeros(len(dist)),
+            "GPS Slope": np.zeros(len(dist)),
+        })
+
+    def test_basic_calibration(self):
+        from fsae_sim.driver.strategies import PedalProfileStrategy
+        aim_df = self._make_telemetry()
+        track = make_track(n_segments=10, length_m=5.0)
+
+        strategy = PedalProfileStrategy.from_telemetry(aim_df, track)
+        assert strategy.num_segments == 10
+        assert strategy.name == "pedal_profile"
+        assert strategy.params.throttle_scale == 1.0
+
+    def test_throttle_segments_have_pedal_values(self):
+        from fsae_sim.driver.strategies import PedalProfileStrategy
+        aim_df = self._make_telemetry()
+        track = make_track(n_segments=10, length_m=5.0)
+
+        strategy = PedalProfileStrategy.from_telemetry(aim_df, track)
+        throttle_mask = strategy._actions == 1
+        assert throttle_mask.sum() > 0
+        throttle_vals = strategy._throttle_pct[throttle_mask]
+        assert np.all(throttle_vals > 0.0)
+        assert np.all(throttle_vals <= 1.0)
+
+    def test_brake_segments_have_brake_values(self):
+        from fsae_sim.driver.strategies import PedalProfileStrategy
+        aim_df = self._make_telemetry()
+        track = make_track(n_segments=10, length_m=5.0)
+
+        strategy = PedalProfileStrategy.from_telemetry(aim_df, track)
+        brake_mask = strategy._actions == 2
+        if brake_mask.sum() > 0:
+            brake_vals = strategy._brake_pct[brake_mask]
+            assert np.all(brake_vals > 0.0)
+            assert np.all(brake_vals <= 1.0)
+
+    def test_ref_speed_populated(self):
+        from fsae_sim.driver.strategies import PedalProfileStrategy
+        aim_df = self._make_telemetry()
+        track = make_track(n_segments=10, length_m=5.0)
+
+        strategy = PedalProfileStrategy.from_telemetry(aim_df, track)
+        assert np.all(strategy._ref_speed_ms > 0.0)

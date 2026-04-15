@@ -599,3 +599,158 @@ class PedalProfileStrategy(DriverStrategy):
             num_segments=self._num_segments,
             params=new_params,
         )
+
+    @classmethod
+    def from_telemetry(
+        cls,
+        aim_df: pd.DataFrame,
+        track: Track,
+        *,
+        laps: list[int] | None = None,
+        throttle_threshold: float = 5.0,
+        brake_threshold: float = 2.0,
+        name: str = "pedal_profile",
+    ) -> PedalProfileStrategy:
+        """Calibrate from AiM telemetry.
+
+        Samples raw throttle position and brake pressure at each track
+        segment midpoint, classifies actions per-lap, then aggregates
+        across representative laps using majority vote for action and
+        median for pedal/brake values.
+
+        Args:
+            aim_df: AiM telemetry DataFrame.
+            track: Track geometry with segments.
+            laps: Which lap indices to use (None = auto-select).
+            throttle_threshold: Throttle % above which = THROTTLE.
+            brake_threshold: Brake pressure (bar) above which = BRAKE.
+            name: Strategy name.
+
+        Returns:
+            Calibrated PedalProfileStrategy.
+        """
+        from fsae_sim.analysis.telemetry_analysis import _detect_lap_boundaries_safe
+
+        num_segments = track.num_segments
+        lap_boundaries = _detect_lap_boundaries_safe(aim_df)
+
+        # Select representative laps
+        if lap_boundaries and len(lap_boundaries) >= 2:
+            if laps is not None:
+                selected = [lap_boundaries[i] for i in laps if i < len(lap_boundaries)]
+            else:
+                selected = []
+                median_dist = float(np.median([d for _, _, d in lap_boundaries]))
+                for i, (s, e, d) in enumerate(lap_boundaries):
+                    if i == 0:
+                        continue
+                    if abs(d - median_dist) > median_dist * 0.15:
+                        continue
+                    selected.append((s, e, d))
+            if not selected:
+                selected = lap_boundaries
+        else:
+            # Single-pass fallback: treat whole dataset as one lap
+            total_dist = aim_df["Distance on GPS Speed"].values
+            selected = [(0, len(aim_df), float(total_dist[-1] - total_dist[0]))]
+
+        # Brake normalization across all moving data
+        speed_all = aim_df["GPS Speed"].values
+        moving = speed_all > 5.0
+        brake_all = np.maximum(
+            aim_df["FBrakePressure"].values,
+            aim_df["RBrakePressure"].values,
+        )
+        nonzero_brake = brake_all[moving & (brake_all > 0)]
+        brake_norm = float(np.percentile(nonzero_brake, 99)) if len(nonzero_brake) > 0 else 1.0
+        brake_norm = max(brake_norm, 1.0)
+
+        # Per-lap, per-segment extraction
+        action_matrix = []
+        throttle_matrix = []
+        brake_matrix = []
+        speed_matrix = []
+
+        for start_idx, end_idx, _ in selected:
+            lap_df = aim_df.iloc[start_idx:end_idx]
+            lap_dist_raw = lap_df["Distance on GPS Speed"].values
+            lap_d = lap_dist_raw - lap_dist_raw[0]
+            lap_throttle = lap_df["Throttle Pos"].values
+            lap_speed = lap_df["GPS Speed"].values
+            lap_brake = np.maximum(
+                lap_df["FBrakePressure"].values,
+                lap_df["RBrakePressure"].values,
+            )
+
+            lap_actions = np.zeros(num_segments, dtype=int)
+            lap_throttles = np.zeros(num_segments)
+            lap_brakes = np.zeros(num_segments)
+            lap_speeds = np.zeros(num_segments)
+
+            for seg in track.segments:
+                mid = seg.distance_start_m + seg.length_m / 2.0
+                half_bin = seg.length_m / 2.0
+
+                mask = (lap_d >= mid - half_bin) & (lap_d < mid + half_bin)
+                if not np.any(mask):
+                    nearest_idx = np.argmin(np.abs(lap_d - mid))
+                    mask = np.zeros(len(lap_d), dtype=bool)
+                    mask[nearest_idx] = True
+
+                seg_throttle = float(np.median(lap_throttle[mask]))
+                seg_brake = float(np.median(lap_brake[mask]))
+                seg_speed = float(np.mean(lap_speed[mask]))
+
+                if seg_brake > brake_threshold:
+                    lap_actions[seg.index] = 2  # BRAKE
+                    lap_brakes[seg.index] = float(np.clip(seg_brake / brake_norm, 0.0, 1.0))
+                    lap_throttles[seg.index] = 0.0
+                elif seg_throttle > throttle_threshold:
+                    lap_actions[seg.index] = 1  # THROTTLE
+                    lap_throttles[seg.index] = float(np.clip(seg_throttle / 100.0, 0.0, 1.0))
+                    lap_brakes[seg.index] = 0.0
+                else:
+                    lap_actions[seg.index] = 0  # COAST
+                    lap_throttles[seg.index] = 0.0
+                    lap_brakes[seg.index] = 0.0
+
+                lap_speeds[seg.index] = seg_speed / 3.6  # km/h -> m/s
+
+            action_matrix.append(lap_actions)
+            throttle_matrix.append(lap_throttles)
+            brake_matrix.append(lap_brakes)
+            speed_matrix.append(lap_speeds)
+
+        # Aggregate across laps
+        action_arr = np.array(action_matrix)
+        throttle_arr = np.array(throttle_matrix)
+        brake_arr = np.array(brake_matrix)
+        speed_arr = np.array(speed_matrix)
+
+        final_actions = np.zeros(num_segments, dtype=int)
+        final_throttle = np.zeros(num_segments)
+        final_brake = np.zeros(num_segments)
+        final_speed = np.zeros(num_segments)
+
+        for i in range(num_segments):
+            counts = np.bincount(action_arr[:, i], minlength=3)
+            winner = int(np.argmax(counts))
+            final_actions[i] = winner
+
+            winner_mask = action_arr[:, i] == winner
+            if np.any(winner_mask):
+                final_throttle[i] = float(np.median(throttle_arr[:, i][winner_mask]))
+                final_brake[i] = float(np.median(brake_arr[:, i][winner_mask]))
+            else:
+                final_throttle[i] = float(np.median(throttle_arr[:, i]))
+                final_brake[i] = float(np.median(brake_arr[:, i]))
+
+            final_speed[i] = float(np.mean(speed_arr[:, i]))
+
+        return cls(
+            throttle_pct=final_throttle,
+            brake_pct=final_brake,
+            actions=final_actions,
+            ref_speed_ms=final_speed,
+            num_segments=num_segments,
+        )
