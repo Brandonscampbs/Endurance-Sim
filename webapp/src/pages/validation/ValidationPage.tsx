@@ -1,12 +1,13 @@
-import { useEffect } from 'react'
+import { useEffect, lazy, Suspense } from 'react'
 import { useValidation, useAllLaps, useTrack, useLaps } from '../../api/client'
 import { useValidationStore } from '../../stores/validationStore'
 import LoadingSpinner from '../../components/LoadingSpinner'
-import TrackMaps from './TrackMaps'
-import OverlayCharts from './OverlayCharts'
 import SectorTable from './SectorTable'
 import LapTable from './LapTable'
 import MetricCards from './MetricCards'
+
+const TrackMaps = lazy(() => import('./TrackMaps'))
+const OverlayCharts = lazy(() => import('./OverlayCharts'))
 
 export default function ValidationPage() {
   const { selectedLap, setSelectedLap } = useValidationStore()
@@ -56,8 +57,10 @@ export default function ValidationPage() {
             <LoadingSpinner message="Running simulation and loading telemetry..." />
           ) : track && validation ? (
             <>
-              <TrackMaps track={track} validation={validation} />
-              <OverlayCharts validation={validation} />
+              <Suspense fallback={<LoadingSpinner message="Loading charts..." />}>
+                <TrackMaps track={track} validation={validation} />
+                <OverlayCharts validation={validation} />
+              </Suspense>
               <SectorTable sectors={validation.sectors} />
               <MetricCards metrics={validation.metrics} />
             </>
