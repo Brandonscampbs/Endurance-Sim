@@ -67,9 +67,8 @@ def _make_replay_strategy():
     distances = np.array([0.0, 100.0, 200.0, 400.0, 600.0, 800.0, 1000.0])
     throttle = np.array([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.5])
     brake = np.array([0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0])
-    speeds = np.array([5.0, 12.0, 10.0, 8.0, 10.0, 14.0, 12.0])
     torque = np.array([60.0, 50.0, 0.0, 0.0, 40.0, 70.0, 30.0])
-    return ReplayStrategy(distances, throttle, brake, speeds, torque, lap_distance_m=1000.0)
+    return ReplayStrategy(distances, throttle, brake, torque, lap_distance_m=1000.0)
 
 
 # ---------------------------------------------------------------------------
@@ -97,11 +96,6 @@ class TestReplayStrategy:
         state = SimState(0, 200.0, 10.0, 0.9, 440, 20, 30, 0, 0)
         cmd = strategy.decide(state, [])
         assert cmd.action == ControlAction.COAST
-
-    def test_target_speed_interpolation(self):
-        strategy = _make_replay_strategy()
-        v = strategy.target_speed(50.0)  # midway between 5 and 12 m/s
-        assert 7.0 < v < 10.0
 
     def test_distance_wraps_around_lap(self):
         strategy = _make_replay_strategy()

@@ -28,16 +28,17 @@ from fsae_sim.analysis.telemetry_analysis import (
 
 
 class ReplayStrategy(DriverStrategy):
-    """Replay recorded driver behavior from AiM telemetry.
+    """Replay recorded driver inputs from AiM telemetry through the force model.
+
+    Provides the exact torque commands, throttle, and brake pressure the
+    real driver applied, indexed by cumulative distance.  The engine
+    resolves speed from forces — no speed-constrained shortcuts.
 
     Supports two modes:
     - **Single-lap**: wraps a one-lap recording for multi-lap sims (use
       ``from_aim_data`` with lap slice).
     - **Full-endurance**: uses the entire AiM recording indexed by
       cumulative distance (use ``from_full_endurance``).
-
-    The engine uses ``target_speed()`` to constrain speed directly and
-    ``target_torque()`` for power calculation.
     """
 
     name = "replay"
@@ -47,7 +48,6 @@ class ReplayStrategy(DriverStrategy):
         distances_m: np.ndarray,
         throttle_pct: np.ndarray,
         brake_pct: np.ndarray,
-        speeds_ms: np.ndarray,
         torque_nm: np.ndarray,
         lap_distance_m: float,
         *,
@@ -63,10 +63,6 @@ class ReplayStrategy(DriverStrategy):
         self._brake_interp = interp1d(
             distances_m, brake_pct, kind="linear",
             bounds_error=False, fill_value=(float(brake_pct[0]), float(brake_pct[-1])),
-        )
-        self._speed_interp = interp1d(
-            distances_m, speeds_ms, kind="linear",
-            bounds_error=False, fill_value=(float(speeds_ms[0]), float(speeds_ms[-1])),
         )
         self._torque_interp = interp1d(
             distances_m, torque_nm, kind="linear",
@@ -93,11 +89,10 @@ class ReplayStrategy(DriverStrategy):
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
 
-        speeds = lap["GPS Speed"].values / 3.6
         inverter_torque_limit = 85.0
         torque = np.clip(lap["LVCU Torque Req"].values, 0.0, inverter_torque_limit)
 
-        return cls(dist, throttle, brake, speeds, torque, lap_distance_m, wrap=True)
+        return cls(dist, throttle, brake, torque, lap_distance_m, wrap=True)
 
     @classmethod
     def from_full_endurance(
@@ -125,26 +120,21 @@ class ReplayStrategy(DriverStrategy):
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
 
-        speeds = clean["GPS Speed"].values / 3.6
         inverter_torque_limit = 85.0
         torque = np.clip(clean["LVCU Torque Req"].values, 0.0, inverter_torque_limit)
 
-        # Use mean driving speed as fill value (not last point, which may
-        # be very slow at end of event) so sim doesn't crawl if cumulative
-        # distance exceeds the AiM data range.
-        mean_speed = float(np.mean(speeds))
         mean_torque = float(np.mean(torque))
 
         # Extend interpolation data with a point beyond the last distance
-        # at mean speed, so extrapolation uses a reasonable value
+        # so extrapolation uses reasonable values if sim distance exceeds
+        # the AiM data range.
         max_dist = float(dist[-1])
         dist_ext = np.append(dist, max_dist + lap_distance_m)
-        speeds_ext = np.append(speeds, mean_speed)
         throttle_ext = np.append(throttle, 0.5)
         brake_ext = np.append(brake, 0.0)
         torque_ext = np.append(torque, mean_torque)
 
-        return cls(dist_ext, throttle_ext, brake_ext, speeds_ext, torque_ext,
+        return cls(dist_ext, throttle_ext, brake_ext, torque_ext,
                    lap_distance_m, wrap=False)
 
     def _resolve_distance(self, cumulative_distance_m: float) -> float:
@@ -152,10 +142,6 @@ class ReplayStrategy(DriverStrategy):
         if self._wrap:
             return cumulative_distance_m % self._lap_distance_m
         return min(cumulative_distance_m, self._total_distance_m)
-
-    def target_speed(self, distance_m: float) -> float:
-        """Recorded speed (m/s) at given cumulative distance."""
-        return float(self._speed_interp(self._resolve_distance(distance_m)))
 
     def target_torque(self, distance_m: float) -> float:
         """Recorded motor torque (Nm) at given cumulative distance."""
@@ -282,10 +268,12 @@ class CalibratedStrategy(DriverStrategy):
         zones: list[DriverZone],
         num_segments: int,
         name: str = "calibrated",
+        segment_intensities: np.ndarray | None = None,
     ) -> None:
         self.name = name
         self._zones = list(zones)
         self._num_segments = num_segments
+        self._segment_intensities = segment_intensities
 
         # Build flat lookup: segment_idx -> (action, intensity, max_speed_ms)
         self._segment_actions: list[tuple[ControlAction, float, float]] = [
@@ -297,6 +285,16 @@ class CalibratedStrategy(DriverStrategy):
                     self._segment_actions[seg_idx] = (
                         zone.action, zone.intensity, zone.max_speed_ms,
                     )
+
+        # Override with per-segment intensities when available.
+        # Zones still define action type and structure; per-segment
+        # intensities capture the real driver's fine-grained modulation.
+        if segment_intensities is not None:
+            for i in range(num_segments):
+                action, _, max_speed = self._segment_actions[i]
+                self._segment_actions[i] = (
+                    action, float(segment_intensities[i]), max_speed,
+                )
 
     @property
     def zones(self) -> list[DriverZone]:
@@ -375,7 +373,16 @@ class CalibratedStrategy(DriverStrategy):
                 ))
             else:
                 new_zones.append(z)
-        return CalibratedStrategy(new_zones, self._num_segments, name=self.name)
+        # Carry per-segment intensities, update overridden zone's segments
+        new_seg_intensities = None
+        if self._segment_intensities is not None:
+            new_seg_intensities = self._segment_intensities.copy()
+            zone = next(z for z in self._zones if z.zone_id == zone_id)
+            for seg_idx in range(zone.segment_start, zone.segment_end + 1):
+                if 0 <= seg_idx < self._num_segments:
+                    new_seg_intensities[seg_idx] = intensity
+        return CalibratedStrategy(new_zones, self._num_segments, name=self.name,
+                                  segment_intensities=new_seg_intensities)
 
     @classmethod
     def from_telemetry(
@@ -407,7 +414,11 @@ class CalibratedStrategy(DriverStrategy):
         )
         zones = collapse_to_zones(seg_actions, track, merge_tolerance=merge_tolerance)
 
-        return cls(zones, track.num_segments, name=name)
+        # Extract per-segment intensities for fine-grained driver modulation
+        segment_intensities = seg_actions["intensity"].values.copy()
+
+        return cls(zones, track.num_segments, name=name,
+                   segment_intensities=segment_intensities)
 
     @classmethod
     def from_zone_list(
