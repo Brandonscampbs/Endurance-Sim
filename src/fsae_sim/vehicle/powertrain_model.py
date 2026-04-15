@@ -41,7 +41,12 @@ class PowertrainModel:
             dependent motor+inverter efficiency.
     """
 
-    TIRE_RADIUS_M: float = 0.228  # 10-inch FSAE wheel
+    TIRE_RADIUS_M: float = 0.2042  # Hoosier 16x7.5-10 LC0, UNLOADED_RADIUS from .tir file
+
+    # Gearbox mechanical efficiency — the only loss between motor shaft
+    # and wheel.  Motor+inverter efficiency is handled separately in
+    # electrical_power() via the efficiency map.
+    _GEARBOX_EFFICIENCY: float = 0.97
 
     # Regen capture efficiency relative to drivetrain efficiency.
     # The mechanical-to-electrical conversion path has the same gearbox
@@ -117,6 +122,35 @@ class PowertrainModel:
         rpm = max(0.0, motor_rpm)
         wheel_rpm = rpm / self.config.gear_ratio
         return wheel_rpm * self.TIRE_RADIUS_M * 2.0 * math.pi / 60.0
+
+    # ------------------------------------------------------------------
+    # Torque delivery
+    # ------------------------------------------------------------------
+
+    # Field-weakening onset RPM and derating slope, derived from
+    # Torque Feedback / LVCU Torque Req analysis of Michigan 2025
+    # telemetry.  Below _FW_ONSET the motor delivers ~100% of the
+    # command; above it, back-EMF limits delivery linearly.
+    _FW_ONSET_RPM: float = 2800.0
+    _FW_SLOPE_PER_RPM: float = 0.75 / 250.0  # ratio drop per RPM above onset
+
+    def torque_delivery_factor(self, motor_rpm: float) -> float:
+        """Fraction of commanded torque the motor physically delivers.
+
+        Below the field-weakening onset the motor tracks the command
+        at ~100%.  Above onset, back-EMF reduces delivery linearly.
+        Derived from Michigan 2025 Torque Feedback vs LVCU Torque Req.
+
+        Args:
+            motor_rpm: Motor shaft speed in RPM.
+
+        Returns:
+            Delivery factor in (0, 1].
+        """
+        if motor_rpm <= self._FW_ONSET_RPM:
+            return 1.0
+        derate = (motor_rpm - self._FW_ONSET_RPM) * self._FW_SLOPE_PER_RPM
+        return max(0.0, 1.0 - derate)
 
     # ------------------------------------------------------------------
     # Torque capability
@@ -204,12 +238,41 @@ class PowertrainModel:
         # 3. Final command: remapped pedal * clamped ceiling
         return pedal_remapped * torque_ceiling_nm
 
+    def lvcu_torque_ceiling(
+        self, motor_rpm: float, bms_current_limit_a: float,
+    ) -> float:
+        """LVCU power-limited torque ceiling without dead zone remap.
+
+        Returns the maximum torque the LVCU would allow at the given RPM
+        and BMS current limit. Use this with a torque fraction (0-1) that
+        has already been through the real LVCU — avoids double-processing
+        the dead zone remap.
+
+        Args:
+            motor_rpm: Motor shaft speed in RPM.
+            bms_current_limit_a: BMS discharge current limit in A.
+
+        Returns:
+            Torque ceiling in Nm.
+        """
+        cfg = self.config
+        omega_term = max(cfg.lvcu_omega_floor, motor_rpm * cfg.lvcu_rpm_scale)
+        power_ceiling_nm = cfg.lvcu_power_constant * bms_current_limit_a / omega_term
+        torque_ceiling_nm = min(cfg.torque_limit_lvcu_nm, power_ceiling_nm)
+        if motor_rpm >= cfg.lvcu_overspeed_rpm:
+            torque_ceiling_nm = cfg.lvcu_overspeed_torque_nm
+        return min(torque_ceiling_nm, cfg.torque_limit_inverter_nm)
+
     # ------------------------------------------------------------------
     # Torque and force through drivetrain
     # ------------------------------------------------------------------
 
     def wheel_torque(self, motor_torque_nm: float) -> float:
         """Wheel torque from motor torque through gear reduction and friction.
+
+        Only gearbox friction is applied here.  Motor+inverter efficiency
+        affects electrical power (handled in ``electrical_power()``), not
+        the mechanical torque delivered to the wheels.
 
         Args:
             motor_torque_nm: Motor shaft torque in Nm.
@@ -218,7 +281,7 @@ class PowertrainModel:
             Wheel hub torque in Nm.  Positive = driving, negative = braking
             (regen sign is preserved).
         """
-        return motor_torque_nm * self.config.gear_ratio * self.config.drivetrain_efficiency
+        return motor_torque_nm * self.config.gear_ratio * self._GEARBOX_EFFICIENCY
 
     def wheel_force(self, motor_torque_nm: float) -> float:
         """Tractive force at the tire contact patch from motor torque.
@@ -276,15 +339,13 @@ class PowertrainModel:
             return 0.0
 
         rpm = self.motor_rpm_from_speed(speed)
-        # Generator torque capability uses the same RPM-torque envelope;
-        # scale by regen efficiency relative to the motoring efficiency.
-        max_regen_torque = (
-            self.max_motor_torque(rpm)
-            * (self._regen_efficiency / self.config.drivetrain_efficiency)
-        )
+        # Generator torque capability uses the same RPM-torque envelope.
+        max_regen_torque = self.max_motor_torque(rpm)
         commanded_torque = brake * max_regen_torque
-        # Regen wheel force opposes motion, so return negative
-        regen_wheel_torque = commanded_torque * self.config.gear_ratio * self._regen_efficiency
+        # Regen wheel force: only gearbox friction reduces shaft torque
+        # to wheel torque.  Motor/inverter regen efficiency affects energy
+        # recovery (electrical_power), not mechanical braking force.
+        regen_wheel_torque = commanded_torque * self.config.gear_ratio * self._GEARBOX_EFFICIENCY
         return -(regen_wheel_torque / self.TIRE_RADIUS_M)
 
     # ------------------------------------------------------------------

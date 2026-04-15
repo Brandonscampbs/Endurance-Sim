@@ -53,7 +53,7 @@ class VehicleDynamics:
 
         # Effective mass: bare mass + rotational inertia of spinning components
         if powertrain_config is not None:
-            tire_radius = 0.228  # m, 10-inch FSAE wheel
+            tire_radius = 0.2042  # m, Hoosier 16x7.5-10 UNLOADED_RADIUS from .tir
             G = powertrain_config.gear_ratio
             eta = powertrain_config.drivetrain_efficiency
             j_eff = (
@@ -242,6 +242,15 @@ class VehicleDynamics:
 
         return total_drag
 
+    # Constant mechanical parasitic drag (N): drivetrain bearings, chain
+    # friction, brake pad drag, motor cogging/windage.  Back-derived from
+    # direction-averaged straight-line coasting telemetry at Michigan 2025.
+    _PARASITIC_DRAG_N: float = 70.0
+
+    def parasitic_drag(self) -> float:
+        """Mechanical parasitic drag (N) from drivetrain and bearings."""
+        return self._PARASITIC_DRAG_N
+
     def total_resistance(
         self, speed_ms: float, grade: float = 0.0, curvature: float = 0.0,
     ) -> float:
@@ -251,6 +260,7 @@ class VehicleDynamics:
             + self.rolling_resistance_force(speed_ms)
             + self.grade_force(grade)
             + self.cornering_drag(speed_ms, curvature)
+            + self.parasitic_drag()
         )
 
     # ------------------------------------------------------------------

@@ -101,8 +101,13 @@ class SpeedEnvelope:
                 v_back[i] = new_limit
 
         # Pass 3: forward pass (acceleration feasibility)
+        # Use lap-wrapped backward-pass limit as initial speed.  The backward
+        # pass already handles circuit wrap-around, so v_back[0] is the fastest
+        # the car can enter segment 0 while still braking for upcoming corners.
+        # Using initial_speed here created an artificial acceleration ramp that
+        # penalised every lap on straight segments.
         v_fwd = np.empty(n, dtype=np.float64)
-        v_fwd[0] = min(v_back[0], max(initial_speed, self._MIN_SPEED))
+        v_fwd[0] = v_back[0]
 
         for i in range(1, n):
             v = v_fwd[i - 1]
@@ -184,7 +189,7 @@ class SpeedEnvelope:
                 v_corrected[i] = new_limit
 
             # Re-run forward pass
-            v_corrected[0] = min(v_corrected[0], max(initial_speed, self._MIN_SPEED))
+            v_corrected[0] = min(v_corrected[0], v_back[0])
             for i in range(1, n):
                 v = v_corrected[i - 1]
                 f_drive = self._powertrain.drive_force(1.0, v)

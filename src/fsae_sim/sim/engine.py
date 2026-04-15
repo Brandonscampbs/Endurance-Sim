@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from fsae_sim.driver.strategy import ControlAction, DriverStrategy, SimState
-from fsae_sim.driver.strategies import ReplayStrategy
+from fsae_sim.driver.strategies import CalibratedStrategy, ReplayStrategy
 from fsae_sim.track.track import Track
 from fsae_sim.vehicle import VehicleConfig
 from fsae_sim.vehicle.battery_model import BatteryModel
@@ -149,12 +149,10 @@ class SimulationEngine:
         records: list[dict] = []
         laps_completed = 0
 
-        # Pre-compute speed envelope for synthetic strategies
+        # Pre-compute speed envelope (cornering limits from tire grip)
+        v_max = self._envelope.compute(initial_speed=speed)
         is_replay = isinstance(self.strategy, ReplayStrategy)
-        if not is_replay:
-            v_max = self._envelope.compute(initial_speed=speed)
-        else:
-            v_max = None
+        is_calibrated = isinstance(self.strategy, CalibratedStrategy)
 
         for lap in range(num_laps):
             for seg_idx, segment in enumerate(segments):
@@ -181,81 +179,88 @@ class SimulationEngine:
                 # 1. Driver decision
                 cmd = self.strategy.decide(sim_state, upcoming)
 
-                if is_replay:
-                    # --- Speed-constrained replay mode ---
-                    # Use recorded speed profile directly. This gives
-                    # accurate energy accounting without force-model error.
-                    seg_mid_dist = distance + segment.length_m / 2.0
-                    target_speed = self.strategy.target_speed(seg_mid_dist)
-                    exit_speed = max(target_speed, self._MIN_SPEED_MS)
+                # --- Force-based resolution (all strategies) ---
 
-                    avg_speed = (speed + exit_speed) / 2.0
-                    seg_time = segment.length_m / max(avg_speed, self._MIN_SPEED_MS)
+                # 2. Speed limit from pre-computed envelope
+                corner_limit = float(v_max[seg_idx])
 
-                    # Use recorded torque command for power calculation
-                    motor_torque = self.strategy.target_torque(seg_mid_dist)
-                    motor_rpm = self.powertrain.motor_rpm_from_speed(avg_speed)
+                # 2b. BMS current limit for LVCU torque command
+                bms_current_limit = self.battery_model.max_discharge_current(temp, soc)
+                motor_rpm = self.powertrain.motor_rpm_from_speed(speed)
 
-                    # Resistance forces (for logging)
-                    resist_f = self.dynamics.total_resistance(avg_speed, segment.grade, segment.curvature)
-                    drive_f = self.powertrain.wheel_force(motor_torque) if motor_torque > 0 else 0.0
-                    regen_f = 0.0
-                    net_force = drive_f - resist_f
-                    corner_limit = float("inf")
-
-                else:
-                    # --- Force-based resolution mode ---
-                    # Used for synthetic strategies (coast, threshold braking, etc.)
-
-                    # 2. Speed limit from pre-computed envelope
-                    corner_limit = float(v_max[seg_idx])
-
-                    # 2b. BMS current limit for LVCU torque command
-                    bms_current_limit = self.battery_model.max_discharge_current(temp, soc)
-                    motor_rpm = self.powertrain.motor_rpm_from_speed(speed)
-
-                    # 3. Compute forces based on driver action
-                    if cmd.action == ControlAction.THROTTLE:
-                        motor_torque = self.powertrain.lvcu_torque_command(
-                            cmd.throttle_pct, motor_rpm, bms_current_limit,
+                # 3. Compute forces based on driver action
+                #    ReplayStrategy: use recorded LVCU Torque Req directly
+                #    (already the final inverter command, no re-processing).
+                #    CalibratedStrategy: intensity is a torque fraction
+                #    (LVCU Torque Req / 85 Nm), already through the dead
+                #    zone remap. Use lvcu_torque_ceiling to apply power
+                #    limiting without double-processing the dead zone.
+                #    Other strategies: raw throttle through full LVCU model.
+                if cmd.action == ControlAction.THROTTLE:
+                    if is_replay:
+                        seg_mid_dist = distance + segment.length_m / 2.0
+                        motor_torque = (
+                            self.strategy.target_torque(seg_mid_dist)
+                            * self.powertrain.torque_delivery_factor(motor_rpm)
                         )
-                        drive_f = self.powertrain.wheel_force(motor_torque)
-                        drive_f = min(drive_f, self.dynamics.max_traction_force(speed))
-                        regen_f = 0.0
-                    elif cmd.action == ControlAction.BRAKE:
-                        drive_f = 0.0
-                        regen_f = self.powertrain.regen_force(cmd.brake_pct, speed)
-                        max_brake = self.dynamics.max_braking_force(speed)
-                        if abs(regen_f) > max_brake:
-                            regen_f = -max_brake
-                    else:  # COAST
-                        drive_f = 0.0
-                        regen_f = 0.0
-
-                    # 4. Resistive forces
-                    resist_f = self.dynamics.total_resistance(speed, segment.grade, segment.curvature)
-
-                    # 5. Net force and speed resolution
-                    net_force = drive_f + regen_f - resist_f
-
-                    exit_speed, seg_time = self.dynamics.resolve_exit_speed(
-                        speed, segment.length_m, net_force, corner_limit,
-                    )
-                    exit_speed = max(exit_speed, self._MIN_SPEED_MS)
-
-                    avg_speed = (speed + exit_speed) / 2.0
-                    motor_rpm = self.powertrain.motor_rpm_from_speed(avg_speed)
-
-                    # Recompute torque at resolved avg speed for accurate power calc
-                    if cmd.action == ControlAction.THROTTLE:
-                        motor_torque = self.powertrain.lvcu_torque_command(
-                            cmd.throttle_pct, motor_rpm, bms_current_limit,
+                    elif is_calibrated:
+                        ceiling = self.powertrain.lvcu_torque_ceiling(
+                            motor_rpm, bms_current_limit,
                         )
-                    elif cmd.action == ControlAction.BRAKE:
-                        max_torque = self.powertrain.max_motor_torque(motor_rpm)
-                        motor_torque = -cmd.brake_pct * max_torque
+                        motor_torque = cmd.throttle_pct * ceiling
                     else:
-                        motor_torque = 0.0
+                        motor_torque = self.powertrain.lvcu_torque_command(
+                            cmd.throttle_pct, motor_rpm, bms_current_limit,
+                        )
+                    drive_f = self.powertrain.wheel_force(motor_torque)
+                    drive_f = min(drive_f, self.dynamics.max_traction_force(speed))
+                    regen_f = 0.0
+                elif cmd.action == ControlAction.BRAKE:
+                    drive_f = 0.0
+                    regen_f = self.powertrain.regen_force(cmd.brake_pct, speed)
+                    max_brake = self.dynamics.max_braking_force(speed)
+                    if abs(regen_f) > max_brake:
+                        regen_f = -max_brake
+                else:  # COAST
+                    drive_f = 0.0
+                    regen_f = 0.0
+
+                # 4. Resistive forces
+                resist_f = self.dynamics.total_resistance(speed, segment.grade, segment.curvature)
+
+                # 5. Net force and speed resolution
+                net_force = drive_f + regen_f - resist_f
+
+                exit_speed, seg_time = self.dynamics.resolve_exit_speed(
+                    speed, segment.length_m, net_force, corner_limit,
+                )
+                exit_speed = max(exit_speed, self._MIN_SPEED_MS)
+
+                avg_speed = (speed + exit_speed) / 2.0
+                motor_rpm = self.powertrain.motor_rpm_from_speed(avg_speed)
+
+                # Recompute torque at resolved avg speed for accurate power calc
+                if cmd.action == ControlAction.THROTTLE:
+                    if is_replay:
+                        seg_mid_dist = distance + segment.length_m / 2.0
+                        motor_torque = (
+                            self.strategy.target_torque(seg_mid_dist)
+                            * self.powertrain.torque_delivery_factor(motor_rpm)
+                        )
+                    elif is_calibrated:
+                        ceiling = self.powertrain.lvcu_torque_ceiling(
+                            motor_rpm, bms_current_limit,
+                        )
+                        motor_torque = cmd.throttle_pct * ceiling
+                    else:
+                        motor_torque = self.powertrain.lvcu_torque_command(
+                            cmd.throttle_pct, motor_rpm, bms_current_limit,
+                        )
+                elif cmd.action == ControlAction.BRAKE:
+                    max_torque = self.powertrain.max_motor_torque(motor_rpm)
+                    motor_torque = -cmd.brake_pct * max_torque
+                else:
+                    motor_torque = 0.0
 
                 # 7. Electrical power and pack current
                 elec_power = self.powertrain.electrical_power(motor_torque, motor_rpm)
