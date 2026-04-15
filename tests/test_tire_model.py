@@ -71,10 +71,12 @@ class TestParser:
     def test_lateral_pvy1(self, tire_10psi: PacejkaTireModel) -> None:
         assert tire_10psi.lateral["PVY1"] == pytest.approx(0.0254765)
 
-    def test_longitudinal_all_zeros(self, tire_10psi: PacejkaTireModel) -> None:
-        """All longitudinal coefficients in the 10 psi file are zero."""
-        for key, val in tire_10psi.longitudinal.items():
-            assert val == 0.0, f"{key} should be 0.0, got {val}"
+    def test_longitudinal_has_transplanted_coeffs(self, tire_10psi: PacejkaTireModel) -> None:
+        """Longitudinal coefficients have non-zero R25B transplanted values."""
+        assert tire_10psi.longitudinal["PDX1"] == pytest.approx(2.68565)
+        assert tire_10psi.longitudinal["PKX1"] == pytest.approx(55.2561)
+        assert tire_10psi.longitudinal["PCX1"] == pytest.approx(1.0)
+        assert tire_10psi.longitudinal["PEX4"] == pytest.approx(-0.59049)
 
     def test_scaling_all_ones(self, tire_10psi: PacejkaTireModel) -> None:
         """All scaling factors should be 1.0."""
@@ -208,12 +210,17 @@ class TestLateralForce:
 
 
 class TestLongitudinalForce:
-    """Verify mirrored longitudinal force model."""
+    """Verify PAC2002 longitudinal force basics."""
 
-    def test_zero_slip_zero_force(self, tire_10psi: PacejkaTireModel) -> None:
-        """At zero slip ratio, Fx should be zero (symmetric, no offset)."""
+    def test_zero_slip_small_force(self, tire_10psi: PacejkaTireModel) -> None:
+        """At zero slip ratio, Fx should be small (just SHx/SVx offsets).
+
+        The PAC2002 model has non-zero PHX1 and PVX1, producing a small
+        force at kappa=0 analogous to SVy in the lateral model.
+        """
         fx = tire_10psi.longitudinal_force(0.0, 657.0)
-        assert abs(fx) < 1e-6
+        peak = tire_10psi.peak_longitudinal_force(657.0)
+        assert abs(fx) < peak * 0.02  # less than 2% of peak
 
     def test_positive_slip_positive_force(self, tire_10psi: PacejkaTireModel) -> None:
         """Positive slip ratio (driving) should produce positive Fx."""
@@ -225,18 +232,22 @@ class TestLongitudinalForce:
         fx = tire_10psi.longitudinal_force(-0.1, 657.0)
         assert fx < 0.0
 
-    def test_antisymmetric(self, tire_10psi: PacejkaTireModel) -> None:
-        """Fx(kappa) should be antisymmetric: Fx(k) = -Fx(-k)."""
+    def test_near_antisymmetric(self, tire_10psi: PacejkaTireModel) -> None:
+        """Fx(kappa) + Fx(-kappa) should be small relative to peak.
+
+        PEX4, PHX, and PVX introduce legitimate small asymmetry in
+        the PAC2002 model, analogous to SVy in the lateral model.
+        """
         fx_pos = tire_10psi.longitudinal_force(0.1, 657.0)
         fx_neg = tire_10psi.longitudinal_force(-0.1, 657.0)
-        assert abs(fx_pos + fx_neg) < 1e-6
+        peak = tire_10psi.peak_longitudinal_force(657.0)
+        assert abs(fx_pos + fx_neg) < peak * 0.02
 
     def test_peak_mu_same_order_as_lateral(self, tire_10psi: PacejkaTireModel) -> None:
         """Peak Fx / Fz should be same order of magnitude as Fy / Fz.
 
-        The mirrored model uses the same D (peak mu) but the lateral
-        model has SVy offset and a negative-By sign structure that
-        shifts the effective peak.  Both should be in the 1.5-3.0 range.
+        Both use transplanted/scaled R25B coefficients matched to LC0
+        grip levels. Both should be in the 1.5-3.0 range.
         """
         fz = 657.0
         mu_x = tire_10psi.peak_longitudinal_force(fz) / fz
@@ -258,6 +269,71 @@ class TestLongitudinalForce:
 
 
 # ======================================================================
+# Longitudinal force PAC2002 proper formula tests
+# ======================================================================
+
+
+class TestLongitudinalForcePAC2002:
+    """Tests for proper PAC2002 Fx using transplanted R25B coefficients."""
+
+    def test_positive_slip_positive_force(self, tire_10psi: PacejkaTireModel) -> None:
+        """Driving slip produces positive Fx."""
+        fx = tire_10psi.longitudinal_force(0.1, 657.0)
+        assert fx > 0.0
+
+    def test_negative_slip_negative_force(self, tire_10psi: PacejkaTireModel) -> None:
+        """Braking slip produces negative Fx."""
+        fx = tire_10psi.longitudinal_force(-0.1, 657.0)
+        assert fx < 0.0
+
+    def test_peak_fx_near_peak_fy(self, tire_10psi: PacejkaTireModel) -> None:
+        """Peak Fx should be within 15% of peak Fy at nominal load."""
+        fz = 657.0
+        peak_fx = tire_10psi.peak_longitudinal_force(fz)
+        peak_fy = tire_10psi.peak_lateral_force(fz)
+        ratio = peak_fx / peak_fy
+        assert 0.85 < ratio < 1.15
+
+    def test_uses_real_lmux_scaling(self, tire_10psi: PacejkaTireModel) -> None:
+        """LMUX should scale peak Fx independently of LMUY."""
+        fz = 657.0
+        peak_before = tire_10psi.peak_longitudinal_force(fz)
+        tire_10psi.scaling["LMUX"] = 0.5
+        peak_after = tire_10psi.peak_longitudinal_force(fz)
+        assert peak_after == pytest.approx(peak_before * 0.5, rel=0.05)
+        tire_10psi.scaling["LMUX"] = 1.0
+
+    def test_load_sensitivity_mu_decreases(self, tire_10psi: PacejkaTireModel) -> None:
+        """Fx friction coefficient should decrease with load (PDX2 < 0)."""
+        mu_low = tire_10psi.peak_longitudinal_force(300.0) / 300.0
+        mu_high = tire_10psi.peak_longitudinal_force(900.0) / 900.0
+        assert mu_low > mu_high
+
+    def test_force_increases_with_load(self, tire_10psi: PacejkaTireModel) -> None:
+        """Absolute Fx should increase with normal load."""
+        fx_300 = abs(tire_10psi.longitudinal_force(0.1, 300.0))
+        fx_900 = abs(tire_10psi.longitudinal_force(0.1, 900.0))
+        assert fx_900 > fx_300
+
+    def test_curvature_asymmetry(self, tire_10psi: PacejkaTireModel) -> None:
+        """PEX4 introduces driving/braking asymmetry in curvature."""
+        fx_pos = tire_10psi.longitudinal_force(0.15, 657.0)
+        fx_neg = tire_10psi.longitudinal_force(-0.15, 657.0)
+        asymmetry = abs(fx_pos + fx_neg)
+        peak = tire_10psi.peak_longitudinal_force(657.0)
+        assert asymmetry < peak * 0.05
+        assert asymmetry > 0.1
+
+    def test_sweep_no_nan(self, tire_10psi: PacejkaTireModel) -> None:
+        """Full slip-ratio sweep produces no NaN at multiple loads."""
+        for fz in [100.0, 300.0, 657.0, 900.0, 1091.0]:
+            for i in range(101):
+                kappa = -1.0 + i * 2.0 / 100.0
+                fx = tire_10psi.longitudinal_force(kappa, fz)
+                assert math.isfinite(fx), f"NaN at kappa={kappa}, Fz={fz}"
+
+
+# ======================================================================
 # Combined forces tests
 # ======================================================================
 
@@ -266,11 +342,15 @@ class TestCombinedForces:
     """Verify friction-circle coupling for combined slip."""
 
     def test_pure_lateral_unchanged(self, tire_10psi: PacejkaTireModel) -> None:
-        """With zero slip ratio, combined Fy should equal pure Fy."""
+        """With zero slip ratio, combined Fy should equal pure Fy.
+
+        Fx at kappa=0 is small but non-zero due to PAC2002 SHx/SVx offsets.
+        """
         fy_pure = tire_10psi.lateral_force(0.1, 657.0)
         fx_comb, fy_comb = tire_10psi.combined_forces(0.1, 0.0, 657.0)
-        assert abs(fx_comb) < 1e-6
-        assert fy_comb == pytest.approx(fy_pure, rel=1e-6)
+        peak_fx = tire_10psi.peak_longitudinal_force(657.0)
+        assert abs(fx_comb) < peak_fx * 0.02  # small SVx/SHx offset
+        assert fy_comb == pytest.approx(fy_pure, rel=0.01)
 
     def test_pure_longitudinal_unchanged(self, tire_10psi: PacejkaTireModel) -> None:
         """With zero slip angle, combined Fx should equal pure Fx."""
@@ -298,12 +378,14 @@ class TestCombinedForces:
         reduced = abs(fx_comb) <= abs(fx_pure) + 0.01 or abs(fy_comb) <= abs(fy_pure) + 0.01
         assert reduced
 
-    def test_zero_slip_zero_force(self, tire_10psi: PacejkaTireModel) -> None:
-        """Zero slip angle and ratio should give near-zero forces."""
+    def test_zero_slip_small_forces(self, tire_10psi: PacejkaTireModel) -> None:
+        """Zero slip angle and ratio should give small forces (just offsets).
+
+        Both Fx and Fy have small SH/SV offsets in the PAC2002 model.
+        """
         fx, fy = tire_10psi.combined_forces(0.0, 0.0, 657.0)
-        assert abs(fx) < 1e-6
-        # Fy has SV offset
-        assert abs(fy) < 100.0
+        assert abs(fx) < 100.0  # small SVx/SHx offset
+        assert abs(fy) < 100.0  # small SVy offset
 
 
 # ======================================================================
@@ -341,9 +423,9 @@ class TestPeakForces:
     def test_peak_fx_same_order_as_fy(self, tire_10psi: PacejkaTireModel) -> None:
         """Peak Fx and Fy at same load should be same order of magnitude.
 
-        The mirrored Fx model uses absolute mu and no SH/SV offsets, while
-        the lateral model has signed By (from negative PKY1 / PDY1) and SVy.
-        Both should produce physically reasonable FSAE tire forces.
+        The PAC2002 Fx model uses transplanted R25B coefficients scaled to
+        match the LC0's lateral grip envelope. Both should produce physically
+        reasonable FSAE tire forces.
         """
         fz = 657.0
         peak_fx = tire_10psi.peak_longitudinal_force(fz)

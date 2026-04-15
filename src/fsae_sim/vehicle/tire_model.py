@@ -1,15 +1,16 @@
 """Pacejka PAC2002 tire model for FSAE simulation.
 
 Parses .tir files (PAC2002 format) and computes lateral force (Fy),
-longitudinal force (Fx), combined forces via friction-circle coupling,
+longitudinal force (Fx), combined forces via PAC2002 weighting functions,
 peak force magnitudes, and loaded radius.
 
 The lateral model uses the full Magic Formula with load, camber, and
-scaling-factor support.  Because the .tir files from the TTC Hoosier
-LC0 dataset have all longitudinal coefficients zeroed (USE_MODE=2,
-lateral-only test data), the longitudinal model mirrors the lateral
-structure using |PDY1| for peak mu so that Fx has the same grip
-envelope as Fy.
+scaling-factor support from TTC Round 8 Hoosier LC0 data.
+
+The longitudinal model uses coefficients transplanted from TTC Round 6
+Hoosier R25B (USE_MODE=4, Fx test data), scaled to match the LC0's
+lateral grip envelope per-pressure.  Combined-slip weighting functions
+(Gxa, Gyk) from the R25B replace the friction-ellipse approximation.
 """
 
 from __future__ import annotations
@@ -271,7 +272,7 @@ class PacejkaTireModel:
         return fy
 
     # ------------------------------------------------------------------
-    # Longitudinal force (Fx) -- symmetric mirror of lateral model
+    # Longitudinal force (Fx) -- PAC2002 pure longitudinal slip
     # ------------------------------------------------------------------
 
     def longitudinal_force(
@@ -280,15 +281,11 @@ class PacejkaTireModel:
         normal_load_n: float,
         camber_rad: float = 0.0,
     ) -> float:
-        """Compute pure longitudinal force Fx.
+        """Compute pure longitudinal force Fx using PAC2002 Magic Formula.
 
-        Since the .tir files have all Fx coefficients zeroed (USE_MODE=2,
-        lateral-only TTC data), this uses a symmetric mirror of the lateral
-        structure:
-        - Peak mu (mux) = |PDY1 + PDY2*dfz|  (positive, symmetric)
-        - Cornering stiffness magnitude from |kya|
-        - No horizontal or vertical shift (symmetric about zero slip)
-        - Same curvature factor structure
+        Uses real longitudinal coefficients (PCX1, PDX1, PKX1, etc.)
+        transplanted from TTC Round 6 R25B data and scaled to match
+        the LC0's lateral grip envelope.
 
         Args:
             slip_ratio: Longitudinal slip ratio (-1..1). Positive = driving.
@@ -296,57 +293,69 @@ class PacejkaTireModel:
             camber_rad: Camber angle (rad).
 
         Returns:
-            Longitudinal force Fx (N). Positive for positive slip ratio
-            (driving force).
+            Longitudinal force Fx (N). Positive for driving, negative for braking.
         """
         fz = max(normal_load_n, 1.0)
 
+        # Scaling factors
         lfzo = self._sc("LFZO")
-        lmuy = self._sc("LMUY")  # reuse lateral scaling for mirrored model
-        lcy = self._sc("LCY")
-        ley = self._sc("LEY")
-        lky = self._sc("LKY")
+        lcx = self._sc("LCX")
+        lmux = self._sc("LMUX")
+        lex = self._sc("LEX")
+        lkx = self._sc("LKX")
+        lhx = self._sc("LHX")
+        lvx = self._sc("LVX")
 
+        # Nominal load and normalized load increment
         fz0 = self.fnomin * lfzo
         dfz = (fz - fz0) / fz0 if fz0 > 0 else 0.0
 
-        # Peak friction -- use absolute value of lateral muy (symmetric)
-        pdy1 = self._lat("PDY1")
-        pdy2 = self._lat("PDY2")
-        pdy3 = self._lat("PDY3")
-        mux = abs((pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2)) * lmuy
+        # Peak friction coefficient (mux)
+        pdx1 = self._lon("PDX1")
+        pdx2 = self._lon("PDX2")
+        pdx3 = self._lon("PDX3")
+        mux = (pdx1 + pdx2 * dfz) * (1.0 - pdx3 * camber_rad ** 2) * lmux
 
-        # Cornering stiffness magnitude
-        pky1 = self._lat("PKY1")
-        pky2 = self._lat("PKY2")
-        pky3 = self._lat("PKY3")
-        pky1_fz0 = pky1 * fz0
-        pky2_fz0 = pky2 * fz0
-        sin_arg = 2.0 * math.atan(fz / pky2_fz0) if abs(pky2_fz0) > 1e-9 else 0.0
-        kx = abs(
-            pky1_fz0
-            * math.sin(sin_arg)
-            * (1.0 - pky3 * abs(camber_rad))
-            * lfzo
-            * lky
-        )
+        # Longitudinal slip stiffness (kxk)
+        pkx1 = self._lon("PKX1")
+        pkx2 = self._lon("PKX2")
+        pkx3 = self._lon("PKX3")
+        kxk = fz * (pkx1 + pkx2 * dfz) * math.exp(pkx3 * dfz) * lkx
 
-        # Shape and stiffness factors
-        pcy1 = self._lat("PCY1")
-        cx = pcy1 * lcy
-        denom = cx * mux * fz + 1e-6
-        bx_coeff = kx / denom
+        # Shape factor (cx)
+        pcx1 = self._lon("PCX1")
+        cx = pcx1 * lcx
 
-        # Curvature factor (symmetric: no sign dependency)
-        pey1 = self._lat("PEY1")
-        pey2 = self._lat("PEY2")
-        ex = (pey1 + pey2 * dfz) * ley
+        # Peak force and stiffness factor (bx)
+        dx = mux * fz
+        bx = kxk / (cx * dx + 1e-6)
+
+        # Horizontal shift (shx)
+        phx1 = self._lon("PHX1")
+        phx2 = self._lon("PHX2")
+        shx = (phx1 + phx2 * dfz) * lhx
+
+        # Vertical shift (svx)
+        pvx1 = self._lon("PVX1")
+        pvx2 = self._lon("PVX2")
+        svx = fz * (pvx1 + pvx2 * dfz) * lvx * lmux
+
+        # Shifted slip ratio
+        kappa_x = slip_ratio + shx
+
+        # Curvature factor (ex), clamped <= 1.0
+        pex1 = self._lon("PEX1")
+        pex2 = self._lon("PEX2")
+        pex3 = self._lon("PEX3")
+        pex4 = self._lon("PEX4")
+        sign_k = 1.0 if kappa_x >= 0.0 else -1.0
+        ex = (pex1 + pex2 * dfz + pex3 * dfz ** 2) * (1.0 - pex4 * sign_k) * lex
         ex = min(ex, 1.0)
 
-        # Magic Formula
-        bk = bx_coeff * slip_ratio
+        # Magic Formula: Fx = Dx * sin(Cx * atan(Bx*k - Ex*(Bx*k - atan(Bx*k)))) + SVx
+        bk = bx * kappa_x
         inner = bk - ex * (bk - math.atan(bk))
-        fx = mux * fz * math.sin(cx * math.atan(inner))
+        fx = dx * math.sin(cx * math.atan(inner)) + svx
 
         return fx
 
