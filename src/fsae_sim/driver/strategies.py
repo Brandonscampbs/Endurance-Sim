@@ -406,6 +406,7 @@ class CalibratedStrategy(DriverStrategy):
             brake_threshold=brake_threshold,
         )
         zones = collapse_to_zones(seg_actions, track, merge_tolerance=merge_tolerance)
+
         return cls(zones, track.num_segments, name=name)
 
     @classmethod
