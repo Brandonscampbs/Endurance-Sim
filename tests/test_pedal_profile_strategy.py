@@ -175,3 +175,51 @@ class TestDecide:
         # Segment 8 has 0.5 * 3.0 = 1.5, should clamp to 1.0
         cmd = strategy.decide(make_state(segment_idx=8), [])
         assert cmd.brake_pct == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# with_params()
+# ---------------------------------------------------------------------------
+
+class TestWithParams:
+    def _make_strategy(self):
+        from fsae_sim.driver.strategies import PedalProfileStrategy
+        n = 10
+        throttle = np.array([0.5, 0.6, 0.7, 0.8, 0.3, 0.0, 0.0, 0.0, 0.0, 0.4])
+        brake = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.5, 0.0])
+        actions = np.array([1, 1, 1, 1, 1, 0, 0, 2, 2, 1])
+        ref_speed = np.ones(n) * 12.0
+        return PedalProfileStrategy(
+            throttle_pct=throttle, brake_pct=brake,
+            actions=actions, ref_speed_ms=ref_speed,
+            num_segments=n,
+        )
+
+    def test_returns_new_instance(self):
+        original = self._make_strategy()
+        modified = original.with_params(throttle_scale=0.5)
+        assert modified is not original
+        assert modified.params.throttle_scale == 0.5
+        assert original.params.throttle_scale == 1.0
+
+    def test_preserves_profile_data(self):
+        original = self._make_strategy()
+        modified = original.with_params(brake_scale=2.0)
+        np.testing.assert_array_equal(modified._throttle_pct, original._throttle_pct)
+        np.testing.assert_array_equal(modified._brake_pct, original._brake_pct)
+        np.testing.assert_array_equal(modified._actions, original._actions)
+
+    def test_multiple_params(self):
+        original = self._make_strategy()
+        modified = original.with_params(throttle_scale=0.8, max_throttle=0.6, coast_throttle=0.02)
+        assert modified.params.throttle_scale == 0.8
+        assert modified.params.max_throttle == 0.6
+        assert modified.params.coast_throttle == 0.02
+        assert modified.params.brake_scale == 1.0
+
+    def test_chained_with_params(self):
+        original = self._make_strategy()
+        step1 = original.with_params(throttle_scale=0.9)
+        step2 = step1.with_params(brake_scale=1.5)
+        assert step2.params.throttle_scale == 0.9
+        assert step2.params.brake_scale == 1.5

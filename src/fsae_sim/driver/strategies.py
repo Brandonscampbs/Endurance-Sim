@@ -577,3 +577,25 @@ class PedalProfileStrategy(DriverStrategy):
                 throttle_pct=max(0.0, min(1.0, self.params.coast_throttle)),
                 brake_pct=0.0,
             )
+
+    def with_params(self, **kwargs) -> PedalProfileStrategy:
+        """Return a new strategy with modified DriverParams.
+
+        Shares the underlying profile arrays (numpy views).
+        Only the DriverParams are replaced.
+
+        Args:
+            **kwargs: Fields of DriverParams to override.
+
+        Returns:
+            New PedalProfileStrategy with updated params.
+        """
+        new_params = replace(self.params, **kwargs)
+        return PedalProfileStrategy(
+            throttle_pct=self._throttle_pct,
+            brake_pct=self._brake_pct,
+            actions=self._actions,
+            ref_speed_ms=self._ref_speed_ms,
+            num_segments=self._num_segments,
+            params=new_params,
+        )
