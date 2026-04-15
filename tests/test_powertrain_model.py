@@ -449,3 +449,94 @@ class TestCT16EVIntegration:
         assert 15_000 < p < 35_000, (
             f"Peak electrical power {p/1000:.1f} kW outside expected range"
         )
+
+
+# ---------------------------------------------------------------------------
+# LVCU torque command (real firmware replication)
+# ---------------------------------------------------------------------------
+
+class TestLVCUTorqueCommand:
+    """Tests for lvcu_torque_command — replicates real LVCU C code."""
+
+    def test_full_pedal_low_rpm_inverter_limited(self, model: PowertrainModel) -> None:
+        """At 100A and low RPM, inverter 85 Nm limit should bind."""
+        torque = model.lvcu_torque_command(1.0, 1000.0, 100.0)
+        assert torque == pytest.approx(85.0)
+
+    def test_full_pedal_high_rpm_power_limited(self, model: PowertrainModel) -> None:
+        """At 50A and 2900 RPM, the power limit should bind below 85 Nm.
+
+        Power ceiling: 420 * 50 / max(23.04, 2900 * 0.1076)
+                     = 21000 / max(23.04, 312.04)
+                     = 21000 / 312.04
+                     ~ 67.3 Nm
+        """
+        torque = model.lvcu_torque_command(1.0, 2900.0, 50.0)
+        assert torque == pytest.approx(420.0 * 50.0 / (2900.0 * 0.1076), rel=0.01)
+        assert torque < 85.0
+
+    def test_half_pedal_scales_linearly(self, model: PowertrainModel) -> None:
+        """Half pedal (after dead zone remap) gives half the torque ceiling."""
+        # pedal=0.5 remaps to (0.5-0.1)/(0.9-0.1) = 0.5
+        full = model.lvcu_torque_command(1.0, 1000.0, 100.0)
+        half = model.lvcu_torque_command(0.5, 1000.0, 100.0)
+        assert half == pytest.approx(full * 0.5)
+
+    def test_pedal_below_deadzone_gives_zero(self, model: PowertrainModel) -> None:
+        """Pedal at 0.05 is below V_MIN=0.1, should produce 0 torque."""
+        torque = model.lvcu_torque_command(0.05, 1000.0, 100.0)
+        assert torque == 0.0
+
+    def test_pedal_above_deadzone_gives_zero(self, model: PowertrainModel) -> None:
+        """Pedal at 0.95 is above V_MAX=0.9, should produce full torque."""
+        torque = model.lvcu_torque_command(0.95, 1000.0, 100.0)
+        assert torque == pytest.approx(85.0)
+
+    def test_zero_pedal_gives_zero(self, model: PowertrainModel) -> None:
+        torque = model.lvcu_torque_command(0.0, 1000.0, 100.0)
+        assert torque == 0.0
+
+    def test_zero_current_gives_zero(self, model: PowertrainModel) -> None:
+        """If BMS current limit is 0, no torque can be produced."""
+        torque = model.lvcu_torque_command(1.0, 1000.0, 0.0)
+        assert torque == 0.0
+
+    def test_overspeed_caps_torque(self, model: PowertrainModel) -> None:
+        """At >= 6000 RPM, torque ceiling drops to 30 Nm."""
+        torque = model.lvcu_torque_command(1.0, 6500.0, 100.0)
+        assert torque == pytest.approx(30.0)
+
+    def test_power_limit_at_low_rpm_uses_floor(self, model: PowertrainModel) -> None:
+        """Below ~2141 RPM, the omega floor dominates.
+
+        At 200 RPM: max(23.04, 200*0.1076) = max(23.04, 21.52) = 23.04
+        Power ceiling: 420 * 100 / 23.04 = 1822.9 Nm -> clamped to 85 Nm
+        """
+        torque = model.lvcu_torque_command(1.0, 200.0, 100.0)
+        assert torque == pytest.approx(85.0)  # inverter limit still binds
+
+    def test_power_limit_becomes_binding_with_low_current(self, model: PowertrainModel) -> None:
+        """At 45A and 2400 RPM, power limit should be near inverter limit.
+
+        Power ceiling: 420 * 45 / max(23.04, 2400 * 0.1076)
+                     = 18900 / max(23.04, 258.24)
+                     = 18900 / 258.24
+                     ~ 73.2 Nm  (below 85 Nm -- power limit binds)
+        """
+        torque = model.lvcu_torque_command(1.0, 2400.0, 45.0)
+        expected = 420.0 * 45.0 / (2400.0 * 0.1076)
+        assert torque == pytest.approx(expected, rel=0.01)
+        assert torque < 85.0
+
+    def test_lvcu_limit_caps_before_inverter(self, model: PowertrainModel) -> None:
+        """With very high current, LVCU 150 Nm limit should bind before
+        the power formula would give more, but inverter 85 Nm still wins.
+
+        At 500A (unrealistic, but tests the min chain):
+        Power: 420*500/max(23.04, 1000*0.1076) = 210000/107.6 = 1951 Nm
+        LVCU limit: 150 Nm
+        Inverter limit: 85 Nm
+        Result: 85 Nm
+        """
+        torque = model.lvcu_torque_command(1.0, 1000.0, 500.0)
+        assert torque == pytest.approx(85.0)
