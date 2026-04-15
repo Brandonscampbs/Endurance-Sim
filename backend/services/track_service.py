@@ -5,14 +5,12 @@ import pandas as pd
 from scipy.interpolate import CubicSpline
 
 from backend.models.track import Sector, TrackData, TrackPoint
-from fsae_sim.data.loader import load_aim_csv
+from backend.services.telemetry_service import get_lap_boundaries, get_telemetry
 from fsae_sim.track.track import Track
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_AIM_CSV = _PROJECT_ROOT / "Real-Car-Data-And-Stats" / "2025 Endurance Data.csv"
 
 _CURVATURE_CORNER_THRESHOLD = 0.01  # 1/m -- above this is a corner
-_GPS_POS_ACC_BAD = 200.0
 _MIN_SPEED_KMH = 5.0
 
 
@@ -90,35 +88,34 @@ def detect_sectors(
 
 
 def _load_best_lap_gps(aim_df: pd.DataFrame, track: Track) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract GPS data for the lap with the best GPS quality."""
-    from fsae_sim.analysis.validation import detect_lap_boundaries
-
-    boundaries = detect_lap_boundaries(aim_df)
+    """Extract GPS data for the lap with the best quality."""
+    boundaries = get_lap_boundaries()
     if not boundaries:
         raise ValueError("No laps detected in telemetry")
 
-    # Score each lap by mean GPS accuracy (lower = better, 200 = invalid)
+    # Pick lap with the smoothest GPS heading (proxy for quality without PosAccuracy)
     best_score = float("inf")
     best_lap_idx = 0
     for idx, (start, end, _) in enumerate(boundaries):
         lap_slice = aim_df.iloc[start:end]
-        acc = lap_slice["GPS PosAccuracy"]
-        valid = acc[acc < _GPS_POS_ACC_BAD]
-        if len(valid) == 0:
+        # Filter low speed samples
+        fast = lap_slice[lap_slice["GPS Speed"] > _MIN_SPEED_KMH]
+        if len(fast) < 20:
             continue
-        score = valid.mean()
-        if score < best_score:
-            best_score = score
-            best_lap_idx = idx
+        if "GPS Heading" in fast.columns:
+            score = float(fast["GPS Heading"].diff().abs().std())
+            if not np.isnan(score) and score < best_score:
+                best_score = score
+                best_lap_idx = idx
+        else:
+            best_lap_idx = 0
+            break
 
     start, end, _ = boundaries[best_lap_idx]
     lap_df = aim_df.iloc[start:end].copy()
 
-    # Filter bad GPS
-    mask = (
-        (lap_df["GPS PosAccuracy"] < _GPS_POS_ACC_BAD)
-        & (lap_df["GPS Speed"] > _MIN_SPEED_KMH)
-    )
+    # Filter low speed
+    mask = lap_df["GPS Speed"] > _MIN_SPEED_KMH
     lap_df = lap_df[mask]
 
     lats = lap_df["GPS Latitude"].values
@@ -132,7 +129,7 @@ def _load_best_lap_gps(aim_df: pd.DataFrame, track: Track) -> tuple[np.ndarray, 
 
 def get_track_data() -> TrackData:
     """Build complete track data with XY coordinates and sectors."""
-    _, aim_df = load_aim_csv(str(_AIM_CSV))
+    aim_df = get_telemetry()
     track = Track.from_telemetry(df=aim_df)
 
     lats, lons, dists = _load_best_lap_gps(aim_df, track)
