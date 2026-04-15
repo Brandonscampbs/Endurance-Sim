@@ -665,9 +665,23 @@ class PedalProfileStrategy(DriverStrategy):
         brake_norm = float(np.percentile(nonzero_brake, 99)) if len(nonzero_brake) > 0 else 1.0
         brake_norm = max(brake_norm, 1.0)
 
-        # Per-lap, per-segment extraction
-        action_matrix = []
-        throttle_matrix = []
+        # Use LVCU Torque Req for throttle intensity when available.
+        # AiM "Throttle Pos" and the LVCU firmware use different sensor
+        # calibration scales (~1.6x ratio), so raw pedal % doesn't map
+        # correctly through our LVCU model.  LVCU Torque Req IS the real
+        # commanded torque — using it / inverter_limit captures the exact
+        # driver torque demand as a fraction of ceiling.
+        has_torque = "LVCU Torque Req" in aim_df.columns
+        _INVERTER_TORQUE_LIMIT = 85.0
+
+        # Per-lap, per-segment extraction.  Store raw torque/brake/pedal
+        # values for ALL laps including zeros.  Use Throttle Pos for
+        # action classification (it's in pedal-travel units matching
+        # the threshold) and LVCU Torque Req for torque intensity (it's
+        # the actual commanded torque).  Classify AFTER aggregation to
+        # avoid majority-vote bias.
+        throttle_matrix = []  # torque fraction (LVCU Torque Req / 85)
+        pedal_matrix = []     # raw Throttle Pos (0-1) for classification
         brake_matrix = []
         speed_matrix = []
 
@@ -675,15 +689,19 @@ class PedalProfileStrategy(DriverStrategy):
             lap_df = aim_df.iloc[start_idx:end_idx]
             lap_dist_raw = lap_df["Distance on GPS Speed"].values
             lap_d = lap_dist_raw - lap_dist_raw[0]
-            lap_throttle = lap_df["Throttle Pos"].values
+            lap_throttle_raw = lap_df["Throttle Pos"].values
             lap_speed = lap_df["GPS Speed"].values
             lap_brake = np.maximum(
                 lap_df["FBrakePressure"].values,
                 lap_df["RBrakePressure"].values,
             )
+            if has_torque:
+                lap_torque = lap_df["LVCU Torque Req"].values
+            else:
+                lap_torque = None
 
-            lap_actions = np.zeros(num_segments, dtype=int)
             lap_throttles = np.zeros(num_segments)
+            lap_pedals = np.zeros(num_segments)
             lap_brakes = np.zeros(num_segments)
             lap_speeds = np.zeros(num_segments)
 
@@ -697,55 +715,57 @@ class PedalProfileStrategy(DriverStrategy):
                     mask = np.zeros(len(lap_d), dtype=bool)
                     mask[nearest_idx] = True
 
-                seg_throttle = float(np.median(lap_throttle[mask]))
+                seg_pedal = float(np.median(lap_throttle_raw[mask]))
                 seg_brake = float(np.median(lap_brake[mask]))
                 seg_speed = float(np.mean(lap_speed[mask]))
 
-                if seg_brake > brake_threshold:
-                    lap_actions[seg.index] = 2  # BRAKE
-                    lap_brakes[seg.index] = float(np.clip(seg_brake / brake_norm, 0.0, 1.0))
-                    lap_throttles[seg.index] = 0.0
-                elif seg_throttle > throttle_threshold:
-                    lap_actions[seg.index] = 1  # THROTTLE
-                    lap_throttles[seg.index] = float(np.clip(seg_throttle / 100.0, 0.0, 1.0))
-                    lap_brakes[seg.index] = 0.0
+                # Torque fraction for intensity
+                if lap_torque is not None:
+                    seg_torque = float(np.median(np.clip(lap_torque[mask], 0, None)))
+                    lap_throttles[seg.index] = float(np.clip(
+                        seg_torque / _INVERTER_TORQUE_LIMIT, 0.0, 1.0,
+                    ))
                 else:
-                    lap_actions[seg.index] = 0  # COAST
-                    lap_throttles[seg.index] = 0.0
-                    lap_brakes[seg.index] = 0.0
+                    lap_throttles[seg.index] = float(np.clip(seg_pedal / 100.0, 0.0, 1.0))
 
+                # Raw pedal for classification
+                lap_pedals[seg.index] = seg_pedal
+
+                lap_brakes[seg.index] = float(np.clip(
+                    max(0.0, seg_brake) / brake_norm, 0.0, 1.0,
+                ))
                 lap_speeds[seg.index] = seg_speed / 3.6  # km/h -> m/s
 
-            action_matrix.append(lap_actions)
             throttle_matrix.append(lap_throttles)
+            pedal_matrix.append(lap_pedals)
             brake_matrix.append(lap_brakes)
             speed_matrix.append(lap_speeds)
 
-        # Aggregate across laps
-        action_arr = np.array(action_matrix)
+        # Aggregate: median across ALL laps then classify action.
         throttle_arr = np.array(throttle_matrix)
+        pedal_arr = np.array(pedal_matrix)
         brake_arr = np.array(brake_matrix)
         speed_arr = np.array(speed_matrix)
 
+        final_throttle = np.median(throttle_arr, axis=0)
+        final_pedal = np.median(pedal_arr, axis=0)
+        final_brake = np.median(brake_arr, axis=0)
+        final_speed = np.mean(speed_arr, axis=0)
+
+        # Classify action using pedal/brake in their native units
         final_actions = np.zeros(num_segments, dtype=int)
-        final_throttle = np.zeros(num_segments)
-        final_brake = np.zeros(num_segments)
-        final_speed = np.zeros(num_segments)
-
+        brake_threshold_norm = brake_threshold / brake_norm
         for i in range(num_segments):
-            counts = np.bincount(action_arr[:, i], minlength=3)
-            winner = int(np.argmax(counts))
-            final_actions[i] = winner
-
-            winner_mask = action_arr[:, i] == winner
-            if np.any(winner_mask):
-                final_throttle[i] = float(np.median(throttle_arr[:, i][winner_mask]))
-                final_brake[i] = float(np.median(brake_arr[:, i][winner_mask]))
+            if final_brake[i] > brake_threshold_norm:
+                final_actions[i] = 2  # BRAKE
+                final_throttle[i] = 0.0
+            elif final_pedal[i] > throttle_threshold:
+                final_actions[i] = 1  # THROTTLE
+                final_brake[i] = 0.0
             else:
-                final_throttle[i] = float(np.median(throttle_arr[:, i]))
-                final_brake[i] = float(np.median(brake_arr[:, i]))
-
-            final_speed[i] = float(np.mean(speed_arr[:, i]))
+                final_actions[i] = 0  # COAST
+                final_throttle[i] = 0.0
+                final_brake[i] = 0.0
 
         return cls(
             throttle_pct=final_throttle,

@@ -16,7 +16,7 @@ from fsae_sim.data.loader import load_aim_csv, load_cleaned_csv, load_voltt_csv
 from fsae_sim.track.track import Track
 from fsae_sim.vehicle import VehicleConfig
 from fsae_sim.vehicle.battery_model import BatteryModel
-from fsae_sim.driver.strategies import CalibratedStrategy
+from fsae_sim.driver.strategies import PedalProfileStrategy
 from fsae_sim.sim.engine import SimulationEngine
 from fsae_sim.analysis.validation import validate_full_endurance, detect_lap_boundaries
 from fsae_sim.analysis.scoring import FSAEScoring
@@ -45,39 +45,41 @@ def main():
     print(f"  Detected {len(laps)} laps")
 
     # ── Calibrate strategy ──
-    print("\n[3/6] Calibrating driver model from telemetry...")
-    strategy = CalibratedStrategy.from_telemetry(aim_df, track)
-    zones = strategy.zones
+    print("\n[3/6] Calibrating pedal-profile driver model from telemetry...")
+    strategy = PedalProfileStrategy.from_telemetry(aim_df, track)
 
-    print(f"  Created {len(zones)} zones")
-    print(f"\n  Zone summary:")
-    for z in zones:
-        action_str = z.action.value.upper()
-        if z.action.value == "throttle":
-            detail = f"{z.intensity * 100:.0f}%"
-        elif z.action.value == "brake":
-            detail = f"{z.intensity * 100:.0f}%"
-        else:
-            detail = ""
-        print(f"    Zone {z.zone_id:2d}: {z.label:20s} "
-              f"({z.distance_start_m:6.0f}-{z.distance_end_m:6.0f}m) "
-              f"{action_str:8s} {detail}")
+    # Profile summary
+    n_throttle = int(np.sum(strategy._actions == 1))
+    n_coast = int(np.sum(strategy._actions == 0))
+    n_brake = int(np.sum(strategy._actions == 2))
+    print(f"  {strategy.num_segments} segments: "
+          f"{n_throttle} throttle, {n_coast} coast, {n_brake} brake")
+    throttle_segs = strategy._throttle_pct[strategy._actions == 1]
+    if len(throttle_segs) > 0:
+        print(f"  Throttle pedal: mean={np.mean(throttle_segs)*100:.1f}%, "
+              f"median={np.median(throttle_segs)*100:.1f}%, "
+              f"max={np.max(throttle_segs)*100:.1f}%")
+    brake_segs = strategy._brake_pct[strategy._actions == 2]
+    if len(brake_segs) > 0:
+        print(f"  Brake pressure: mean={np.mean(brake_segs)*100:.1f}%, "
+              f"median={np.median(brake_segs)*100:.1f}%, "
+              f"max={np.max(brake_segs)*100:.1f}%")
 
-    # ── Zone quality checks ──
-    print("\n[4/6] Zone quality checks...")
+    # ── Profile quality checks ──
+    print("\n[4/6] Profile quality checks...")
     all_ok = True
-    for z in zones:
-        span = z.distance_end_m - z.distance_start_m
-        if span > 200:
-            print(f"  WARNING: Zone {z.zone_id} ({z.label}) spans {span:.0f}m > 200m")
-            all_ok = False
-        if span < 5:
-            print(f"  WARNING: Zone {z.zone_id} ({z.label}) spans {span:.0f}m < 5m")
-            all_ok = False
-    if not (25 <= len(zones) <= 50):
-        print(f"  WARNING: {len(zones)} zones (expected 25-50)")
-    if all_ok and 25 <= len(zones) <= 50:
-        print("  All zone quality checks passed")
+    if n_throttle == 0:
+        print("  WARNING: No throttle segments found")
+        all_ok = False
+    if n_coast == 0:
+        print("  WARNING: No coast segments found")
+        all_ok = False
+    total_pct = 100.0 * (n_throttle + n_coast + n_brake) / strategy.num_segments
+    if total_pct < 99.9:
+        print(f"  WARNING: Only {total_pct:.1f}% of segments classified")
+        all_ok = False
+    if all_ok:
+        print("  All profile quality checks passed")
 
     # ── Run simulation ──
     print("\n[5/6] Running 22-lap simulation...")

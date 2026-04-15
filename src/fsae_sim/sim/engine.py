@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from fsae_sim.driver.strategy import ControlAction, DriverStrategy, SimState
-from fsae_sim.driver.strategies import CalibratedStrategy, ReplayStrategy
+from fsae_sim.driver.strategies import CalibratedStrategy, PedalProfileStrategy, ReplayStrategy
 from fsae_sim.track.track import Track
 from fsae_sim.vehicle import VehicleConfig
 from fsae_sim.vehicle.battery_model import BatteryModel
@@ -152,7 +152,7 @@ class SimulationEngine:
         # Pre-compute speed envelope (cornering limits from tire grip)
         v_max = self._envelope.compute(initial_speed=speed)
         is_replay = isinstance(self.strategy, ReplayStrategy)
-        is_calibrated = isinstance(self.strategy, CalibratedStrategy)
+        is_calibrated = isinstance(self.strategy, (CalibratedStrategy, PedalProfileStrategy))
 
         for lap in range(num_laps):
             for seg_idx, segment in enumerate(segments):
@@ -191,10 +191,11 @@ class SimulationEngine:
                 # 3. Compute forces based on driver action
                 #    ReplayStrategy: use recorded LVCU Torque Req directly
                 #    (already the final inverter command, no re-processing).
-                #    CalibratedStrategy: intensity is a torque fraction
-                #    (LVCU Torque Req / 85 Nm), already through the dead
-                #    zone remap. Use lvcu_torque_ceiling to apply power
-                #    limiting without double-processing the dead zone.
+                #    CalibratedStrategy / PedalProfileStrategy: throttle_pct
+                #    is a calibrated pedal fraction (0-1). AiM's Throttle
+                #    Pos is already de-dead-zoned by sensor calibration.
+                #    Use lvcu_torque_ceiling to apply power limiting
+                #    without double-processing the dead zone.
                 #    Other strategies: raw throttle through full LVCU model.
                 if cmd.action == ControlAction.THROTTLE:
                     if is_replay:
@@ -263,7 +264,21 @@ class SimulationEngine:
                     motor_torque = 0.0
 
                 # 7. Electrical power and pack current
-                elec_power = self.powertrain.electrical_power(motor_torque, motor_rpm)
+                #    When the replay strategy has measured V×I data,
+                #    use it directly — this is the actual power at the
+                #    battery terminals, more accurate than computing
+                #    P_elec = torque × RPM / efficiency because the
+                #    CAN torque feedback has a ~10% positive bias vs
+                #    what V×I energy data implies.
+                #    For non-replay strategies, fall back to the
+                #    torque-based computation.
+                if is_replay and self.strategy.has_electrical_power:
+                    seg_mid_dist = distance + segment.length_m / 2.0
+                    elec_power = self.strategy.measured_electrical_power(seg_mid_dist)
+                elif cmd.action == ControlAction.COAST:
+                    elec_power = self.powertrain.coast_electrical_power(avg_speed)
+                else:
+                    elec_power = self.powertrain.electrical_power(motor_torque, motor_rpm)
                 if pack_voltage > 0:
                     pack_current = elec_power / pack_voltage
                 else:
