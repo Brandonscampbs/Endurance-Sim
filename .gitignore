@@ -14,3 +14,10 @@ results/*
 .coverage
 htmlcov/
 .worktrees/
+
+# Webapp
+webapp/node_modules/
+webapp/dist/
+
+# Superpowers brainstorm sessions
+.superpowers/
