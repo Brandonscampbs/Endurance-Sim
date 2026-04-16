@@ -3,12 +3,12 @@
 All tests use the CT-16EV specification:
 - Motor:     EMRAX-like PMSM, max 2900 RPM, brake speed 2400 RPM
 - Inverter:  IQ=170 A, ID=30 A, torque limit 85 Nm
-- LVCU:      mechanical torque limit 150 Nm
+- LVCU:      mechanical torque limit 220 Nm (firmware default; see C17 fix)
 - Gear ratio: 3.5 single-speed
 - Drivetrain efficiency: 92 %
-- Tire radius: 0.228 m (10-inch FSAE tyre)
+- Tire radius: 0.2042 m (Hoosier LC0 16x7.5-10 from .tir file)
 
-Effective torque ceiling = min(85, 150) = 85 Nm (inverter-limited).
+Effective torque ceiling = min(85, 220) = 85 Nm (inverter-limited).
 """
 
 import math
@@ -30,7 +30,7 @@ def ct16ev_powertrain_config() -> PowertrainConfig:
         motor_speed_max_rpm=2900.0,
         brake_speed_rpm=2400.0,
         torque_limit_inverter_nm=85.0,
-        torque_limit_lvcu_nm=150.0,
+        torque_limit_lvcu_nm=220.0,
         iq_limit_a=170.0,
         id_limit_a=30.0,
         gear_ratio=3.5,
@@ -77,17 +77,17 @@ class TestSpeedRPMConversion:
     def test_max_speed_at_max_rpm_in_fsae_range(self, model: PowertrainModel) -> None:
         """At 2900 RPM the vehicle speed must match the gear-ratio prediction.
 
-        With gear_ratio=3.5 and tire_radius=0.228 m:
+        With gear_ratio=3.5 and tire_radius=0.2042 m (Hoosier LC0):
             wheel_rpm   = 2900 / 3.5 ≈ 828.6 rpm
-            speed_ms    = 828.6 * 0.228 * 2*pi / 60 ≈ 19.78 m/s ≈ 71.2 km/h
+            speed_ms    = 828.6 * 0.2042 * 2*pi / 60 ≈ 17.72 m/s ≈ 63.8 km/h
 
-        FSAE competition speeds typically reach 60–80 km/h on straights, so
-        ~71 km/h is physically plausible for this drivetrain.
+        FSAE competition speeds typically reach 55–80 km/h on straights, so
+        ~64 km/h is physically plausible for this drivetrain.
         """
         speed_ms = model.speed_from_motor_rpm(2900.0)
         speed_kmh = speed_ms * 3.6
-        assert 65.0 < speed_kmh < 80.0, (
-            f"Expected ~71 km/h at max RPM, got {speed_kmh:.2f} km/h"
+        assert 55.0 < speed_kmh < 80.0, (
+            f"Expected ~64 km/h at max RPM, got {speed_kmh:.2f} km/h"
         )
 
     def test_rpm_scales_linearly_with_speed(self, model: PowertrainModel) -> None:
@@ -147,10 +147,10 @@ class TestMaxMotorTorque:
             assert abs(slope - slopes[0]) < 1e-9, "Taper slope is not linear"
 
     def test_inverter_limit_is_binding(self, model: PowertrainModel) -> None:
-        """Inverter limit (85 Nm) is less than LVCU (150 Nm), so it must bind."""
+        """Inverter limit (85 Nm) is less than LVCU (220 Nm), so it must bind."""
         # The effective cap must equal the inverter limit, not the LVCU limit
         assert model.max_motor_torque(0.0) == pytest.approx(85.0)
-        assert model.max_motor_torque(0.0) != pytest.approx(150.0)
+        assert model.max_motor_torque(0.0) != pytest.approx(220.0)
 
 
 # ---------------------------------------------------------------------------
@@ -159,17 +159,22 @@ class TestMaxMotorTorque:
 
 class TestWheelTorqueAndForce:
 
-    def test_wheel_torque_equals_motor_times_ratio_times_efficiency(
+    def test_wheel_torque_equals_motor_times_ratio_times_gearbox_eff(
         self, model: PowertrainModel
     ) -> None:
-        """wheel_torque = motor_torque * gear_ratio * drivetrain_efficiency."""
+        """wheel_torque = motor_torque * gear_ratio * _GEARBOX_EFFICIENCY.
+
+        Motor+inverter efficiency affects electrical power (see
+        electrical_power()), not mechanical torque delivered to the wheels.
+        Only gearbox friction appears here.
+        """
         motor_torque = 50.0
-        expected = motor_torque * 3.5 * 0.92
+        expected = motor_torque * 3.5 * PowertrainModel._GEARBOX_EFFICIENCY
         assert model.wheel_torque(motor_torque) == pytest.approx(expected)
 
     def test_wheel_torque_at_max_motor_torque(self, model: PowertrainModel) -> None:
-        """At full motor torque the wheel torque should be 85 * 3.5 * 0.92 Nm."""
-        expected = 85.0 * 3.5 * 0.92
+        """At full motor torque the wheel torque should be 85 * 3.5 * η_gearbox Nm."""
+        expected = 85.0 * 3.5 * PowertrainModel._GEARBOX_EFFICIENCY
         assert model.wheel_torque(85.0) == pytest.approx(expected)
 
     def test_wheel_torque_zero_for_zero_motor_torque(
@@ -268,14 +273,22 @@ class TestRegenForce:
         half = model.regen_force(0.5, 10.0)
         assert abs(half - full / 2.0) < 1e-9
 
-    def test_regen_magnitude_less_than_drive_force(
+    def test_regen_magnitude_greater_than_drive_force(
         self, model: PowertrainModel
     ) -> None:
-        """Regen force magnitude should be less than peak drive force (losses)."""
+        """After S12 fix: regen *mechanical* retarding force is GREATER than drive force.
+
+        In generator mode, gearbox friction ADDS to retarding torque at the
+        wheel (gearbox losses help slow the car). Drive force has gearbox
+        friction SUBTRACT from motor torque. Same motor torque magnitude,
+        different sign: |F_regen| = T*gear / (η*r) > F_drive = T*gear*η / r.
+        (Electrical energy recovered is still less than energy expended —
+        that asymmetry lives in electrical_power(), not regen_force().)
+        """
         speed = 10.0
         drive = model.drive_force(1.0, speed)
         regen_mag = abs(model.regen_force(1.0, speed))
-        assert regen_mag < drive
+        assert regen_mag > drive
 
     def test_regen_brake_clamped_above_one(self, model: PowertrainModel) -> None:
         f_1 = model.regen_force(1.0, 10.0)
@@ -411,7 +424,7 @@ class TestCT16EVIntegration:
     ) -> None:
         """Peak tractive force at low speed should be physically reasonable.
 
-        Expected: 85 Nm * 3.5 * 0.92 / 0.228 m ≈ 1198 N.
+        Expected: 85 Nm * 3.5 * η_gearbox / 0.2042 m ≈ 1413 N.
         Plausible range for FSAE EV: 900–1500 N.
         """
         force = model.drive_force(1.0, 1.0)  # 1 m/s ~ constant-torque region
@@ -421,7 +434,10 @@ class TestCT16EVIntegration:
 
     def test_peak_force_calculation(self, model: PowertrainModel) -> None:
         """Verify peak force matches analytical calculation."""
-        expected = 85.0 * 3.5 * 0.92 / 0.228
+        expected = (
+            85.0 * 3.5 * PowertrainModel._GEARBOX_EFFICIENCY
+            / PowertrainModel.TIRE_RADIUS_M
+        )
         actual = model.drive_force(1.0, 0.5)  # very low speed, constant-torque
         assert abs(actual - expected) < 1.0
 
@@ -466,13 +482,15 @@ class TestLVCUTorqueCommand:
     def test_full_pedal_high_rpm_power_limited(self, model: PowertrainModel) -> None:
         """At 50A and 2900 RPM, the power limit should bind below 85 Nm.
 
-        Power ceiling: 420 * 50 / max(23.04, 2900 * 0.1076)
-                     = 21000 / max(23.04, 312.04)
-                     = 21000 / 312.04
-                     ~ 67.3 Nm
+        After S14 BMS offset: effective_limit = 50 - 3 = 47 A.
+        Power ceiling: 420 * 47 / max(23.04, 2900 * 0.1076)
+                     = 19740 / max(23.04, 312.04)
+                     = 19740 / 312.04
+                     ~ 63.3 Nm
         """
         torque = model.lvcu_torque_command(1.0, 2900.0, 50.0)
-        assert torque == pytest.approx(420.0 * 50.0 / (2900.0 * 0.1076), rel=0.01)
+        expected = 420.0 * (50.0 - 3.0) / (2900.0 * 0.1076)
+        assert torque == pytest.approx(expected, rel=0.01)
         assert torque < 85.0
 
     def test_half_pedal_scales_linearly(self, model: PowertrainModel) -> None:
@@ -518,25 +536,343 @@ class TestLVCUTorqueCommand:
     def test_power_limit_becomes_binding_with_low_current(self, model: PowertrainModel) -> None:
         """At 45A and 2400 RPM, power limit should be near inverter limit.
 
-        Power ceiling: 420 * 45 / max(23.04, 2400 * 0.1076)
-                     = 18900 / max(23.04, 258.24)
-                     = 18900 / 258.24
-                     ~ 73.2 Nm  (below 85 Nm -- power limit binds)
+        After S14 BMS offset: effective_limit = 45 - 3 = 42 A.
+        Power ceiling: 420 * 42 / max(23.04, 2400 * 0.1076)
+                     = 17640 / max(23.04, 258.24)
+                     = 17640 / 258.24
+                     ~ 68.3 Nm  (below 85 Nm -- power limit binds)
         """
         torque = model.lvcu_torque_command(1.0, 2400.0, 45.0)
-        expected = 420.0 * 45.0 / (2400.0 * 0.1076)
+        expected = 420.0 * (45.0 - 3.0) / (2400.0 * 0.1076)
         assert torque == pytest.approx(expected, rel=0.01)
         assert torque < 85.0
 
     def test_lvcu_limit_caps_before_inverter(self, model: PowertrainModel) -> None:
-        """With very high current, LVCU 150 Nm limit should bind before
+        """With very high current, LVCU 220 Nm limit should bind before
         the power formula would give more, but inverter 85 Nm still wins.
 
         At 500A (unrealistic, but tests the min chain):
-        Power: 420*500/max(23.04, 1000*0.1076) = 210000/107.6 = 1951 Nm
-        LVCU limit: 150 Nm
+        Power: 420*(500-3)/max(23.04, 1000*0.1076) = 208740/107.6 ~ 1940 Nm
+        LVCU limit: 220 Nm
         Inverter limit: 85 Nm
         Result: 85 Nm
         """
         torque = model.lvcu_torque_command(1.0, 1000.0, 500.0)
         assert torque == pytest.approx(85.0)
+
+    # --- S14: BMS -3 A safety offset -----------------------------------
+
+    def test_bms_current_limit_has_minus_three_offset(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Firmware: `current_limit = RxData − 3`. Our sim must subtract 3 A
+        before the power divide.
+
+        At 2400 RPM with BMS limit 50 A:
+            effective_limit = 47 A
+            power ceiling   = 420 * 47 / (2400 * 0.1076)
+                            = 19740 / 258.24
+                            ~ 76.4 Nm  (< 85 Nm inverter limit)
+        """
+        torque = model.lvcu_torque_command(1.0, 2400.0, 50.0)
+        expected = 420.0 * (50.0 - 3.0) / (2400.0 * 0.1076)
+        assert torque == pytest.approx(expected, rel=0.01)
+
+    def test_bms_offset_clamped_to_zero(self, model: PowertrainModel) -> None:
+        """With BMS limit at 1 A, effective limit must clamp to 0, not -2."""
+        torque = model.lvcu_torque_command(1.0, 2400.0, 1.0)
+        assert torque == 0.0
+
+    def test_bms_offset_exactly_three(self, model: PowertrainModel) -> None:
+        """BMS limit of exactly 3 A → 0 A effective → 0 torque."""
+        torque = model.lvcu_torque_command(1.0, 2400.0, 3.0)
+        assert torque == 0.0
+
+
+# ---------------------------------------------------------------------------
+# LVCU BSE (brake+throttle) latch, APPS mismatch, startup gate
+# ---------------------------------------------------------------------------
+
+class TestLVCUBSELatch:
+    """S13: BSE/APPS/startup gate interlocks from LVCU firmware."""
+
+    def test_bse_latches_when_brake_and_tps_ge_10pct(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Brake pressed with TPS >= 10% latches BSE → torque zeroed."""
+        result = model.lvcu_torque_command(
+            pedal_pct=0.15,
+            motor_rpm=1000.0,
+            bms_current_limit_a=100.0,
+            brake_pressed=True,
+            return_state=True,
+        )
+        assert result.torque_nm == 0.0
+        assert result.bse_latched is True
+
+    def test_bse_not_latched_below_10pct_tps(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Brake pressed with TPS < 10% does NOT latch BSE."""
+        result = model.lvcu_torque_command(
+            pedal_pct=0.08,
+            motor_rpm=1000.0,
+            bms_current_limit_a=100.0,
+            brake_pressed=True,
+            return_state=True,
+        )
+        assert result.bse_latched is False
+
+    def test_bse_stays_latched_when_tps_between_5_and_10_pct(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Once latched, BSE persists until TPS < 5% (hysteresis)."""
+        # First call: latch
+        s1 = model.lvcu_torque_command(
+            0.20, 1000.0, 100.0, brake_pressed=True, return_state=True,
+        )
+        assert s1.bse_latched is True
+        # Second call: still pressing throttle, brake released. TPS now 7%.
+        # BSE clears only when TPS < 5%.
+        s2 = model.lvcu_torque_command(
+            0.07, 1000.0, 100.0, brake_pressed=False,
+            prior_bse_latched=True, return_state=True,
+        )
+        assert s2.bse_latched is True
+        assert s2.torque_nm == 0.0
+
+    def test_bse_clears_when_tps_below_5pct(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Once TPS drops below 5%, BSE clears and torque can flow again."""
+        s = model.lvcu_torque_command(
+            0.03, 1000.0, 100.0, brake_pressed=False,
+            prior_bse_latched=True, return_state=True,
+        )
+        assert s.bse_latched is False
+
+    def test_bse_not_active_without_brake(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Throttle alone at any value must not latch BSE."""
+        r = model.lvcu_torque_command(
+            1.0, 1000.0, 100.0, brake_pressed=False, return_state=True,
+        )
+        assert r.bse_latched is False
+        assert r.torque_nm > 0.0
+
+    def test_apps_mismatch_flag(
+        self, model: PowertrainModel,
+    ) -> None:
+        """APPS mismatch ( |TPS1 - TPS2| > 40% ) is reported as a flag."""
+        r = model.lvcu_torque_command(
+            0.5, 1000.0, 100.0, tps1=0.5, tps2=0.9, return_state=True,
+        )
+        assert r.apps_mismatch is True
+
+    def test_startup_gate_flag(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Startup gate (torque<5 Nm & motor<500 RPM) is a diagnostic flag."""
+        # Pedal 0.1 remaps to exactly dead-zone low edge → 0 torque,
+        # which is below the 5 Nm gate at 300 RPM < 500 RPM.
+        r = model.lvcu_torque_command(
+            0.1, 300.0, 100.0, return_state=True,
+        )
+        assert r.startup_gate_active is True
+
+    def test_backwards_compat_no_brake_returns_float(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Without brake or return_state, behavior is identical to before."""
+        t = model.lvcu_torque_command(1.0, 1000.0, 100.0)
+        expected = 420.0 * (100.0 - 3.0) / max(23.04, 1000.0 * 0.1076)
+        # At low RPM the power ceiling is huge, so inverter 85 Nm wins
+        assert t == pytest.approx(85.0)
+
+
+# ---------------------------------------------------------------------------
+# Regen gearbox sign (S12) and regen gearbox mechanical force
+# ---------------------------------------------------------------------------
+
+class TestRegenGearboxSign:
+    """S12: generator-mode gearbox friction adds to retarding torque."""
+
+    def test_regen_wheel_force_uses_divide_not_multiply(
+        self, model: PowertrainModel,
+    ) -> None:
+        """In generator mode, wheel retarding force = T_motor * gear / (η * r).
+
+        Gearbox friction adds to retarding torque at the wheel, so the
+        retarding force magnitude is ~3% HIGHER than a naïve (× η) model.
+        """
+        speed = 10.0
+        rpm = model.motor_rpm_from_speed(speed)
+        max_torque = model.max_motor_torque(rpm)
+        expected_mag = max_torque * model.config.gear_ratio / (
+            PowertrainModel._GEARBOX_EFFICIENCY * PowertrainModel.TIRE_RADIUS_M
+        )
+        actual = model.regen_force(1.0, speed)
+        assert actual < 0.0
+        assert abs(actual) == pytest.approx(expected_mag, rel=1e-6)
+
+    def test_regen_force_exceeds_naive_multiply(
+        self, model: PowertrainModel,
+    ) -> None:
+        """After S12 fix, |regen| with divide is 1/η² higher than multiply.
+
+        Old (wrong): |F| = T * gear * η / r
+        New (right): |F| = T * gear / (η * r)
+        Ratio:        1/η² ≈ 1/0.97² ≈ 1.0627
+        """
+        speed = 12.0
+        rpm = model.motor_rpm_from_speed(speed)
+        max_torque = model.max_motor_torque(rpm)
+        eta = PowertrainModel._GEARBOX_EFFICIENCY
+        r = PowertrainModel.TIRE_RADIUS_M
+
+        old_wrong_mag = max_torque * model.config.gear_ratio * eta / r
+        new_correct = abs(model.regen_force(1.0, speed))
+        assert new_correct > old_wrong_mag
+        assert new_correct / old_wrong_mag == pytest.approx(1.0 / (eta * eta), rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Back-EMF rectification (C2)
+# ---------------------------------------------------------------------------
+
+class TestBackEMFRectification:
+    """C2: `electrical_power(0, rpm, V_pack)` regens when K_e·ω > V_pack."""
+
+    def test_coast_above_bemf_threshold_is_regen(
+        self, model: PowertrainModel,
+    ) -> None:
+        """K_e=0.045 V/(rad/s). At 2500 RPM ω=261.8 rad/s, V_bemf=11.78 V
+        for a single pole pair — but for EMRAX 228 the effective line-line
+        back-EMF constant scales up.
+
+        Test with a low pack voltage so V_bemf > V_pack unambiguously.
+        """
+        rpm = 2500.0
+        # omega = 261.8 rad/s, V_bemf = 0.045 * 261.8 ≈ 11.78 V
+        # Deliberately low pack voltage so back-EMF threshold is crossed.
+        V_pack = 5.0
+        p = model.electrical_power(0.0, rpm, V_pack)
+        assert p < 0.0, "Coast above back-EMF threshold must return negative (regen) power"
+
+    def test_coast_below_bemf_threshold_is_zero(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Below V_bemf threshold, coast returns zero power (no current flow)."""
+        rpm = 1000.0
+        # omega = 104.7 rad/s, V_bemf = 0.045 * 104.7 ≈ 4.71 V
+        # Pack voltage of 400 V is well above, so no rectification.
+        V_pack = 400.0
+        p = model.electrical_power(0.0, rpm, V_pack)
+        assert p == 0.0
+
+    def test_coast_no_pack_voltage_is_zero(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Backwards compat: calling without V_pack defaults to no-rectification."""
+        p = model.electrical_power(0.0, 2000.0)
+        assert p == 0.0
+
+    def test_motoring_ignores_back_emf(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Back-EMF rectification only applies when motor_torque is ~zero.
+        Motoring path (positive torque) uses efficiency map / drivetrain_eff.
+        """
+        p_no_bemf = model.electrical_power(50.0, 1500.0)
+        p_with_bemf = model.electrical_power(50.0, 1500.0, 400.0)
+        assert p_with_bemf == pytest.approx(p_no_bemf)
+
+    def test_negative_torque_unchanged_by_bemf_arg(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Regen path (commanded negative torque) is independent of back-EMF arg."""
+        p_no_bemf = model.electrical_power(-40.0, 2000.0)
+        p_with_bemf = model.electrical_power(-40.0, 2000.0, 400.0)
+        assert p_with_bemf == pytest.approx(p_no_bemf)
+
+
+# ---------------------------------------------------------------------------
+# Regen inverter-loss double-count fix (C3)
+# ---------------------------------------------------------------------------
+
+class TestRegenEfficiencyNoDoubleCount:
+    """C3: map path must NOT multiply by extra 0.85 — map already includes losses."""
+
+    def test_fallback_regen_uses_drivetrain_eff_directly(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Without a motor map, regen efficiency = drivetrain_efficiency (0.92).
+
+        After C3 fix, no 0.85 factor is applied. If asymmetry is desired,
+        it is documented and <= 2pp.
+        """
+        torque = -50.0
+        rpm = 1500.0
+        omega = rpm * math.pi / 30.0
+        p_mech = torque * omega  # negative
+        p_elec = model.electrical_power(torque, rpm)
+        # Motoring-vs-regen offset must be small (<= 2 percentage points).
+        implied_eta = p_elec / p_mech  # both negative → positive
+        assert implied_eta <= 0.92 + 1e-9
+        assert implied_eta >= 0.92 - 0.02
+
+
+# ---------------------------------------------------------------------------
+# Pedal dead-zone span guard (NF-41)
+# ---------------------------------------------------------------------------
+
+class TestPedalDeadzoneGuard:
+
+    def test_zero_span_rejected_in_config(self) -> None:
+        """PowertrainConfig with lvcu_pedal_deadzone_high == low must raise."""
+        with pytest.raises(ValueError):
+            PowertrainConfig(
+                motor_speed_max_rpm=2900.0,
+                brake_speed_rpm=2400.0,
+                torque_limit_inverter_nm=85.0,
+                torque_limit_lvcu_nm=220.0,
+                iq_limit_a=170.0,
+                id_limit_a=30.0,
+                gear_ratio=3.5,
+                drivetrain_efficiency=0.92,
+                lvcu_pedal_deadzone_low=0.5,
+                lvcu_pedal_deadzone_high=0.5,
+            )
+
+    def test_near_zero_span_rejected(self) -> None:
+        """Span < 0.01 is rejected (catastrophic noise amplification)."""
+        with pytest.raises(ValueError):
+            PowertrainConfig(
+                motor_speed_max_rpm=2900.0,
+                brake_speed_rpm=2400.0,
+                torque_limit_inverter_nm=85.0,
+                torque_limit_lvcu_nm=220.0,
+                iq_limit_a=170.0,
+                id_limit_a=30.0,
+                gear_ratio=3.5,
+                drivetrain_efficiency=0.92,
+                lvcu_pedal_deadzone_low=0.5,
+                lvcu_pedal_deadzone_high=0.505,
+            )
+
+    def test_valid_span_accepted(self) -> None:
+        """Span >= 0.01 is accepted."""
+        cfg = PowertrainConfig(
+            motor_speed_max_rpm=2900.0,
+            brake_speed_rpm=2400.0,
+            torque_limit_inverter_nm=85.0,
+            torque_limit_lvcu_nm=220.0,
+            iq_limit_a=170.0,
+            id_limit_a=30.0,
+            gear_ratio=3.5,
+            drivetrain_efficiency=0.92,
+            lvcu_pedal_deadzone_low=0.4,
+            lvcu_pedal_deadzone_high=0.5,
+        )
+        assert cfg.lvcu_pedal_deadzone_high - cfg.lvcu_pedal_deadzone_low == pytest.approx(0.1)
