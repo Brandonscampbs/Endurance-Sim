@@ -314,7 +314,8 @@ class SimulationEngine:
                     "soc_pct": soc,
                     "pack_voltage_v": pack_voltage,
                     "pack_current_a": pack_current,
-                    "cell_temp_c": temp,
+                    "cell_temp_c": temp,  # deprecated alias; prefer mean_cell_temp_c
+                    "mean_cell_temp_c": temp,  # NF-10: lumped-mean cell temperature (AiM Pack Temp is max-cell)
                     "motor_rpm": motor_rpm,
                     "motor_torque_nm": motor_torque,
                     "electrical_power_w": elec_power,

@@ -17,6 +17,23 @@ from fsae_sim.sim.engine import SimulationEngine
 from fsae_sim.analysis.validation import validate_full_endurance, detect_lap_boundaries
 
 
+def _annotate_laps(aim_df: pd.DataFrame) -> pd.DataFrame:
+    """Annotate aim_df with a 1-based ``lap`` column using lap boundaries.
+
+    Used to drive the ``holdout_laps`` argument of
+    :meth:`BatteryModel.calibrate_pack_from_telemetry`.  Rows outside
+    detected laps (pre-start, post-finish, driver change) receive
+    ``lap = 0``.
+    """
+    laps = detect_lap_boundaries(aim_df)
+    lap_col = np.zeros(len(aim_df), dtype=int)
+    for lap_num, (start_idx, end_idx, _) in enumerate(laps, start=1):
+        lap_col[start_idx:end_idx] = lap_num
+    out = aim_df.copy()
+    out["lap"] = lap_col
+    return out
+
+
 def main():
     # ── Load everything ──
     config = VehicleConfig.from_yaml("configs/ct16ev.yaml")
@@ -26,10 +43,16 @@ def main():
     )
     track = Track.from_telemetry(df=aim_df)
 
-    # Battery with two-step calibration
-    battery = BatteryModel(config.battery, cell_capacity_ah=4.5)
-    battery.calibrate(voltt_df)
-    battery.calibrate_pack_from_telemetry(aim_df)
+    # C15 fix: decouple battery calibration from validation.
+    # Calibrate from Voltt cell-level data ONLY; pack-level parameters
+    # scale geometrically via series/parallel.  We do NOT call
+    # calibrate_pack_from_telemetry on aim_df here — doing so fits
+    # OCV and pack R against the same data we then validate against.
+    aim_df = _annotate_laps(aim_df)
+    HOLDOUT_LAPS = list(range(13, 22))  # validate on laps 13-21
+
+    battery = BatteryModel(config.battery)
+    battery.calibrate_from_voltt(voltt_df)
 
     # ── Tire model components ──
     tire = PacejkaTireModel(config.tire.tir_file)
@@ -63,10 +86,11 @@ def main():
 
     replay = ReplayStrategy.from_full_endurance(aim_df, track.lap_distance_m)
 
-    # Need fresh battery for each run
-    batt_replay = BatteryModel(config.battery, cell_capacity_ah=4.5)
-    batt_replay.calibrate(voltt_df)
-    batt_replay.calibrate_pack_from_telemetry(aim_df)
+    # Need fresh battery for each run. Voltt-only calibration (no AiM
+    # pack fit) so the replay validation is an honest comparison
+    # against the held-out stint.
+    batt_replay = BatteryModel(config.battery)
+    batt_replay.calibrate_from_voltt(voltt_df)
 
     engine = SimulationEngine(config, track, replay, batt_replay)
     result = engine.run(
@@ -76,13 +100,37 @@ def main():
         initial_speed_ms=max(initial_speed, 0.5),
     )
 
-    report = validate_full_endurance(
-        result.states, aim_df,
-        result.total_time_s, result.final_soc,
-        result.total_energy_kwh, result.laps_completed,
-        target_pct=5.0,
-    )
-    print(report.summary())
+    # C15 fix: validate on held-out stint only (laps 13-21).  The full
+    # endurance report is still printed for reference below.
+    aim_holdout = aim_df[aim_df["lap"].isin(HOLDOUT_LAPS)].reset_index(drop=True)
+    sim_holdout = result.states[result.states["lap"].isin(HOLDOUT_LAPS)].reset_index(drop=True)
+
+    if len(aim_holdout) > 0 and len(sim_holdout) > 0:
+        # Approximate per-stint totals for sim; the report API still
+        # accepts scalars so we hand it the held-out stint aggregates.
+        holdout_time = float(sim_holdout["time_s"].iloc[-1] - sim_holdout["time_s"].iloc[0])
+        holdout_energy_j_arr = sim_holdout["electrical_power_w"].values * sim_holdout["segment_time_s"].values
+        holdout_energy_kwh = float(np.sum(holdout_energy_j_arr[holdout_energy_j_arr > 0]) / 3.6e6)
+        holdout_final_soc = float(sim_holdout["soc_pct"].iloc[-1])
+
+        report_holdout = validate_full_endurance(
+            sim_holdout, aim_holdout,
+            holdout_time, holdout_final_soc,
+            holdout_energy_kwh, int(sim_holdout["lap"].nunique()),
+            target_pct=5.0,
+        )
+        print("  Validation stint: laps", HOLDOUT_LAPS[0], "-", HOLDOUT_LAPS[-1])
+        print(report_holdout.summary())
+        report = report_holdout
+    else:
+        print("  WARNING: no held-out laps found; falling back to full endurance")
+        report = validate_full_endurance(
+            result.states, aim_df,
+            result.total_time_s, result.final_soc,
+            result.total_energy_kwh, result.laps_completed,
+            target_pct=5.0,
+        )
+        print(report.summary())
     print(f"  Laps completed: {result.laps_completed}/{num_laps}")
 
     # ── 2. Corner Speed Comparison ──
@@ -131,8 +179,8 @@ def main():
 
     # CoastOnly with Pacejka dynamics
     coast_strat = CoastOnlyStrategy(new_dyn, coast_margin_ms=2.0)
-    batt_coast = BatteryModel(config.battery, 4.5)
-    batt_coast.calibrate(voltt_df)
+    batt_coast = BatteryModel(config.battery)
+    batt_coast.calibrate_from_voltt(voltt_df)
     engine_coast = SimulationEngine(config, track, coast_strat, batt_coast)
     # Override dynamics to use our Pacejka-equipped one
     engine_coast.dynamics = new_dyn
@@ -140,16 +188,16 @@ def main():
 
     # ThresholdBraking with Pacejka
     brake_strat = ThresholdBrakingStrategy(new_dyn, coast_margin_ms=3.0, brake_threshold_ms=1.0, brake_intensity=0.5)
-    batt_brake = BatteryModel(config.battery, 4.5)
-    batt_brake.calibrate(voltt_df)
+    batt_brake = BatteryModel(config.battery)
+    batt_brake.calibrate_from_voltt(voltt_df)
     engine_brake = SimulationEngine(config, track, brake_strat, batt_brake)
     engine_brake.dynamics = new_dyn
     result_brake = engine_brake.run(num_laps=1, initial_soc_pct=initial_soc, initial_temp_c=initial_temp)
 
     # CoastOnly with legacy dynamics
     coast_legacy = CoastOnlyStrategy(legacy_dyn, coast_margin_ms=2.0)
-    batt_leg = BatteryModel(config.battery, 4.5)
-    batt_leg.calibrate(voltt_df)
+    batt_leg = BatteryModel(config.battery)
+    batt_leg.calibrate_from_voltt(voltt_df)
     engine_leg = SimulationEngine(config, track, coast_legacy, batt_leg)
     engine_leg.dynamics = legacy_dyn
     result_leg = engine_leg.run(num_laps=1, initial_soc_pct=initial_soc, initial_temp_c=initial_temp)

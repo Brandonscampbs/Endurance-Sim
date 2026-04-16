@@ -22,6 +22,8 @@ class BatteryConfig:
     soc_taper_threshold_pct: float
     soc_taper_rate_a_per_pct: float
     discharge_limits: tuple[DischargeLimitPoint, ...]
+    cell_capacity_ah: float = 4.5  # Molicel P45B default; P50B = 5.0
+    pack_structural_thermal_mass_kj_per_k: float = 7.5  # ≈25% of cell thermal mass (busbars, plates, enclosure)
 
     @property
     def pack_voltage_min_v(self) -> float:
@@ -31,10 +33,16 @@ class BatteryConfig:
     def pack_voltage_max_v(self) -> float:
         return self.cell_voltage_max_v * self.series
 
+    @property
+    def pack_capacity_ah(self) -> float:
+        return self.cell_capacity_ah * self.parallel
+
     @classmethod
     def from_dict(cls, data: dict) -> "BatteryConfig":
         """Build from parsed YAML dict."""
-        return cls(
+        # cell_capacity_ah is required for new configs but optional for
+        # backward compatibility (defaults to P45B 4.5 Ah).
+        kwargs = dict(
             cell_type=data["cell_type"],
             series=data["topology"]["series"],
             parallel=data["topology"]["parallel"],
@@ -47,3 +55,10 @@ class BatteryConfig:
                 DischargeLimitPoint(**dl) for dl in data["discharge_limits"]
             ),
         )
+        if "cell_capacity_ah" in data:
+            kwargs["cell_capacity_ah"] = float(data["cell_capacity_ah"])
+        if "pack_structural_thermal_mass_kj_per_k" in data:
+            kwargs["pack_structural_thermal_mass_kj_per_k"] = float(
+                data["pack_structural_thermal_mass_kj_per_k"]
+            )
+        return cls(**kwargs)
