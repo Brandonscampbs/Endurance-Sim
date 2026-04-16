@@ -164,3 +164,66 @@ class TestHelpers:
         # Other zones unchanged
         assert new_strategy.zones[1].action == ControlAction.COAST
         assert new_strategy.zones[2].action == ControlAction.BRAKE
+
+
+# ---------------------------------------------------------------------------
+# C13: Zone intensity is load-bearing for runtime decide()
+# ---------------------------------------------------------------------------
+
+class TestZoneIntensityIsAuthoritative:
+    """Zones are the unit of control. Per-segment intensities are calibration
+    artifacts; runtime decide() must read zone.intensity, not _segment_actions.
+    Otherwise to_driver_brief() and the simulated behavior diverge.
+    """
+
+    def test_decide_returns_zone_intensity_not_segment(self):
+        """Build zones with intensity=0.8, pass segment_intensities=[0.2]*10.
+        decide() must return 0.8 (zone-level), NOT 0.2 (per-segment).
+        """
+        import numpy as np
+        zones = [
+            DriverZone(
+                zone_id=0, segment_start=0, segment_end=9,
+                action=ControlAction.THROTTLE, intensity=0.8,
+                distance_start_m=0.0, distance_end_m=500.0,
+                label="Full Straight",
+            )
+        ]
+        per_segment = np.full(10, 0.2)
+        strategy = CalibratedStrategy(
+            zones, num_segments=10, segment_intensities=per_segment,
+        )
+
+        for seg_idx in range(10):
+            cmd = strategy.decide(make_state(segment_idx=seg_idx), [])
+            assert cmd.action == ControlAction.THROTTLE
+            assert cmd.throttle_pct == pytest.approx(0.8), (
+                f"segment {seg_idx} returned {cmd.throttle_pct}, expected 0.8"
+            )
+
+    def test_brief_matches_decide(self):
+        """to_driver_brief() and decide() must agree on intensity."""
+        import numpy as np
+        zones = [
+            DriverZone(
+                zone_id=0, segment_start=0, segment_end=4,
+                action=ControlAction.THROTTLE, intensity=0.75,
+                distance_start_m=0.0, distance_end_m=250.0, label="Straight",
+            ),
+            DriverZone(
+                zone_id=1, segment_start=5, segment_end=9,
+                action=ControlAction.BRAKE, intensity=0.40,
+                distance_start_m=250.0, distance_end_m=500.0, label="Turn 1",
+            ),
+        ]
+        per_segment = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
+        strategy = CalibratedStrategy(
+            zones, num_segments=10, segment_intensities=per_segment,
+        )
+
+        brief = strategy.to_driver_brief()
+        # Brief reports 75% throttle in zone 0
+        assert "75% throttle" in brief
+        # And decide() must also use 75% throttle
+        cmd = strategy.decide(make_state(segment_idx=2), [])
+        assert cmd.throttle_pct == pytest.approx(0.75)
