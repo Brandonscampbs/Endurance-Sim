@@ -108,6 +108,50 @@ class TestReplayStrategy:
         strategy = _make_replay_strategy()
         assert strategy.name == "replay"
 
+    def test_d06_preserves_negative_lvcu_torque(self):
+        """D-06: LVCU Torque Req < 0 (regen) must be preserved, not clipped to 0.
+
+        Prior to D-06, from_aim_data clipped LVCU Torque Req to [0, 85],
+        deleting every regen command. That broke replay energy accounting
+        and validation of regen events.
+        """
+        import pandas as pd
+        # Build synthetic AiM DataFrame with negative LVCU Torque Req values.
+        n = 50
+        dist = np.linspace(0, 100, n)
+        aim_df = pd.DataFrame({
+            "Distance on GPS Speed": dist,
+            "Throttle Pos": np.zeros(n),
+            "FBrakePressure": np.zeros(n),
+            "RBrakePressure": np.zeros(n),
+            # Mix of positive and negative torque commands (regen + drive).
+            "LVCU Torque Req": np.linspace(-40.0, 40.0, n),
+        })
+        strategy = ReplayStrategy.from_aim_data(aim_df, 0, n, lap_distance_m=200.0)
+        # Torque at start of window should be ~-40 Nm (regen).
+        assert strategy.target_torque(0.0) < -30.0
+        # Torque near end (before wrap) should be ~+40 Nm (drive).
+        assert strategy.target_torque(99.0) > 30.0
+
+    def test_d06_preserves_negative_lvcu_torque_full_endurance(self):
+        """D-06: from_full_endurance must also preserve negative torque."""
+        import pandas as pd
+        n = 100
+        dist = np.linspace(0, 1000, n)
+        # Keep GPS Speed > 5 km/h so moving filter keeps everything.
+        aim_df = pd.DataFrame({
+            "Distance on GPS Speed": dist,
+            "GPS Speed": np.full(n, 30.0),
+            "Throttle Pos": np.zeros(n),
+            "FBrakePressure": np.zeros(n),
+            "RBrakePressure": np.zeros(n),
+            "LVCU Torque Req": np.linspace(-50.0, 50.0, n),
+            "Pack Voltage": np.full(n, 400.0),
+            "Pack Current": np.zeros(n),
+        })
+        strategy = ReplayStrategy.from_full_endurance(aim_df, lap_distance_m=100.0)
+        assert strategy.target_torque(0.0) < -30.0
+
 
 # ---------------------------------------------------------------------------
 # CoastOnlyStrategy

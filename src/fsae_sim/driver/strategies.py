@@ -113,8 +113,14 @@ class ReplayStrategy(DriverStrategy):
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
 
+        # D-06: preserve sign so regen commands (negative LVCU Torque Req)
+        # are replayed faithfully. Clipping at 0 deleted all regen events.
         inverter_torque_limit = 85.0
-        torque = np.clip(lap["LVCU Torque Req"].values, 0.0, inverter_torque_limit)
+        torque = np.clip(
+            lap["LVCU Torque Req"].values,
+            -inverter_torque_limit,
+            inverter_torque_limit,
+        )
 
         return cls(dist, throttle, brake, torque, lap_distance_m, wrap=True)
 
@@ -144,8 +150,13 @@ class ReplayStrategy(DriverStrategy):
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
 
+        # D-06: preserve sign (see from_aim_data). Clipping at 0 deleted regen.
         inverter_torque_limit = 85.0
-        torque = np.clip(clean["LVCU Torque Req"].values, 0.0, inverter_torque_limit)
+        torque = np.clip(
+            clean["LVCU Torque Req"].values,
+            -inverter_torque_limit,
+            inverter_torque_limit,
+        )
 
         mean_torque = float(np.mean(torque))
 
