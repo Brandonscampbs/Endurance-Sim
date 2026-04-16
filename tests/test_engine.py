@@ -1,5 +1,7 @@
 """Tests for the quasi-static simulation engine."""
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -9,6 +11,7 @@ from fsae_sim.driver.strategy import ControlAction, ControlCommand, DriverStrate
 from fsae_sim.sim.engine import SimulationEngine, SimResult
 from fsae_sim.track.track import Segment, Track
 from fsae_sim.vehicle import VehicleConfig
+from fsae_sim.vehicle.battery import DischargeLimitPoint
 from fsae_sim.vehicle.battery_model import BatteryModel
 from fsae_sim.vehicle.dynamics import VehicleDynamics
 
@@ -181,6 +184,38 @@ class TestTermination:
         # Start at very low SOC
         result = engine.run(num_laps=1000, initial_soc_pct=3.0)
         assert result.final_soc <= vehicle_config.battery.discharged_soc_pct
+
+    def test_termination_temp_comes_from_config(
+        self, vehicle_config, battery_model, simple_track,
+    ):
+        """NF-42: hot-termination threshold must track config.battery.discharge_limits[-1].
+
+        The engine previously hardcoded 65 C; this test guards against that
+        regression by swapping in a battery config whose last discharge-limit
+        row is at 50 C.  Starting above 65 C but below 70 C would pass with
+        the old magic number; here we verify the engine terminates at the
+        configured 50 C instead of a code-embedded constant.
+        """
+        # Override the discharge-limit ceiling to 50 C instead of 65 C.
+        custom_battery = dataclasses.replace(
+            vehicle_config.battery,
+            discharge_limits=(
+                DischargeLimitPoint(temp_c=30.0, max_current_a=100.0),
+                DischargeLimitPoint(temp_c=50.0, max_current_a=0.0),
+            ),
+        )
+        custom_vehicle = dataclasses.replace(vehicle_config, battery=custom_battery)
+
+        strategy = FullThrottleStrategy()
+        engine = SimulationEngine(
+            custom_vehicle, simple_track, strategy, battery_model,
+        )
+        # Start above the new 50 C ceiling; the first segment's post-step
+        # temperature must already exceed termination_temp_c regardless of
+        # battery-model thermal response, so exactly one record should land.
+        result = engine.run(num_laps=5, initial_soc_pct=95.0, initial_temp_c=51.0)
+        assert len(result.states) == 1
+        assert result.laps_completed == 0
 
 
 # ---------------------------------------------------------------------------
