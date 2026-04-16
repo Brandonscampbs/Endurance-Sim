@@ -142,6 +142,12 @@ class SimulationEngine:
         temp = initial_temp_c
         pack_voltage = self.battery_model.pack_voltage(soc, 0.0)
 
+        # Termination temperature: top of the configured discharge-limit table
+        # (the last entry is the hottest, where max_current_a hits 0 and the
+        # pack is effectively disabled by the BMS).  Pulled from config to
+        # avoid the NF-42 magic-number duplication.
+        termination_temp_c = self.vehicle.battery.discharge_limits[-1].temp_c
+
         # Accumulator for energy
         total_energy_j = 0.0
 
@@ -338,7 +344,7 @@ class SimulationEngine:
                     return self._build_result(
                         records, time, total_energy_j, soc, laps_completed,
                     )
-                if temp >= 65.0:
+                if temp >= termination_temp_c:
                     return self._build_result(
                         records, time, total_energy_j, soc, laps_completed,
                     )
