@@ -1,3 +1,5 @@
+import { useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useVisualization } from '../../api/client'
 import { usePlaybackStore } from '../../stores/playbackStore'
 import LoadingSpinner from '../../components/LoadingSpinner'
@@ -6,10 +8,31 @@ import SidePanel from './SidePanel'
 import Timeline from './Timeline'
 import PlaybackControls from './PlaybackControls'
 
+export type DataSource = 'sim' | 'real'
+
+/**
+ * Defensively parse the ?source URL param. Unknown / missing values
+ * fall back to "sim".
+ */
+export function parseDataSource(raw: string | null): DataSource {
+  return raw === 'real' ? 'real' : 'sim'
+}
+
 export default function VisualizationPage() {
-  const dataSource = usePlaybackStore(s => s.dataSource)
+  const [searchParams] = useSearchParams()
+  const dataSource = parseDataSource(searchParams.get('source'))
   const currentFrame = usePlaybackStore(s => s.currentFrame)
+  const setFrame = usePlaybackStore(s => s.setFrame)
+  const pause = usePlaybackStore(s => s.pause)
   const { data, isLoading, error } = useVisualization(dataSource)
+
+  // When the user switches data source (via URL), reset playback state.
+  // Previously this was a side effect of setDataSource inside playbackStore;
+  // keeping it here makes the store pure (setters only set).
+  useEffect(() => {
+    pause()
+    setFrame(0)
+  }, [dataSource, pause, setFrame])
 
   if (isLoading) return <LoadingSpinner message="Computing visualization data..." />
   if (error || !data) return <p className="text-red-400">Failed to load visualization data.</p>

@@ -19,23 +19,41 @@ function BarGauge({ value, max, color }: { value: number; max: number; color: st
   )
 }
 
+// Spread-free min/max for large centerline arrays; spreading ~40k elements
+// into Math.min/max blows the JS argument-count limit.
+function reduceExtents(arr: number[]): [number, number] {
+  let lo = Infinity
+  let hi = -Infinity
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i]
+    if (!Number.isFinite(v)) continue
+    if (v < lo) lo = v
+    if (v > hi) hi = v
+  }
+  if (!Number.isFinite(lo)) lo = 0
+  if (!Number.isFinite(hi)) hi = 1
+  return [lo, hi]
+}
+
 function TrackMinimap({ frame, data }: { frame: VizFrame; data: VisualizationResponse }) {
-  const minX = Math.min(...data.track_centerline_x)
-  const maxX = Math.max(...data.track_centerline_x)
-  const minY = Math.min(...data.track_centerline_y)
-  const maxY = Math.max(...data.track_centerline_y)
+  const [minX, maxX] = reduceExtents(data.track_centerline_x)
+  const [minY, maxY] = reduceExtents(data.track_centerline_y)
   const range = Math.max(maxX - minX, maxY - minY) || 1
 
+  // Convention: world X -> minimap x, world Y -> minimap y (no flip).
+  // Matches the 3D TrackLine (which maps track Y -> world Z). SVG y grows
+  // downward by default but we're content with that — the minimap shows the
+  // same orientation as the 3D view with the camera looking toward +Y world-up.
   const points = data.track_centerline_x
     .map((x, i) => {
       const nx = ((x - minX) / range) * 100
-      const ny = 100 - ((data.track_centerline_y[i] - minY) / range) * 100
+      const ny = ((data.track_centerline_y[i] - minY) / range) * 100
       return `${nx},${ny}`
     })
     .join(' ')
 
   const cx = ((frame.x - minX) / range) * 100
-  const cy = 100 - ((frame.y - minY) / range) * 100
+  const cy = ((frame.y - minY) / range) * 100
 
   return (
     <svg viewBox="-10 -10 120 120" className="w-full bg-gray-800/50 rounded">

@@ -1,6 +1,8 @@
 import { useEffect, useCallback } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { usePlaybackStore } from '../../stores/playbackStore'
-import type { CameraMode } from '../../stores/playbackStore'
+import { parseCameraMode, type CameraMode } from './CameraController'
+import { parseDataSource, type DataSource } from './VisualizationPage'
 
 const speeds = [0.5, 1, 2, 5]
 const cameras: { mode: CameraMode; label: string }[] = [
@@ -11,6 +13,22 @@ const cameras: { mode: CameraMode; label: string }[] = [
 
 export default function PlaybackControls() {
   const store = usePlaybackStore()
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  const cameraMode = parseCameraMode(searchParams.get('camera'))
+  const dataSource = parseDataSource(searchParams.get('source'))
+
+  const setCameraMode = (m: CameraMode) => {
+    const next = new URLSearchParams(searchParams)
+    next.set('camera', m)
+    setSearchParams(next, { replace: true })
+  }
+
+  const setDataSource = (s: DataSource) => {
+    const next = new URLSearchParams(searchParams)
+    next.set('source', s)
+    setSearchParams(next, { replace: true })
+  }
 
   const handleKeydown = useCallback((e: KeyboardEvent) => {
     if (e.code === 'Space') { e.preventDefault(); usePlaybackStore.getState().togglePlay() }
@@ -57,9 +75,9 @@ export default function PlaybackControls() {
         {cameras.map(({ mode, label }) => (
           <button
             key={mode}
-            onClick={() => store.setCameraMode(mode)}
+            onClick={() => setCameraMode(mode)}
             className={`px-2 py-0.5 text-xs rounded ${
-              store.cameraMode === mode ? 'bg-blue-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+              cameraMode === mode ? 'bg-blue-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
             }`}
           >
             {label}
@@ -74,9 +92,9 @@ export default function PlaybackControls() {
         {(['sim', 'real'] as const).map((src) => (
           <button
             key={src}
-            onClick={() => store.setDataSource(src)}
+            onClick={() => setDataSource(src)}
             className={`px-2 py-0.5 text-xs rounded ${
-              store.dataSource === src ? 'bg-purple-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+              dataSource === src ? 'bg-purple-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
             }`}
           >
             {src === 'sim' ? 'Sim' : 'Real'}

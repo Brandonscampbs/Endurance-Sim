@@ -14,7 +14,7 @@ Endurance simulation and optimization for UConn Formula SAE Electric. Predicts l
 ## Architecture
 
 ```
-Vehicle Config (YAML)  →  Simulation Engine  →  Results  →  Dashboard
+Vehicle Config (YAML)  →  Simulation Engine  →  FastAPI backend  →  React webapp
                               ↑
                Track (from GPS telemetry)
                Driver Strategy (swappable)
@@ -34,24 +34,50 @@ Vehicle Config (YAML)  →  Simulation Engine  →  Results  →  Dashboard
 | `fsae_sim.optimization` | Parameter sweep runner |
 | `fsae_sim.analysis` | Post-processing metrics, Pareto computation |
 | `fsae_sim.data` | Telemetry and simulation data loaders |
-| `dashboard` | Dash web app for viewing results |
+| `backend` | FastAPI service exposing sim results to the webapp |
+| `webapp` | React + Vite SPA with Verification, Visualization, and Simulate pages |
+
+## Webapp
+
+The webapp has three pages, each tied to one question about the simulator:
+
+1. **Verification** — how close is the baseline sim to real Michigan 2025 telemetry?
+2. **Visualization** — 3D playback of the car driving the track (real or sim).
+3. **Simulate** — one-shot what-if: change max RPM, max torque, and the SOC discharge map; see how endurance time and energy change vs baseline.
+
+See `docs/WEBAPP_REFOCUS_PLAN_2026-04-16.md` for the full scope and fix list.
 
 ## Quick Start
 
-### With Docker
+### Local dev (recommended while iterating)
+
+In two terminals:
 
 ```bash
-docker compose -f docker/docker-compose.yaml up
-# Browser → http://localhost:3000
-```
-
-### Without Docker
-
-```bash
+# Terminal 1: backend (FastAPI on :8001)
 pip install -e ".[dev]"
-python -m dashboard
-# Browser → http://localhost:3000
+python -m uvicorn backend.main:app --reload --port 8001
 ```
+
+```bash
+# Terminal 2: webapp (Vite dev server on :5173, proxies /api to :8001)
+cd webapp
+npm install
+npm run dev
+```
+
+Open http://localhost:5173. Vite hot-reloads the UI; the backend hot-reloads on `.py` edits.
+
+### Docker (one command, full stack)
+
+```bash
+docker compose up --build
+```
+
+- Webapp → http://localhost:3000 (nginx serving the built React bundle, reverse-proxying `/api` to the backend)
+- Backend → http://localhost:8001 (uvicorn, directly reachable for debugging)
+
+The backend bind-mounts `src/`, `backend/`, `configs/`, and `Real-Car-Data-And-Stats/`, so backend Python edits pick up after restarting the container. Frontend edits require a rebuild (`docker compose up --build`) or — easier — use the local dev flow above.
 
 ### Run tests
 
@@ -62,22 +88,26 @@ pytest -v
 ## Project Structure
 
 ```
-├── src/fsae_sim/          # Simulation Python package
-│   ├── vehicle/           # Vehicle, powertrain, battery models
-│   ├── track/             # Track representation
-│   ├── driver/            # Driver strategy
-│   ├── sim/               # Simulation engine
-│   ├── scoring/           # FSAE scoring formulas
-│   ├── optimization/      # Parameter sweeps
-│   ├── analysis/          # Metrics and post-processing
-│   └── data/              # Data loaders
-├── dashboard/             # Dash web app (port 3000)
-│   └── pages/             # Dashboard pages
-├── configs/               # Vehicle config YAML files
-├── Real-Car-Data-And-Stats/  # Telemetry and battery data
-├── results/               # Simulation outputs (gitignored)
-├── tests/                 # pytest test suite
-└── docker/                # Dockerfile and compose
+├── src/fsae_sim/              # Simulation Python package
+│   ├── vehicle/               # Vehicle, powertrain, battery models
+│   ├── track/                 # Track representation
+│   ├── driver/                # Driver strategy
+│   ├── sim/                   # Simulation engine
+│   ├── scoring/               # FSAE scoring formulas
+│   ├── optimization/          # Parameter sweeps
+│   ├── analysis/              # Metrics and post-processing
+│   └── data/                  # Data loaders
+├── backend/                   # FastAPI app (port 8001)
+│   ├── routers/               # /api/* route handlers
+│   ├── services/              # sim runner, telemetry, export logic
+│   └── models/                # Pydantic response models
+├── webapp/                    # React + Vite SPA (port 5173 dev, 3000 docker)
+│   └── src/pages/             # verification, visualization, simulate
+├── configs/                   # Vehicle config YAML files
+├── Real-Car-Data-And-Stats/   # Telemetry and battery data
+├── results/                   # Simulation outputs (gitignored)
+├── tests/                     # pytest test suite
+└── docker/                    # Backend Dockerfile (webapp Dockerfile lives in webapp/)
 ```
 
 ## Data
@@ -89,13 +119,13 @@ pytest -v
 ## Roadmap
 
 ### Phase 1 — Foundation ✅ (Done)
-Repository scaffold, Docker, dashboard skeleton, vehicle configs, data loaders
+Repository scaffold, Docker, webapp skeleton, vehicle configs, data loaders
 
 ### Phase 2 — Core Simulation (In Progress)
-Battery model, powertrain model, vehicle dynamics with 4-wheel Pacejka tire model, driver model (CalibratedStrategy, zone-based), simulation engine validated against real telemetry (~2% energy error, 8/8 metrics pass). Remaining: physics model alignment and accuracy validation — see `docs/REMAINING_ISSUES.md` for 13 open issues.
+Battery model, powertrain model, vehicle dynamics with 4-wheel Pacejka tire model, driver model (CalibratedStrategy, zone-based), simulation engine validated against real telemetry (~2% energy error, 8/8 metrics pass). Remaining: physics model alignment and accuracy validation — see `docs/REMAINING_ISSUES.md` for open issues.
 
-### Phase 3 — Optimization & Comparison (Next)
-Swappable strategies, parameter sweeps, car comparison, Pareto frontier, dashboard buildout
+### Phase 3 — Verification polish + Simulate page (Next)
+Close the residual physics gaps visible on the Verification page; ship the Simulate page (max RPM, max torque, SOC discharge-map sliders); keep Visualization honest so it can be used to spot physics bugs.
 
 ### Phase 4 — Scoring & Decision Support (Future)
-FSAE scoring model, field estimation, points maximization, final decision dashboard
+FSAE scoring model, field estimation, points maximization, final decision output.

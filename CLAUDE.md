@@ -2,11 +2,15 @@
 
 ## What This Repo Is
 
-FSAE EV endurance simulation and optimization for UConn Formula SAE Electric (car CT-16EV).
+FSAE EV endurance simulation for UConn Formula SAE Electric (car CT-16EV).
 
-**Core mission: maximize competition points in Endurance + Efficiency by finding the optimal driver strategy and car tune through simulation.** FSAE endurance is an energy management game — the car has far more grip than the driver needs, so the winning variables are coasting behavior, acceleration profiles, power limits, RPM limits, and SOC management over 22 laps. The simulation exists to explore thousands of strategy/tune combinations, identify the best ones, and produce actionable coaching targets that real drivers can train to execute.
+**Core mission: build the most accurate FSAE EV endurance simulator possible, and expose it through a three-page webapp.** The three pages are:
 
-The workflow is: (1) build an accurate physics simulation validated against real telemetry, (2) create a parameterized driver model calibrated to real driver behavior, (3) sweep driver strategy and car tune parameters to find the scoring-optimal combination, (4) translate the optimal parameters into driver coaching and car configuration.
+1. **Verification** — how close is the baseline simulator to reality? (compare sim vs Michigan 2025 telemetry, per-channel residuals, energy budget reconciliation).
+2. **Visualization** — a 3D playback of the car so physics bugs become visible.
+3. **Simulate** — a what-if tool with three knobs only: **max motor RPM, max motor torque, SOC discharge map**. Run one sim with those overrides, see how endurance changes.
+
+**Out of scope for this repo.** Parameter sweeps, Pareto optimization, multi-run comparison, driver-strategy search, coaching output. Those will live in a separate repo that imports this one as a library. Do not add sweep runners, sweep-results pages, or sweep storage schemas here.
 
 The repo starts with real telemetry and battery simulation data from Michigan 2025.
 
@@ -51,17 +55,22 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 
 ## Project Roadmap
 
+See `docs/WEBAPP_REFOCUS_PLAN_2026-04-16.md` for the full plan.
+
 1. **Baseline simulation + validation** (DONE) -- quasi-static lap sim with 4-wheel Pacejka tire model, validated against Michigan 2025 telemetry (~2% energy error, 8/8 metrics pass).
-2. **Calibrated driver model + physics alignment** (IN PROGRESS) -- zone-based driver model (`CalibratedStrategy`) calibrated from AiM telemetry. Collapses ~200 segments into ~30-40 coachable zones (throttle/coast/brake with intensity). FSAE scoring function (`FSAEScoring`) implements full Endurance + Efficiency scoring per D.12.13 / D.13.4, pre-configured with Michigan 2025 field data. Telemetry extraction pipeline in `analysis/telemetry_analysis.py`. Validation target: 3-5% error on time and energy vs telemetry. **Blocking:** 13 open physics/code issues must be resolved before Phase 3 sweeps — see `docs/REMAINING_ISSUES.md`.
-3. **Strategy + tune sweeps** (NEXT) -- run thousands of sims varying driver parameters (zone overrides via `CalibratedStrategy.with_zone_override()`) and car tune (max RPM, torque limit, regen intensity). Optimize combined `FSAEScoring.combined_score` (Endurance + Efficiency, max 375 pts). Foundation: zone-based driver model + scoring function from Phase 2.
-4. **Driver coaching output** -- translate optimal parameters into actionable targets using `CalibratedStrategy.to_driver_brief()`: "coast X meters before corners," "use Y% throttle out of hairpins," "target Z kWh total energy." Drivers train to match these.
+2. **Verification page correctness + physics fixes** (IN PROGRESS) -- fix the per-lap metrics regression, swap GPS Speed → LFspeed, add per-channel residuals + RMS/R²/correlation, add energy budget reconciliation, expand channel coverage to RPM/torque/pack V&I/temp. Also close the 13 open physics/code issues in `docs/REMAINING_ISSUES.md`.
+3. **Visualization page physics + polish** (NEXT) -- fix force-arrow frame math (body vs world), Euler order for roll/pitch/yaw, orbit camera target binding, backend Fy sign-by-curvature. Add trajectory trail, scrubbable time-series strip, friction-circle per wheel, sector/lap markers on timeline.
+4. **Simulate page** (AFTER VISUALIZATION) -- backend endpoint accepting `{max_rpm, max_torque_nm, soc_discharge_map}`, runs one sim with those overrides against the baseline, returns summary + per-lap table + time series. Frontend: three-knob form, baseline-comparison delta cards, overlay chart.
+5. **Retire Dash dashboard + unify Docker** -- webapp/ + FastAPI as a single Docker image; delete `dashboard/`; update README.
+
+Deliberately **not** in this repo's roadmap: parameter sweeps, Pareto, multi-run comparison, coaching output. Those go to a separate repo.
 
 ## Architecture Guidance
 
 - **No bandaid fixes — root cause only**: Never apply superficial patches, fudge factors, or tuning hacks to make results match. Every fix must address the actual root cause. This is especially critical in simulation work: if the sim output is wrong, the physics model or inputs are wrong — find out why. Adding correction factors or clamping outputs to hide errors destroys the simulation's predictive value and makes every downstream result untrustworthy. A simulation that's honestly wrong is more useful than one that's been patched to look right.
 - **Modular by domain**: separate modules for battery model, drivetrain model, tire/vehicle dynamics, track representation, driver model, and lap simulation orchestration. Each module should be independently testable.
 - **Simulation correctness first**: validate every model against real data before adding complexity. Numerical accuracy matters more than abstraction elegance.
-- **Performance-aware from the start**: parameter sweeps and optimization will run thousands of simulations. Use NumPy/SciPy vectorized operations. Profile before optimizing, but don't create structures that prevent vectorization later.
+- **Performance-aware**: sims should complete in seconds, not minutes, so the Simulate page feels interactive. Use NumPy/SciPy vectorized operations. Profile before optimizing. Leave room for a future sweep repo to reuse this core, so don't build structures that prevent vectorization later.
 - **Data pipelines are first-class**: loading, cleaning, and transforming telemetry and simulation CSVs should be reliable and repeatable. Use pandas for tabular data.
 - **Docker for reproducibility**: local dev environment should be containerized. Pin Python version and all dependencies.
 - **Testing**: use pytest. Validate models against known analytical solutions and recorded data. Property-based tests (hypothesis) for numerical edge cases.

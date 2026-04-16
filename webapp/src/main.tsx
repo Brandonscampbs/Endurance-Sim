@@ -1,6 +1,7 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { SWRConfig } from 'swr'
+import { Toaster } from 'sonner'
 import App from './App.tsx'
 import './index.css'
 
@@ -14,5 +15,11 @@ createRoot(document.getElementById('root')!).render(
     >
       <App />
     </SWRConfig>
+    <Toaster
+      position="bottom-right"
+      theme="dark"
+      richColors
+      closeButton
+    />
   </StrictMode>,
 )

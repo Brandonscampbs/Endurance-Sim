@@ -14,18 +14,45 @@ const COLOR_SCALE: [number, string][] = [
   [1, '#ef4444'],    // red - fast
 ]
 
+// Spread-free min/max: large speed arrays (~40k points) blow the JS engine's
+// argument-count limit when passed via Math.min(...arr) / Math.max(...arr).
+// Also skips non-finite values.
+function reduceMin(arrs: number[][], predicate?: (v: number) => boolean): number {
+  let m = Infinity
+  for (const arr of arrs) {
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i]
+      if (!Number.isFinite(v)) continue
+      if (predicate && !predicate(v)) continue
+      if (v < m) m = v
+    }
+  }
+  return m
+}
+function reduceMax(arrs: number[][], predicate?: (v: number) => boolean): number {
+  let m = -Infinity
+  for (const arr of arrs) {
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i]
+      if (!Number.isFinite(v)) continue
+      if (predicate && !predicate(v)) continue
+      if (v > m) m = v
+    }
+  }
+  return m
+}
+
 export default function TrackMaps({ track, validation }: Props) {
   const xs = track.centerline.map(p => p.x)
   const ys = track.centerline.map(p => p.y)
 
-  const maxSpeed = Math.max(
-    ...validation.track_sim_speed,
-    ...validation.track_real_speed,
+  const rawMax = reduceMax([validation.track_sim_speed, validation.track_real_speed])
+  const rawMin = reduceMin(
+    [validation.track_sim_speed, validation.track_real_speed],
+    v => v > 0,
   )
-  const minSpeed = Math.min(
-    ...validation.track_sim_speed.filter(v => v > 0),
-    ...validation.track_real_speed.filter(v => v > 0),
-  )
+  const maxSpeed = Number.isFinite(rawMax) ? rawMax : 1
+  const minSpeed = Number.isFinite(rawMin) ? rawMin : 0
 
   const layout = (title: string) => ({
     title: { text: title, font: { color: '#9ca3af', size: 14 } },

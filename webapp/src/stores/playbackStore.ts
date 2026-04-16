@@ -1,17 +1,13 @@
 import { create } from 'zustand'
 import { syncAnimIndex } from '../pages/visualization/animationState'
 
-export type CameraMode = 'chase' | 'birdseye' | 'orbit'
-
 interface PlaybackState {
   isPlaying: boolean
   speed: number  // 0.5, 1, 2, 5
   currentFrame: number
   totalFrames: number
-  cameraMode: CameraMode
   showForces: boolean
   showTrackColor: boolean
-  dataSource: 'sim' | 'real'
 
   play: () => void
   pause: () => void
@@ -21,10 +17,9 @@ interface PlaybackState {
   nextFrame: () => void
   prevFrame: () => void
   setTotalFrames: (n: number) => void
-  setCameraMode: (m: CameraMode) => void
   toggleForces: () => void
   toggleTrackColor: () => void
-  setDataSource: (s: 'sim' | 'real') => void
+  setIsPlaying: (p: boolean) => void
 }
 
 export const usePlaybackStore = create<PlaybackState>((set, get) => ({
@@ -32,10 +27,8 @@ export const usePlaybackStore = create<PlaybackState>((set, get) => ({
   speed: 1,
   currentFrame: 0,
   totalFrames: 0,
-  cameraMode: 'chase',
   showForces: true,
   showTrackColor: true,
-  dataSource: 'sim',
 
   play: () => set({ isPlaying: true }),
   pause: () => set({ isPlaying: false }),
@@ -63,8 +56,7 @@ export const usePlaybackStore = create<PlaybackState>((set, get) => ({
     }
   },
   setTotalFrames: (n) => set({ totalFrames: n }),
-  setCameraMode: (cameraMode) => set({ cameraMode }),
   toggleForces: () => set(s => ({ showForces: !s.showForces })),
   toggleTrackColor: () => set(s => ({ showTrackColor: !s.showTrackColor })),
-  setDataSource: (dataSource) => set({ dataSource, currentFrame: 0, isPlaying: false }),
+  setIsPlaying: (isPlaying) => set({ isPlaying }),
 }))

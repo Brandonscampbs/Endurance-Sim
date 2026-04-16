@@ -40,9 +40,24 @@ def _compute_lateral_forces(
     curvature: float,
     mass_kg: float,
 ) -> tuple[float, float, float, float]:
-    """Estimate per-wheel lateral force from cornering."""
-    lat_accel = speed_ms ** 2 * curvature
-    total_lat_force = mass_kg * lat_accel
+    """Estimate per-wheel lateral force from cornering.
+
+    Sign convention (C8): Fy is signed by ``sign(curvature)`` so arrows in a
+    left turn point opposite to a right turn. The magnitude uses
+    ``|curvature|`` (matching the pattern in ``_compute_tire_loads``) and the
+    sign is applied once via ``np.sign(curvature)``. Convention matches the
+    frontend 3D renderer: positive Y = left of the car, so a left turn
+    (positive curvature) produces positive Fy (centripetal force on the car
+    points toward the turn center, i.e. to the left).
+
+    Straight line (curvature == 0) cleanly yields zero lateral force because
+    ``np.sign(0) == 0``.
+    """
+    # Magnitude first, then apply the curvature sign (mirrors
+    # _compute_tire_loads which also takes abs(curvature) then multiplies by
+    # a sign factor).
+    lat_accel_mag = speed_ms ** 2 * abs(curvature)
+    total_lat_force = mass_kg * lat_accel_mag * float(np.sign(curvature))
     front_share = 0.53
     front_total = total_lat_force * front_share
     rear_total = total_lat_force * (1 - front_share)

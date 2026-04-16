@@ -1,15 +1,34 @@
 import { useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
+import { useSearchParams } from 'react-router-dom'
 import * as THREE from 'three'
-import { usePlaybackStore } from '../../stores/playbackStore'
 import { animState, lerpAngle } from './animationState'
 
+export type CameraMode = 'chase' | 'birdseye' | 'orbit'
+
+const VALID_CAMERAS: readonly CameraMode[] = ['chase', 'birdseye', 'orbit'] as const
+
+/**
+ * Defensively parse the ?camera URL param. Unknown / missing values
+ * fall back to "chase".
+ */
+export function parseCameraMode(raw: string | null): CameraMode {
+  return VALID_CAMERAS.includes(raw as CameraMode) ? (raw as CameraMode) : 'chase'
+}
+
 export default function CameraController() {
-  const cameraMode = usePlaybackStore(s => s.cameraMode)
+  const [searchParams] = useSearchParams()
+  const cameraMode = parseCameraMode(searchParams.get('camera'))
   const { camera } = useThree()
+  // Shared smoothed target (world-space car position) used by all camera modes.
   const target = useRef(new THREE.Vector3())
   const smoothPos = useRef(new THREE.Vector3())
+  // drei's <OrbitControls> copies the `target` prop into its own Vector3 at
+  // mount and never re-reads it. To keep the orbit center following the car
+  // we grab the controls imperatively and mutate controls.target each frame.
+  const controlsRef = useRef<OrbitControlsImpl | null>(null)
 
   useFrame((_, delta) => {
     const curr = animState.current
@@ -28,8 +47,7 @@ export default function CameraController() {
     const camSmooth = 1 - Math.pow(1 - 0.05, delta * 60)
     target.current.lerp(carPos, targetSmooth)
 
-    const mode = usePlaybackStore.getState().cameraMode
-    if (mode === 'chase') {
+    if (cameraMode === 'chase') {
       const behind = new THREE.Vector3(
         ix - Math.cos(ih) * 4,
         2.5,
@@ -38,16 +56,22 @@ export default function CameraController() {
       smoothPos.current.lerp(behind, camSmooth)
       camera.position.copy(smoothPos.current)
       camera.lookAt(target.current)
-    } else if (mode === 'birdseye') {
+    } else if (cameraMode === 'birdseye') {
       const above = new THREE.Vector3(ix, 15, iy)
       smoothPos.current.lerp(above, targetSmooth)
       camera.position.copy(smoothPos.current)
       camera.lookAt(target.current)
+    } else if (cameraMode === 'orbit' && controlsRef.current) {
+      // Update OrbitControls' internal target (not the prop) so the orbit
+      // center tracks the car. update() applies damping + recomputes the
+      // camera transform.
+      controlsRef.current.target.copy(target.current)
+      controlsRef.current.update()
     }
   })
 
   if (cameraMode === 'orbit') {
-    return <OrbitControls target={target.current} enableDamping dampingFactor={0.1} />
+    return <OrbitControls ref={controlsRef} enableDamping dampingFactor={0.1} />
   }
 
   return null

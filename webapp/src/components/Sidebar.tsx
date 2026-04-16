@@ -3,17 +3,23 @@ import { NavLink } from 'react-router-dom'
 import { rerunSimulation } from '../api/client'
 
 const links = [
-  { to: '/', label: 'Validation' },
+  { to: '/', label: 'Verification' },
   { to: '/visualization', label: 'Visualization' },
+  { to: '/simulate', label: 'Simulate' },
 ]
 
 export default function Sidebar() {
   const [rerunning, setRerunning] = useState(false)
 
   async function handleRerun() {
+    if (rerunning) return
     setRerunning(true)
     try {
       await rerunSimulation()
+    } catch {
+      // `rerunSimulation` already surfaces a toast; swallow here so the
+      // unhandled rejection doesn't bubble while still re-enabling the
+      // button in `finally`.
     } finally {
       setRerunning(false)
     }
@@ -25,7 +31,7 @@ export default function Sidebar() {
         <h1 className="text-lg font-bold tracking-tight">FSAE Sim</h1>
         <p className="text-xs text-gray-500 mt-1">CT-16EV · Michigan 2025</p>
       </div>
-      <nav className="p-3 space-y-1">
+      <nav aria-label="Main navigation" className="p-3 space-y-1">
         {links.map(({ to, label }) => (
           <NavLink
             key={to}
@@ -46,6 +52,7 @@ export default function Sidebar() {
         <button
           onClick={handleRerun}
           disabled={rerunning}
+          aria-busy={rerunning}
           className="w-full px-3 py-2 rounded text-sm font-medium transition-colors bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-wait text-white"
         >
           {rerunning ? 'Rerunning...' : 'Rerun Simulation'}

@@ -1,6 +1,15 @@
 import Plot from '../../components/Plot'
 import type { TraceData, ValidationResponse } from '../../api/client'
 
+type ChannelKey = 'speed' | 'throttle' | 'brake' | 'power' | 'soc' | 'lat_accel'
+
+interface ChartSpec {
+  key: ChannelKey
+  trace: TraceData
+  title: string
+  yLabel: string
+}
+
 interface Props {
   validation: ValidationResponse
 }
@@ -60,19 +69,19 @@ function OverlayChart({ trace, title, yLabel }: { trace: TraceData; title: strin
 }
 
 export default function OverlayCharts({ validation }: Props) {
-  const charts: { trace: TraceData; title: string; yLabel: string }[] = [
-    { trace: validation.speed, title: 'Speed vs Distance', yLabel: 'Speed (km/h)' },
-    { trace: validation.throttle, title: 'Throttle vs Distance', yLabel: 'Throttle (%)' },
-    { trace: validation.brake, title: 'Brake vs Distance', yLabel: 'Brake (%)' },
-    { trace: validation.power, title: 'Electrical Power vs Distance', yLabel: 'Power (W)' },
-    { trace: validation.soc, title: 'SOC vs Distance', yLabel: 'SOC (%)' },
-    { trace: validation.lat_accel, title: 'Lateral Acceleration vs Distance', yLabel: 'Lat Accel (g)' },
+  const charts: ChartSpec[] = [
+    { key: 'speed', trace: validation.speed, title: 'Speed vs Distance', yLabel: 'Speed (km/h)' },
+    { key: 'throttle', trace: validation.throttle, title: 'Throttle vs Distance', yLabel: 'Throttle (%)' },
+    { key: 'brake', trace: validation.brake, title: 'Brake vs Distance', yLabel: 'Brake (%)' },
+    { key: 'power', trace: validation.power, title: 'Electrical Power vs Distance', yLabel: 'Power (W)' },
+    { key: 'soc', trace: validation.soc, title: 'SOC vs Distance', yLabel: 'SOC (%)' },
+    { key: 'lat_accel', trace: validation.lat_accel, title: 'Lateral Acceleration vs Distance', yLabel: 'Lat Accel (g)' },
   ]
 
   return (
     <div className="space-y-4">
-      {charts.map(({ trace, title, yLabel }) => (
-        <OverlayChart key={title} trace={trace} title={title} yLabel={yLabel} />
+      {charts.map(({ key, trace, title, yLabel }) => (
+        <OverlayChart key={key} trace={trace} title={title} yLabel={yLabel} />
       ))}
     </div>
   )

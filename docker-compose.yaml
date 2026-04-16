@@ -1,0 +1,43 @@
+# -----------------------------------------------------------------------------
+# Two-service deployment for the FSAE EV simulation webapp.
+#
+#   webapp   - nginx serving the Vite/React bundle, reverse-proxying /api to backend.
+#   backend  - FastAPI + uvicorn exposing the simulation API on :8001.
+#
+# Browser opens http://localhost:3000 and sees the UI; XHR requests to /api
+# are proxied through nginx to the backend service over the compose network.
+#
+# Dev hot-reload:
+#   - The backend bind-mounts src/, backend/, configs/ so edits are picked up
+#     after a container restart (uvicorn --reload is enabled via env).
+#   - The webapp image is a static build; for frontend dev use `npm run dev`
+#     locally on port 5173 (Vite dev server proxies /api to localhost:8001).
+# -----------------------------------------------------------------------------
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./src:/app/src
+      - ./backend:/app/backend
+      - ./configs:/app/configs
+      - ./Real-Car-Data-And-Stats:/app/Real-Car-Data-And-Stats:ro
+      - ./tests:/app/tests
+      - ./results:/app/results
+    environment:
+      - PYTHONUNBUFFERED=1
+      - FSAE_LOG_LEVEL=INFO
+
+  webapp:
+    build:
+      context: ./webapp
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
