@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from scipy.optimize import brentq, minimize_scalar
 
+from fsae_sim.physics_constants import AIR_DENSITY_KG_M3, GRAVITY_M_S2
 from fsae_sim.vehicle.vehicle import VehicleParams
 
 if TYPE_CHECKING:
@@ -33,8 +34,6 @@ class VehicleDynamics:
     used, preserving backward compatibility.
     """
 
-    AIR_DENSITY_KG_M3: float = 1.225  # ISA sea level, 15 C
-    GRAVITY_M_S2: float = 9.81
     # Lateral grip limit for FSAE on dry asphalt (Hoosier R25B / LC0)
     _LEGACY_MAX_LATERAL_G: float = 1.3
 
@@ -73,7 +72,7 @@ class VehicleDynamics:
         v = abs(speed_ms)
         return (
             0.5
-            * self.AIR_DENSITY_KG_M3
+            * AIR_DENSITY_KG_M3
             * self.vehicle.drag_coefficient
             * self.vehicle.frontal_area_m2
             * v * v
@@ -84,7 +83,7 @@ class VehicleDynamics:
         v = abs(speed_ms)
         return (
             0.5
-            * self.AIR_DENSITY_KG_M3
+            * AIR_DENSITY_KG_M3
             * self.vehicle.downforce_coefficient
             * v * v
         )
@@ -92,7 +91,7 @@ class VehicleDynamics:
     def rolling_resistance_force(self, speed_ms: float = 0.0) -> float:
         """Rolling resistance (N).  Increases with downforce."""
         normal_force = (
-            self.vehicle.mass_kg * self.GRAVITY_M_S2
+            self.vehicle.mass_kg * GRAVITY_M_S2
             + self.downforce(speed_ms)
         )
         return normal_force * self.vehicle.rolling_resistance
@@ -104,7 +103,7 @@ class VehicleDynamics:
         """
         # sin(atan(grade)) for small grades ≈ grade, but exact is better
         angle = math.atan(grade)
-        return self.vehicle.mass_kg * self.GRAVITY_M_S2 * math.sin(angle)
+        return self.vehicle.mass_kg * GRAVITY_M_S2 * math.sin(angle)
 
     def cornering_drag(self, speed_ms: float, curvature: float) -> float:
         """Drag force (N) from tire slip angles during cornering.
@@ -147,7 +146,7 @@ class VehicleDynamics:
         mu_peak = 1.5
         alpha_peak = 0.15  # rad, typical FSAE tire
         c_alpha_total = (
-            self.vehicle.mass_kg * self.GRAVITY_M_S2 * mu_peak / alpha_peak
+            self.vehicle.mass_kg * GRAVITY_M_S2 * mu_peak / alpha_peak
         )
         return f_lat_total ** 2 / c_alpha_total
 
@@ -215,7 +214,7 @@ class VehicleDynamics:
         across all four tires.
         """
         # Lateral acceleration for load transfer
-        a_lat_g = speed_ms ** 2 * abs(curvature) / self.GRAVITY_M_S2
+        a_lat_g = speed_ms ** 2 * abs(curvature) / GRAVITY_M_S2
 
         # Per-tire normal loads under cornering
         fl, fr, rl, rr = self.load_transfer.tire_loads(
@@ -294,7 +293,7 @@ class VehicleDynamics:
         # Legacy analytical formula
         mu = self._LEGACY_MAX_LATERAL_G * grip_factor
         m = self.vehicle.mass_kg
-        g = self.GRAVITY_M_S2
+        g = GRAVITY_M_S2
         cl_a = self.vehicle.downforce_coefficient
 
         if cl_a < 1e-6:
@@ -303,7 +302,7 @@ class VehicleDynamics:
 
         # With downforce: (m*g + 0.5*rho*ClA*v^2)*mu = m*v^2*kappa
         # v^2 * (m*kappa - 0.5*rho*ClA*mu) = m*g*mu
-        rho = self.AIR_DENSITY_KG_M3
+        rho = AIR_DENSITY_KG_M3
         denom = m * kappa - 0.5 * rho * cl_a * mu
         if denom <= 0:
             # Downforce dominates: effectively unlimited speed for this curvature

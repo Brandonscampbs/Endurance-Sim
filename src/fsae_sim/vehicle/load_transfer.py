@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import math
 
+from fsae_sim.physics_constants import AIR_DENSITY_KG_M3 as AIR_DENSITY
+from fsae_sim.physics_constants import GRAVITY_M_S2 as GRAVITY
 from fsae_sim.vehicle.vehicle import SuspensionConfig, VehicleParams
-
-GRAVITY: float = 9.81
-AIR_DENSITY: float = 1.225
 
 
 class LoadTransferModel:
