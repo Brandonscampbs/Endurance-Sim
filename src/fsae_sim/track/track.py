@@ -20,10 +20,11 @@ _GPS_POS_ACC_BAD: float = 200.0
 _GPS_RADIUS_STRAIGHT: float = 10_000.0
 
 # Bin size for segmenting the lap.
-_SEGMENT_BIN_M: float = 5.0
+_SEGMENT_BIN_M: float = 0.5
 
-# Rolling-median window for curvature smoothing.
-_CURVATURE_SMOOTH_WINDOW: int = 5
+# Physical distance (m) covered by the rolling-median curvature smoother.
+# Independent of bin size, so finer segmentation does not amplify GPS noise.
+_CURVATURE_SMOOTH_DISTANCE_M: float = 25.0
 
 # Minimum speed (m/s) for curvature computation to be valid.
 _V_MIN_FOR_CURVATURE_MS: float = 2.0
@@ -112,7 +113,8 @@ class Track:
              right-hand turn, negative = left-hand turn.
            - **grade** = mean(tan(``GPS Slope`` × π/180)).
 
-        7. Apply a rolling-median smoother (window = 5) to curvature.
+        7. Apply a rolling-median smoother (window covers fixed ~25 m
+           physical distance) to curvature.
 
         Args:
             aim_csv_path: Path to the AiM Race Studio CSV export.
@@ -121,7 +123,7 @@ class Track:
                 Must contain GPS Speed, Distance on GPS Speed, GPS Latitude,
                 GPS Longitude, GPS LatAcc columns.
             bin_size_m: Length of each output segment in metres.
-                Defaults to 5 m.
+                Defaults to 0.5 m.
             name: Name stored on the returned :class:`Track` object.
 
         Returns:
@@ -253,10 +255,17 @@ class Track:
                 raw_grades.append(prev_g)
 
         # ---- 7. Smooth curvature with rolling median -----------------------
+        # Window covers a fixed physical distance (~25 m) regardless of
+        # bin size, so finer segmentation doesn't amplify GPS noise.
+        smooth_window = max(3, int(round(_CURVATURE_SMOOTH_DISTANCE_M / bin_size_m)))
+        # Ensure odd window for centered median.
+        if smooth_window % 2 == 0:
+            smooth_window += 1
+
         smoothed_k: np.ndarray = (
             pd.Series(raw_curvatures)
             .rolling(
-                window=_CURVATURE_SMOOTH_WINDOW,
+                window=smooth_window,
                 center=True,
                 min_periods=1,
             )
