@@ -14,6 +14,31 @@ from fsae_sim.physics_constants import GRAVITY_M_S2 as GRAVITY
 from fsae_sim.vehicle.vehicle import SuspensionConfig, VehicleParams
 
 
+def _redistribute_same_axle(
+    left_load: float, right_load: float
+) -> tuple[float, float]:
+    """Clamp per-tire loads to >= 0 and push any negative share to the
+    opposite tire on the same axle.
+
+    The sum ``left_load + right_load`` is preserved (up to the case where
+    both tires would go negative — physically unreachable under any
+    finite lateral / longitudinal acceleration that can actually happen
+    on a real car, but handled gracefully by clamping both to zero).
+
+    Returns:
+        A ``(left, right)`` pair where both values are >= 0 and
+        ``left + right == max(0, left_load + right_load)``.
+    """
+    axle_total = left_load + right_load
+    if axle_total <= 0.0:
+        return (0.0, 0.0)
+    if left_load < 0.0:
+        return (0.0, axle_total)
+    if right_load < 0.0:
+        return (axle_total, 0.0)
+    return (left_load, right_load)
+
+
 class LoadTransferModel:
     """Calculates per-tire normal loads under combined loading.
 
@@ -52,6 +77,13 @@ class LoadTransferModel:
         # Convert track widths from mm to m
         self.front_track: float = suspension.front_track_mm / 1000.0
         self.rear_track: float = suspension.rear_track_mm / 1000.0
+        # NF-40: validate track widths before first division
+        if self.front_track <= 0.001 or self.rear_track <= 0.001:
+            raise ValueError(
+                f"SuspensionConfig track widths must be > 0.001 m "
+                f"(got front_track={self.front_track:.4f} m, "
+                f"rear_track={self.rear_track:.4f} m)."
+            )
 
         # Convert roll centre heights from mm to m
         self.rc_front: float = suspension.roll_center_height_front_mm / 1000.0
@@ -226,10 +258,19 @@ class LoadTransferModel:
             rl -= delta_lat_r
             rr += delta_lat_r
 
-        # Clamp to non-negative (tire cannot pull the ground)
-        fl = max(fl, 0.0)
-        fr = max(fr, 0.0)
-        rl = max(rl, 0.0)
-        rr = max(rr, 0.0)
+        # Clamp to non-negative (tire cannot pull the ground) while
+        # preserving vertical equilibrium: any negative portion is
+        # redistributed to the same-axle opposite tire.  When an inside
+        # wheel lifts, its share of vertical load has to go somewhere
+        # and the only place it *can* go is the outside wheel on the
+        # same axle.  Clamping without redistribution would under-predict
+        # outside-tire grip and bias cornering capacity downward.
+        #
+        # Conservation target (up to floating-point noise):
+        #     fl + fr + rl + rr == m*g + downforce
+        # which must hold for any input of lateral_g / longitudinal_g,
+        # even when one or more wheels would otherwise go negative.
+        fl, fr = _redistribute_same_axle(fl, fr)
+        rl, rr = _redistribute_same_axle(rl, rr)
 
         return (fl, fr, rl, rr)

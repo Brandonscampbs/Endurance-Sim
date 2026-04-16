@@ -44,11 +44,40 @@ class VehicleDynamics:
         load_transfer: "LoadTransferModel | None" = None,
         cornering_solver: "CorneringSolver | None" = None,
         powertrain_config: "PowertrainConfig | None" = None,
+        cornering_stiffness_scale: float = 1.0,
     ) -> None:
+        """Construct a VehicleDynamics model.
+
+        Args:
+            vehicle: Vehicle parameter bundle.
+            tire_model: Optional Pacejka tire model.  Required for the
+                physics-based cornering-drag path; falls back to the
+                small-angle analytical model when None.
+            load_transfer: Optional LoadTransferModel; paired with
+                ``tire_model`` for per-tire cornering drag and
+                traction/braking limits.
+            cornering_solver: Optional solver used for
+                ``max_cornering_speed``.
+            powertrain_config: Optional powertrain config used to compute
+                ``m_effective`` (bare mass + rotational inertia of motor,
+                gears and wheels).
+            cornering_stiffness_scale: Multiplicative factor applied to
+                the Pacejka cornering stiffness when computing cornering
+                drag.  Captures the gap between TTC lab cornering
+                stiffness and real-world on-car stiffness (surface
+                texture, temperature, combined loading, compliance
+                steer).  ``1.0`` is TTC nominal; values < 1 mean the
+                on-car tire takes more slip angle for a given lateral
+                force, producing more cornering drag.  This is the
+                correct home for the TTC-vs-track calibration: applied
+                at the slip-angle level, not downstream on the drag
+                force.
+        """
         self.vehicle = vehicle
         self.tire_model = tire_model
         self.load_transfer = load_transfer
         self.cornering_solver = cornering_solver
+        self.cornering_stiffness_scale = float(cornering_stiffness_scale)
 
         # Effective mass: bare mass + rotational inertia of spinning components
         if powertrain_config is not None:
@@ -207,12 +236,33 @@ class VehicleDynamics:
     def _cornering_drag_pacejka(
         self, speed_ms: float, curvature: float, f_lat_total: float,
     ) -> float:
-        """Cornering drag using Pacejka tire model with load transfer.
+        """Cornering drag from per-tire Pacejka slip angles.
 
-        Computes per-tire slip angles from lateral force demand distributed
-        by normal load, then sums the drag component (Fy * sin(alpha))
-        across all four tires.
+        For each wheel:
+            1. Query the load-transfer model for the tire normal load at
+               the current lateral demand ``a_lat_g`` and zero
+               longitudinal demand.
+            2. Distribute the required lateral force across the four
+               tires proportional to normal load (simple steady-state
+               share; combined-slip is handled separately).
+            3. Solve for the slip angle that produces the per-tire
+               lateral-force share.
+            4. Project the resulting lateral force onto the velocity
+               direction:  drag = |Fy| * sin(alpha).
+
+        The per-tire slip angle is scaled by
+        ``1.0 / cornering_stiffness_scale`` to model the gap between
+        TTC lab stiffness and real-world on-car stiffness.  When
+        ``cornering_stiffness_scale == 1.0`` the stock Pacejka result is
+        returned unchanged.  This is the physics-faithful location for
+        that calibration: it changes the operating point of every tire,
+        every corner, rather than multiplying the final drag by a
+        constant.  No power-law or scalar fudge factor exists anywhere
+        in the path.
         """
+        if f_lat_total < 1.0:
+            return 0.0
+
         # Lateral acceleration for load transfer
         a_lat_g = speed_ms ** 2 * abs(curvature) / GRAVITY_M_S2
 
@@ -225,19 +275,28 @@ class VehicleDynamics:
         if total_load < 1.0:
             return 0.0
 
+        # Stiffness-scale factor (<= 1 means tire needs more slip than TTC)
+        scale = self.cornering_stiffness_scale
+        if scale <= 0.0:
+            scale = 1.0
+        alpha_scale = 1.0 / scale
+
         total_drag = 0.0
         for fz in loads:
             if fz < 1.0:
                 continue
             # This tire's share of lateral force, proportional to load
             f_lat_tire = f_lat_total * (fz / total_load)
-            # Find slip angle that produces this lateral force
-            alpha = self._find_slip_angle(f_lat_tire, fz)
-            # Drag component: lateral force projected onto velocity direction
-            fy_actual = abs(
-                self.tire_model.lateral_force(alpha, fz)
-            )
-            total_drag += fy_actual * math.sin(alpha)
+            # Find the slip angle that produces this lateral force in
+            # the TTC-calibrated Pacejka model.
+            alpha_ttc = self._find_slip_angle(f_lat_tire, fz)
+            # Real-world effective slip angle: lower stiffness => more
+            # slip to produce the same lateral force.
+            alpha_eff = min(alpha_ttc * alpha_scale, math.pi / 2.0)
+            # Drag component: lateral force projected onto velocity direction.
+            # Fy magnitude is preserved — only the operating slip angle
+            # grows — so the extra cornering drag comes from sin(alpha).
+            total_drag += f_lat_tire * math.sin(alpha_eff)
 
         return total_drag
 

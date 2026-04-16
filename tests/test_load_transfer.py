@@ -348,3 +348,132 @@ class TestAttributes:
     def test_rc_rear_in_metres(self, model: LoadTransferModel) -> None:
         """rc_rear is in metres."""
         assert model.rc_rear == pytest.approx(0.0635, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Property: vertical equilibrium under clamping (C5)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadConservationProperty:
+    """C5: sum of tire loads must remain equal to m*g + downforce across
+    the full (lateral_g, longitudinal_g) operating envelope, even when
+    the zero-clamp fires for inside tires.
+    """
+
+    @pytest.mark.parametrize(
+        "lat_g,long_g,speed_ms",
+        [
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 20.0),
+            (1.5, 0.0, 10.0),
+            (-1.5, 0.0, 10.0),
+            (2.0, 0.5, 15.0),
+            (-2.0, -1.0, 15.0),
+            (2.0, -1.5, 25.0),   # typical corner entry
+            (1.2, 0.8, 12.0),    # corner exit
+            (0.0, -1.5, 20.0),   # threshold braking
+            (0.0, 0.3, 5.0),     # launch
+            # Extreme cases that force clamping:
+            (2.0, 0.0, 0.0),     # pure lateral, no downforce
+            (-2.0, 0.0, 0.0),
+            (1.8, -1.8, 30.0),
+        ],
+    )
+    def test_load_sum_conserved_with_clamping(
+        self,
+        model: LoadTransferModel,
+        lat_g: float,
+        long_g: float,
+        speed_ms: float,
+    ) -> None:
+        """fl+fr+rl+rr == m*g + downforce within 0.1 N."""
+        loads = model.tire_loads(
+            speed_ms=speed_ms, lateral_g=lat_g, longitudinal_g=long_g,
+        )
+        total = sum(loads)
+        weight = 278.0 * GRAVITY
+        aero_f, aero_r = model.aero_loads(speed_ms)
+        expected = weight + aero_f + aero_r
+        assert total == pytest.approx(expected, abs=0.1), (
+            f"lat={lat_g} long={long_g} speed={speed_ms}: "
+            f"got {total:.3f}, expected {expected:.3f}"
+        )
+
+    def test_all_loads_nonnegative_everywhere(
+        self, model: LoadTransferModel,
+    ) -> None:
+        """No tire load may be negative after redistribution."""
+        for lat_g in [-2.0, -1.0, 0.0, 1.0, 2.0]:
+            for long_g in [-1.5, 0.0, 0.5]:
+                for speed in [0.0, 15.0, 30.0]:
+                    loads = model.tire_loads(
+                        speed_ms=speed, lateral_g=lat_g, longitudinal_g=long_g,
+                    )
+                    for load in loads:
+                        assert load >= 0.0
+
+    def test_inside_lift_transfers_to_outside_same_axle(
+        self, model: LoadTransferModel,
+    ) -> None:
+        """When inside tires lift under hard lateral, the outside tires on
+        the same axle must absorb the lifted load."""
+        static = model.static_loads()
+        fl_s, fr_s, rl_s, rr_s = static
+        front_axle_static = fl_s + fr_s
+        rear_axle_static = rl_s + rr_s
+
+        # Huge lateral at 0 speed (no downforce): inside tires would
+        # otherwise go negative.
+        loads = model.tire_loads(
+            speed_ms=0.0, lateral_g=3.0, longitudinal_g=0.0,
+        )
+        fl, fr, rl, rr = loads
+        # Per-axle totals must be preserved
+        assert (fl + fr) == pytest.approx(front_axle_static, abs=0.1)
+        assert (rl + rr) == pytest.approx(rear_axle_static, abs=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Property: constructor validation (NF-40)
+# ---------------------------------------------------------------------------
+
+
+def _replace_tracks(
+    suspension: SuspensionConfig, front_mm: float, rear_mm: float,
+) -> SuspensionConfig:
+    return SuspensionConfig(
+        roll_stiffness_front_nm_per_deg=suspension.roll_stiffness_front_nm_per_deg,
+        roll_stiffness_rear_nm_per_deg=suspension.roll_stiffness_rear_nm_per_deg,
+        roll_center_height_front_mm=suspension.roll_center_height_front_mm,
+        roll_center_height_rear_mm=suspension.roll_center_height_rear_mm,
+        roll_camber_front_deg_per_deg=suspension.roll_camber_front_deg_per_deg,
+        roll_camber_rear_deg_per_deg=suspension.roll_camber_rear_deg_per_deg,
+        front_track_mm=front_mm,
+        rear_track_mm=rear_mm,
+    )
+
+
+class TestTrackWidthValidation:
+    """NF-40: reject malformed SuspensionConfig with zero/negative tracks."""
+
+    def test_zero_front_track_raises(
+        self, vehicle: VehicleParams, suspension: SuspensionConfig,
+    ) -> None:
+        bad = _replace_tracks(suspension, 0.0, suspension.rear_track_mm)
+        with pytest.raises(ValueError):
+            LoadTransferModel(vehicle=vehicle, suspension=bad)
+
+    def test_zero_rear_track_raises(
+        self, vehicle: VehicleParams, suspension: SuspensionConfig,
+    ) -> None:
+        bad = _replace_tracks(suspension, suspension.front_track_mm, 0.0)
+        with pytest.raises(ValueError):
+            LoadTransferModel(vehicle=vehicle, suspension=bad)
+
+    def test_negative_front_track_raises(
+        self, vehicle: VehicleParams, suspension: SuspensionConfig,
+    ) -> None:
+        bad = _replace_tracks(suspension, -10.0, suspension.rear_track_mm)
+        with pytest.raises(ValueError):
+            LoadTransferModel(vehicle=vehicle, suspension=bad)
