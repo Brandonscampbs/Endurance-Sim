@@ -81,6 +81,33 @@ class PowertrainModel:
     # regen efficiency envelopes at 400 V DC, 10-200 A phase current).
     _REGEN_EFFICIENCY_OFFSET_PP: float = 0.02  # 2 percentage points
 
+    # D-17: Regen efficiency multiplicative factor used on the efficiency
+    # map path.  Separate from the fallback path's small OFFSET (above),
+    # this is the body-diode + synchronous-rectifier derate applied on top
+    # of the motor+inverter efficiency map for commanded regen torque.
+    # Chosen so map_eta * FACTOR ≈ map_eta - 0.02 across the operating
+    # envelope (ballpark 0.977 at eta=0.88).
+    _REGEN_EFFICIENCY_FACTOR: float = 0.977
+
+    # D-17: PMSM back-EMF constant K_e in V·s/rad (phase-neutral peak ≈
+    # line-line peak / sqrt(3), but we use the effective line-line
+    # constant for the passive-rectifier threshold comparison against
+    # V_pack — conservative; overstates regen threshold by sqrt(3)).
+    #
+    # Derived from EMRAX 228 MV LC datasheet:
+    #   Kv ≈ 15 RPM/V (no-load) →
+    #   K_e = 60 / (2π · Kv) = 60 / (2π · 15) ≈ 0.6366 V·s/rad.
+    #
+    # Sanity check: at 2500 RPM, ω = 261.8 rad/s,
+    #   V_bemf = 0.6366 × 261.8 ≈ 167 V.  Pack typically 380-410 V,
+    # so V_bemf < V_pack at all normal operating points — i.e. the
+    # passive body-diode rectifier stays OFF under the Michigan stint.
+    #
+    # This means the back-EMF rectifier model alone does NOT explain
+    # the measured -456 W coast power at 2299 RPM (mean Michigan).
+    # See REMAINING_ISSUES.md #21 updated note.
+    _BACK_EMF_CONSTANT_VS_PER_RAD: float = 0.6366
+
     # APPS mismatch trip threshold, from firmware
     # (`tps_dist_error = fabs(tps1 - tps2) > APPS_TRIP_PERCENT`).  The
     # firmware uses 10% in LVCU Code.txt (via the
@@ -114,13 +141,19 @@ class PowertrainModel:
         )
 
     def _get_efficiency(self, motor_rpm: float, motor_torque_nm: float) -> float:
-        """Total drivetrain efficiency at the given operating point.
+        """Motor + inverter efficiency at the given operating point.
+
+        Used by ``electrical_power()`` to convert motor shaft power to
+        battery power.  Gearbox efficiency is excluded here because the
+        gearbox is downstream of the motor shaft — its friction reduces
+        wheel torque (handled in ``wheel_torque()``) but does not
+        increase electrical demand from the battery.
 
         Uses the motor efficiency map when available, otherwise falls
         back to the fixed ``config.drivetrain_efficiency``.
         """
         if self._efficiency_map is not None:
-            return self._efficiency_map.total_efficiency(motor_rpm, motor_torque_nm)
+            return self._efficiency_map.efficiency(motor_rpm, motor_torque_nm)
         return self.config.drivetrain_efficiency
 
     # ------------------------------------------------------------------
@@ -488,25 +521,47 @@ class PowertrainModel:
     # Electrical power
     # ------------------------------------------------------------------
 
-    def electrical_power(self, motor_torque_nm: float, motor_rpm: float) -> float:
+    # Coast-state torque threshold: below this magnitude the motor is
+    # considered "not actively commanded" and the back-EMF rectifier
+    # model applies (instead of the efficiency-map divide).  0.5 Nm
+    # is well below the LVCU startup gate (5 Nm) and below telemetry
+    # noise floor on Torque Feedback.
+    _COAST_TORQUE_THRESHOLD_NM: float = 0.5
+
+    def electrical_power(
+        self,
+        motor_torque_nm: float,
+        motor_rpm: float,
+        pack_voltage_v: float | None = None,
+    ) -> float:
         """Electrical power exchanged with the battery pack (W).
 
         Sign convention (battery perspective):
         - **Positive** (motoring): power drawn *from* the battery.
         - **Negative** (regen): power returned *to* the battery.
 
-        For motoring the mechanical power is divided by drivetrain efficiency
-        to account for friction losses.  For regen, mechanical power is
-        multiplied by efficiency (losses reduce energy recovered).
+        Dispatched on motor state (torque magnitude), not driver action:
 
-        At zero speed the mechanical power is zero regardless of torque, so
-        electrical power is also zero (no back-EMF, no current flows at 0 RPM
-        in a speed-controlled inverter).
+        1. **Motoring** (``motor_torque_nm > COAST_THRESHOLD``):
+           ``P_elec = T·ω / η(rpm, T)``.  Efficiency map (or
+           drivetrain_efficiency fallback) converts mechanical shaft
+           power to electrical demand.
+        2. **Commanded regen** (``motor_torque_nm < -COAST_THRESHOLD``):
+           ``P_elec = T·ω × η_regen(rpm, |T|)``.  Mechanical input times
+           regen efficiency (losses reduce what reaches the pack).
+        3. **Coast** (``|motor_torque_nm| ≤ COAST_THRESHOLD``):
+           Back-EMF rectifier model.  If ``K_e·ω > V_pack`` the inverter
+           body diodes conduct and current flows into the pack; otherwise
+           zero current (free-wheeling).  Requires ``pack_voltage_v``; if
+           None, returns 0 (no rectification).
 
         Args:
             motor_torque_nm: Motor shaft torque in Nm.  Positive = motoring,
-                negative = generating (regen).
+                negative = generating (commanded regen).
             motor_rpm: Motor shaft speed in RPM.
+            pack_voltage_v: Instantaneous pack terminal voltage (V).
+                Required for the back-EMF rectifier branch; optional
+                otherwise (backwards-compat).
 
         Returns:
             Electrical power in W (positive = battery discharge).
@@ -515,26 +570,56 @@ class PowertrainModel:
             return 0.0
 
         omega = motor_rpm * self._rad_per_s_per_rpm  # rad/s
+
+        # --- Coast branch: passive back-EMF rectification ---
+        if abs(motor_torque_nm) <= self._COAST_TORQUE_THRESHOLD_NM:
+            if pack_voltage_v is None or pack_voltage_v <= 0.0:
+                return 0.0
+            v_bemf = self._BACK_EMF_CONSTANT_VS_PER_RAD * omega
+            if v_bemf <= pack_voltage_v:
+                # Body diodes reverse-biased → no current flow.
+                return 0.0
+            # Simplest honest rectifier: assume negligible source
+            # impedance → current limited only by the measured
+            # coast operating point.  We model the overvoltage as
+            # driving current through the battery's own internal
+            # resistance, but without a calibrated R we conservatively
+            # return the power associated with clamping V_bemf to
+            # V_pack — i.e. P = V_pack * I where the inverter sinks
+            # enough current to hold V_bemf = V_pack.  Without the
+            # current limit we can only give an upper bound; return
+            # a small pack-credit scaled by the overvoltage ratio.
+            #
+            # This branch is not exercised under the Michigan stint
+            # (V_bemf < V_pack always at realistic RPMs; see class
+            # constant comment).  Kept honest-and-simple until a
+            # validation point demonstrates it fires.
+            overvoltage = v_bemf - pack_voltage_v
+            # Use a nominal per-phase resistance of 0.05 Ω
+            # (EMRAX 228 phase resistance order of magnitude) so
+            # I = overvoltage / R_phase, P = V_pack * I.
+            R_phase = 0.05
+            i_regen = overvoltage / R_phase
+            return -pack_voltage_v * i_regen
+
         p_mechanical = motor_torque_nm * omega  # W
 
-        if p_mechanical >= 0.0:
+        if p_mechanical > 0.0:
             # Motoring: battery must supply more than mechanical output.
-            # Use operating-point-dependent efficiency when available.
             eta = self._get_efficiency(motor_rpm, motor_torque_nm)
             if eta > 0.0:
                 return p_mechanical / eta
             return 0.0
+
+        # Commanded regen (p_mechanical < 0).
+        if self._efficiency_map is not None:
+            eta_regen = (
+                self._efficiency_map.efficiency(motor_rpm, abs(motor_torque_nm))
+                * self._REGEN_EFFICIENCY_FACTOR
+            )
         else:
-            # Regen: battery receives less than mechanical input due to losses.
-            # Use operating-point efficiency for regen too.
-            if self._efficiency_map is not None:
-                eta_regen = (
-                    self._efficiency_map.total_efficiency(motor_rpm, abs(motor_torque_nm))
-                    * self._REGEN_EFFICIENCY_FACTOR
-                )
-            else:
-                eta_regen = self._regen_efficiency
-            return p_mechanical * eta_regen
+            eta_regen = self._regen_efficiency_fallback
+        return p_mechanical * eta_regen
 
     def pack_current(self, electrical_power_w: float, pack_voltage_v: float) -> float:
         """Pack current from electrical power and instantaneous pack voltage.

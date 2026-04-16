@@ -416,22 +416,53 @@ cornering behavior will be wrong at speed.
 
 ---
 
-### 21. `PowertrainModel.electrical_power` regen branch references undefined `_REGEN_EFFICIENCY_FACTOR`
+### 21. ~~`PowertrainModel.electrical_power` regen branch references undefined `_REGEN_EFFICIENCY_FACTOR`~~ FIXED
 
-**Discovered:** 2026-04-16 (Agent 1, during D-05 implementation)
-**File:** `src/fsae_sim/vehicle/powertrain_model.py:563`
+**Fixed:** 2026-04-16 (Agent 2, D-17).
 
-The regen branch of `electrical_power()` (active when `motor_torque_nm < 0`)
-references `self._REGEN_EFFICIENCY_FACTOR`, which is not defined anywhere
-on the class.  Only `_REGEN_EFFICIENCY_OFFSET_PP` exists.  Any call path
-that triggers regen through `electrical_power` raises `AttributeError`.
+`_REGEN_EFFICIENCY_FACTOR` and `_regen_efficiency_fallback` are now
+defined as class constants / instance attributes.  `electrical_power()`
+was rewritten as part of D-17 to dispatch on motor state (torque
+magnitude) with three branches: motoring, commanded regen, and
+back-EMF rectification coast.  See commit body for D-17 for the
+full change.
 
-This bug was introduced by the uncommitted diff on `powertrain_model.py`
-reserved for Agent 2's electrical-model wave (D-13 / D-17).  Flagged here
-because it blocks `scripts/validate_tier3.py` from completing section 1
-(replay mode) whenever the replay torque trace crosses into negative
-territory.  Agent 2 should fix this as part of the D-17 back-EMF rework
-(that rework will likely delete the regen branch entirely in favour of a
-unified electrical model — see design spec §3.2).
+---
 
-**Scope:** Out of scope for Agent 1 (D-14 / D-05 / D-23).  Logged, not fixed.
+### 22. Back-EMF rectifier alone does not explain measured coast power
+
+**Discovered:** 2026-04-16 (Agent 2, validating D-17).
+
+Michigan 2025 telemetry mean coast operating point:
+`RPM = 2299`, `V_pack = 410 V`, measured `P_pack = -456 W`.
+
+The back-EMF model implemented in D-17 uses the physics-derived
+`K_e = 0.6366 V·s/rad` (EMRAX 228 MV LC datasheet, `Kv = 15 RPM/V`,
+`K_e = 60 / (2π · Kv)`).  At 2299 RPM that gives
+`V_bemf = K_e · ω = 0.6366 × 240.7 = 153 V` — far below `V_pack = 410 V`.
+Body diodes are reverse-biased; passive rectifier current is zero.
+
+**So the model predicts 0 W of coast regen where the car measures
+−456 W.**  Per the campaign rule "no bandaids", we did NOT fit `K_e`
+to match; we kept the physics value and logged the gap.
+
+Likely missing mechanisms (to investigate in a future wave):
+
+1. **Iron / core losses seen by the pack.** PMSMs dissipate iron
+   losses even with zero commanded current; some of those losses
+   are drawn from the pack via the inverter control loop.
+2. **Inverter standby current.** Gate drivers, cooling fans, and
+   logic rails draw from the HV bus (tens of watts).  Cascadia
+   CM200DX datasheet quotes ~20 W idle.
+3. **Driveline drag reflected to the pack.** The EV4 coast-down
+   coefficients include motor + gearbox drag; if the inverter holds
+   `I_d = 0` but regulates `V_q` to track speed, that regulation
+   dissipates pack energy even with zero commanded torque.
+4. **Throttle deadband negative bias.** The driver may be issuing
+   slight negative torque commands via pedal microtap that our
+   coast detector treats as "zero".
+
+**Priority:** Medium.  This is a ~1 A bias on pack current at coast
+segments — meaningful for energy budget (−456 W × ~30% coast time ×
+1200 s ≈ 45 Wh per stint, ~0.6 % of usable energy) but not
+safety-critical.  Revisit after the broader driver-model wave.

@@ -801,6 +801,31 @@ class TestBackEMFRectification:
 # Regen inverter-loss double-count fix (C3)
 # ---------------------------------------------------------------------------
 
+class TestBackEMFValidationMichigan:
+    """D-17: document the -456 W coast-power validation finding.
+
+    Michigan 2025 mean coast operating point:
+      RPM   = 2299 (mean when |Torque Feedback| < 1 Nm)
+      V_pack= 410 V (mean pack voltage over stint)
+      P     = -456 W (measured Pack V × I at those samples)
+
+    With physics-derived K_e = 0.6366 V·s/rad from EMRAX 228 MV LC
+    datasheet (Kv = 15 RPM/V → K_e = 60 / (2π · Kv)), V_bemf at 2299
+    RPM is ≈ 153 V — well below any realistic pack voltage. So the
+    passive-rectifier model predicts 0 W at this point, not -456 W.
+
+    This test pins that finding so a future change doesn't silently
+    re-introduce a fudge factor.  The -456 W must come from somewhere
+    else (iron losses, inverter standby current, driveline drag seen
+    by the pack) — logged in REMAINING_ISSUES.md.
+    """
+
+    def test_michigan_coast_point_rectifier_off(self, model: PowertrainModel) -> None:
+        p = model.electrical_power(0.0, 2299.0, 410.0)
+        # Rectifier off: physics-honest model returns zero.
+        assert p == pytest.approx(0.0, abs=1e-6)
+
+
 class TestRegenEfficiencyNoDoubleCount:
     """C3: map path must NOT multiply by extra 0.85 — map already includes losses."""
 

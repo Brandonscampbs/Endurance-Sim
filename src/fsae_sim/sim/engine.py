@@ -281,11 +281,14 @@ class SimulationEngine:
                 else:
                     motor_torque = 0.0
 
-                # 7. Electrical power and pack current
-                if cmd.action == ControlAction.COAST:
-                    elec_power = self.powertrain.coast_electrical_power(avg_speed)
-                else:
-                    elec_power = self.powertrain.electrical_power(motor_torque, motor_rpm)
+                # 7. Electrical power and pack current.
+                # D-17: dispatch on motor state (torque magnitude), not
+                # driver ControlAction.  The back-EMF rectifier branch
+                # inside electrical_power() fires on |torque| ≈ 0 and
+                # needs pack_voltage to compare against V_bemf.
+                elec_power = self.powertrain.electrical_power(
+                    motor_torque, motor_rpm, pack_voltage,
+                )
                 if pack_voltage > 0:
                     pack_current = elec_power / pack_voltage
                 else:

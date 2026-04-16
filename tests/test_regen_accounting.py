@@ -37,12 +37,13 @@ def _make_simple_track(num_segments: int = 20, segment_length: float = 50.0) -> 
 
 
 class MixedThrottleCoastStrategy(DriverStrategy):
-    """Alternates throttle and coast per segment.
+    """Alternates throttle and regen-brake per segment.
 
-    Uses COAST (rather than BRAKE) to exercise the regen accumulator
-    via ``coast_electrical_power()`` — which returns negative watts at
-    non-trivial RPM — without depending on the BRAKE→regen-torque
-    path.  Keeps the test focused on the D-05 bookkeeping change.
+    After D-17, ``coast_electrical_power()`` is gone and COAST at
+    realistic pack voltages returns 0 W (V_bemf < V_pack, body diodes
+    off).  To exercise the regen accumulator we use BRAKE with a
+    modest intensity so the engine's commanded-regen branch feeds
+    negative watts into the net accumulator.
     """
 
     name = "mixed_throttle_coast"
@@ -50,7 +51,7 @@ class MixedThrottleCoastStrategy(DriverStrategy):
     def decide(self, state: SimState, upcoming):
         if state.segment_idx % 2 == 0:
             return ControlCommand(ControlAction.THROTTLE, throttle_pct=1.0, brake_pct=0.0)
-        return ControlCommand(ControlAction.COAST, throttle_pct=0.0, brake_pct=0.0)
+        return ControlCommand(ControlAction.BRAKE, throttle_pct=0.0, brake_pct=0.3)
 
 
 @pytest.fixture
@@ -103,7 +104,7 @@ class TestSimResultRegenFields:
         )
         result = engine.run(num_laps=2, initial_soc_pct=95.0, initial_temp_c=25.0)
         assert result.total_regen_kwh > 0.0, (
-            "Coast action across 2 laps must produce some regen via back-EMF"
+            "Alternating throttle/regen-brake must produce some regen"
         )
         # Gross is larger than net (i.e., regen is actually being tracked,
         # not silently zeroed).
