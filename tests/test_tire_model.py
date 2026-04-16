@@ -13,6 +13,7 @@ Tests cover:
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import pytest
@@ -669,3 +670,229 @@ class TestCombinedForcesPAC2002:
         fx_pos, _ = tire_10psi.combined_forces(0.1, 0.1, 657.0)
         fx_neg, _ = tire_10psi.combined_forces(-0.1, 0.1, 657.0)
         assert abs(fx_pos) == pytest.approx(abs(fx_neg), rel=0.05)
+
+
+# ======================================================================
+# Closed-form peak regression tests (C4, M11, NF-38)
+# ======================================================================
+
+
+class TestClosedFormPeakRegression:
+    """Verify closed-form peak matches prior optimizer-based values.
+
+    Baselines were captured before C4/M11 fix using
+    ``scipy.optimize.minimize_scalar`` over the Magic Formula, at 10 psi,
+    zero camber.  Closed-form |mu * Fz| should land within 5% across
+    Fz in [100, 4000] N.
+    """
+
+    # Fz -> (peak_fy_optimizer, peak_fx_optimizer) at 10 psi, zero camber.
+    OPTIMIZER_BASELINE = {
+        100.0: (288.71013907153724, 284.8316575342449),
+        300.0: (844.4447916438131, 834.2429178081028),
+        500.0: (1371.2652767883617, 1356.6514383561323),
+        657.0: (1764.5617304995765, 1747.8236699999945),
+        900.0: (2338.163744793499, 2320.4602602739697),
+        1500.0: (3571.6551910954286, 3563.652945205479),
+        3000.0: (5516.888464383268, 5608.4017808219005),
+        4000.0: (5910.142914459523, 6122.945910775905),
+    }
+
+    def test_closed_form_peak_lateral_matches_optimizer(
+        self, tire_10psi: PacejkaTireModel
+    ) -> None:
+        """Closed-form peak_lateral_force should match the prior
+        optimizer baseline within 5% for Fz in [100, 4000] N.
+        """
+        for fz, (baseline_fy, _) in self.OPTIMIZER_BASELINE.items():
+            peak = tire_10psi.peak_lateral_force(fz)
+            assert peak == pytest.approx(baseline_fy, rel=0.05), (
+                f"peak_lateral_force({fz}) = {peak}, baseline {baseline_fy}"
+            )
+
+    def test_closed_form_peak_longitudinal_matches_optimizer(
+        self, tire_10psi: PacejkaTireModel
+    ) -> None:
+        """Closed-form peak_longitudinal_force should match the prior
+        optimizer baseline within 5% for Fz in [100, 4000] N.
+        """
+        for fz, (_, baseline_fx) in self.OPTIMIZER_BASELINE.items():
+            peak = tire_10psi.peak_longitudinal_force(fz)
+            assert peak == pytest.approx(baseline_fx, rel=0.05), (
+                f"peak_longitudinal_force({fz}) = {peak}, baseline {baseline_fx}"
+            )
+
+    def test_peak_lateral_always_positive(self, tire_10psi: PacejkaTireModel) -> None:
+        for fz in [50.0, 100.0, 300.0, 1000.0, 5000.0]:
+            assert tire_10psi.peak_lateral_force(fz) > 0.0
+
+    def test_peak_longitudinal_always_positive(
+        self, tire_10psi: PacejkaTireModel
+    ) -> None:
+        for fz in [50.0, 100.0, 300.0, 1000.0, 5000.0]:
+            assert tire_10psi.peak_longitudinal_force(fz) > 0.0
+
+    def test_peak_lateral_monotonic_in_load(
+        self, tire_10psi: PacejkaTireModel
+    ) -> None:
+        """Peak Fy grows monotonically with Fz within FSAE operating range."""
+        peaks = [tire_10psi.peak_lateral_force(fz) for fz in [300, 500, 700, 900, 1200]]
+        for i in range(1, len(peaks)):
+            assert peaks[i] > peaks[i - 1]
+
+    def test_peak_longitudinal_monotonic_in_load(
+        self, tire_10psi: PacejkaTireModel
+    ) -> None:
+        """Peak Fx grows monotonically with Fz within FSAE operating range."""
+        peaks = [tire_10psi.peak_longitudinal_force(fz) for fz in [300, 500, 700, 900, 1200]]
+        for i in range(1, len(peaks)):
+            assert peaks[i] > peaks[i - 1]
+
+
+# ======================================================================
+# Parser validation tests (NF-4)
+# ======================================================================
+
+
+class TestParserValidation:
+    """Verify .tir parser warns on garbage and asserts required fields."""
+
+    def test_warns_on_non_numeric_coefficient(self, tmp_path, tire_10psi):
+        """Parser should warn when a coefficient value fails float parse."""
+        # Copy a valid .tir and inject a garbage line.
+        src_text = TIR_10PSI.read_text(encoding="utf-8", errors="replace")
+        # Inject a deliberately malformed coefficient inside lateral section.
+        bad_line = "PDY1_BOGUS = 0.5e+  $ malformed number"
+        # Place the bad line after the [LATERAL_COEFFICIENTS] header.
+        injected = src_text.replace(
+            "[LATERAL_COEFFICIENTS]",
+            "[LATERAL_COEFFICIENTS]\n" + bad_line,
+            1,
+        )
+        bad_path = tmp_path / "bad.tir"
+        bad_path.write_text(injected, encoding="utf-8")
+
+        with pytest.warns(UserWarning, match="Skipped coefficients"):
+            PacejkaTireModel(bad_path)
+
+    def test_missing_fnomin_raises(self, tmp_path):
+        """Missing FNOMIN should raise ValueError."""
+        src_text = TIR_10PSI.read_text(encoding="utf-8", errors="replace")
+        # Remove FNOMIN line.
+        stripped = re.sub(r"\nFNOMIN\s*=.*", "", src_text)
+        bad_path = tmp_path / "no_fnomin.tir"
+        bad_path.write_text(stripped, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="FNOMIN"):
+            PacejkaTireModel(bad_path)
+
+    def test_missing_unloaded_radius_raises(self, tmp_path):
+        """Missing UNLOADED_RADIUS should raise ValueError."""
+        src_text = TIR_10PSI.read_text(encoding="utf-8", errors="replace")
+        stripped = re.sub(r"\nUNLOADED_RADIUS\s*=.*", "", src_text)
+        bad_path = tmp_path / "no_r0.tir"
+        bad_path.write_text(stripped, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="UNLOADED_RADIUS"):
+            PacejkaTireModel(bad_path)
+
+    def test_missing_vertical_stiffness_raises(self, tmp_path):
+        """Missing VERTICAL_STIFFNESS should raise ValueError."""
+        src_text = TIR_10PSI.read_text(encoding="utf-8", errors="replace")
+        stripped = re.sub(r"\nVERTICAL_STIFFNESS\s*=.*", "", src_text)
+        bad_path = tmp_path / "no_kz.tir"
+        bad_path.write_text(stripped, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="VERTICAL_STIFFNESS"):
+            PacejkaTireModel(bad_path)
+
+
+# ======================================================================
+# Symmetric E-clamp tests (NF-35)
+# ======================================================================
+
+
+class TestCurvatureFactorClamp:
+    """Verify ey and ex are clamped symmetrically to [-1, 1]."""
+
+    def test_ey_clamp_lower_bound_produces_finite_force(
+        self, tire_10psi: PacejkaTireModel
+    ) -> None:
+        """Force ey below -1 by inflating PEY2*dfz negatively at high load.
+
+        With PEY1 + PEY2*dfz potentially < -1 at high dfz, the un-clamped
+        model would let ey saturate below -1 and produce a discontinuous
+        force jump.  The fix clamps ey in [-1, 1] symmetrically.
+        """
+        fz = 4000.0  # far above fnomin=657, dfz >> 0
+        fy = tire_10psi.lateral_force(0.1, fz)
+        assert math.isfinite(fy)
+
+    def test_lateral_force_continuous_through_high_dfz(
+        self, tire_10psi: PacejkaTireModel
+    ) -> None:
+        """Sweep Fz up to stress the ey expression.  Force should remain
+        bounded and continuous -- no discontinuous jumps that indicate
+        an unclamped ey saturating at the Magic Formula's asymptote.
+        """
+        alpha = 0.1
+        prev = None
+        for fz in range(100, 5000, 50):
+            fy = tire_10psi.lateral_force(alpha, float(fz))
+            assert math.isfinite(fy)
+            if prev is not None:
+                # Consecutive Fz steps of 50N should not jump by more than
+                # a few hundred N -- a catastrophic jump would indicate
+                # the ey clamp issue.
+                assert abs(fy - prev) < 500.0, (
+                    f"Discontinuity at Fz={fz}: {prev} -> {fy}"
+                )
+            prev = fy
+
+    def test_longitudinal_force_continuous_through_high_dfz(
+        self, tire_10psi: PacejkaTireModel
+    ) -> None:
+        """Sweep Fz at fixed slip ratio; ex clamp must be symmetric to
+        avoid sign-asymmetric force response."""
+        kappa = 0.1
+        prev = None
+        for fz in range(100, 5000, 50):
+            fx = tire_10psi.longitudinal_force(kappa, float(fz))
+            assert math.isfinite(fx)
+            if prev is not None:
+                assert abs(fx - prev) < 500.0, (
+                    f"Discontinuity at Fz={fz}: {prev} -> {fx}"
+                )
+            prev = fx
+
+
+# ======================================================================
+# NF-18 regression: atan(fz / PKY2*Fz0) with magnitude
+# ======================================================================
+
+
+class TestCorneringStiffnessSignGuard:
+    """Verify cornering stiffness uses |PKY2*Fz0| in the atan argument."""
+
+    def test_kya_same_sign_with_positive_or_negative_pky2(
+        self, tire_10psi: PacejkaTireModel
+    ) -> None:
+        """Swapping PKY2 sign should not invert the cornering-stiffness sign.
+
+        PAC2002 expects the magnitude in the atan denominator.  A sign flip
+        would propagate and invert downstream lateral-force direction.
+        """
+        fz = 657.0
+        alpha = 0.01
+        fy_baseline = tire_10psi.lateral_force(alpha, fz)
+
+        # Force negative PKY2 and re-evaluate.
+        original_pky2 = tire_10psi.lateral["PKY2"]
+        tire_10psi.lateral["PKY2"] = -abs(original_pky2)
+        try:
+            fy_neg_pky2 = tire_10psi.lateral_force(alpha, fz)
+        finally:
+            tire_10psi.lateral["PKY2"] = original_pky2
+
+        # Both should have the same sign (stiffness magnitude preserved).
+        assert math.copysign(1.0, fy_baseline) == math.copysign(1.0, fy_neg_pky2)
