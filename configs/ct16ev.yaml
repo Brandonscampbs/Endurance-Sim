@@ -31,6 +31,8 @@ powertrain:
 
 battery:
   cell_type: "P45B"
+  cell_capacity_ah: 4.5  # Molicel P45B datasheet (4500 mAh nominal)
+  pack_structural_thermal_mass_kj_per_k: 7.5  # Busbars, compression plates, cell holders, enclosure (~25% of cell mass)
   topology:
     series: 110
     parallel: 4

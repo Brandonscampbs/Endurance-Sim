@@ -23,6 +23,8 @@ powertrain:
 
 battery:
   cell_type: "P50B"
+  cell_capacity_ah: 5.0  # Molicel P50B datasheet (5000 mAh nominal)
+  pack_structural_thermal_mass_kj_per_k: 7.5  # Busbars, compression plates, cell holders, enclosure (~25% of cell mass)
   topology:
     series: 100
     parallel: 4
