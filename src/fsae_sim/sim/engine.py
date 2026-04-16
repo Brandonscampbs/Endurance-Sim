@@ -282,13 +282,28 @@ class SimulationEngine:
                     motor_torque = 0.0
 
                 # 7. Electrical power and pack current.
-                # D-17: dispatch on motor state (torque magnitude), not
-                # driver ControlAction.  The back-EMF rectifier branch
-                # inside electrical_power() fires on |torque| ≈ 0 and
-                # needs pack_voltage to compare against V_bemf.
-                elec_power = self.powertrain.electrical_power(
-                    motor_torque, motor_rpm, pack_voltage,
-                )
+                #
+                # D-13: asymmetric power source by strategy type —
+                #   * Replay with measured V×I: use the recorded pack
+                #     terminal power directly. That's ground truth —
+                #     it bypasses every torque-sensor bias and every
+                #     motor-efficiency-map uncertainty.  CAN Torque
+                #     Feedback has a documented ~10% positive bias
+                #     vs what V×I energy implies, so computing
+                #     P = T·ω / η here would over-count discharge.
+                #   * All other paths (CalibratedStrategy,
+                #     PedalProfileStrategy, CoastOnly, ThreshBrake,
+                #     Replay without V×I): modeled electrical power
+                #     via PowertrainModel.electrical_power, which
+                #     dispatches on motor state (D-17) and consumes
+                #     pack_voltage for the back-EMF rectifier branch.
+                if is_replay and self.strategy.has_electrical_power:
+                    seg_mid_dist = distance + segment.length_m / 2.0
+                    elec_power = self.strategy.measured_electrical_power(seg_mid_dist)
+                else:
+                    elec_power = self.powertrain.electrical_power(
+                        motor_torque, motor_rpm, pack_voltage,
+                    )
                 if pack_voltage > 0:
                     pack_current = elec_power / pack_voltage
                 else:
