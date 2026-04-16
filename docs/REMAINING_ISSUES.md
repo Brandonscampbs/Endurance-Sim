@@ -413,3 +413,25 @@ cornering behavior will be wrong at speed.
 | 17 | 5m segment resolution | Data quality | Misses tight corners | Low |
 | 19 | ISA air density | Physics approx | ~3% aero error | Low |
 | 20 | Downforce distribution | Config gap | Balance at speed wrong | Low |
+
+---
+
+### 21. `PowertrainModel.electrical_power` regen branch references undefined `_REGEN_EFFICIENCY_FACTOR`
+
+**Discovered:** 2026-04-16 (Agent 1, during D-05 implementation)
+**File:** `src/fsae_sim/vehicle/powertrain_model.py:563`
+
+The regen branch of `electrical_power()` (active when `motor_torque_nm < 0`)
+references `self._REGEN_EFFICIENCY_FACTOR`, which is not defined anywhere
+on the class.  Only `_REGEN_EFFICIENCY_OFFSET_PP` exists.  Any call path
+that triggers regen through `electrical_power` raises `AttributeError`.
+
+This bug was introduced by the uncommitted diff on `powertrain_model.py`
+reserved for Agent 2's electrical-model wave (D-13 / D-17).  Flagged here
+because it blocks `scripts/validate_tier3.py` from completing section 1
+(replay mode) whenever the replay torque trace crosses into negative
+territory.  Agent 2 should fix this as part of the D-17 back-EMF rework
+(that rework will likely delete the regen branch entirely in favour of a
+unified electrical model — see design spec §3.2).
+
+**Scope:** Out of scope for Agent 1 (D-14 / D-05 / D-23).  Logged, not fixed.

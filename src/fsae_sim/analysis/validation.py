@@ -30,8 +30,21 @@ class ValidationMetric:
 
 @dataclass
 class ValidationReport:
-    """Summary of all validation metrics."""
+    """Summary of all validation metrics.
+
+    D-05 fields (``telem_discharge_j`` / ``telem_regen_j`` /
+    ``telem_net_j`` and the matching ``sim_*`` counterparts) expose the
+    gross/regen/net energy split on both sides of the comparison.
+    Earlier code only summed positive telemetry power, silently
+    discarding every regen segment.
+    """
     metrics: list[ValidationMetric]
+    telem_discharge_j: float = 0.0
+    telem_regen_j: float = 0.0
+    telem_net_j: float = 0.0
+    sim_discharge_j: float = 0.0
+    sim_regen_j: float = 0.0
+    sim_net_j: float = 0.0
 
     @property
     def all_passed(self) -> bool:
@@ -189,10 +202,12 @@ def validate_simulation(
     sim_v = float(sim_states["pack_voltage_v"].mean())
     metrics.append(_metric("Mean pack voltage", "V", telem_v, sim_v, target_pct))
 
-    # --- Pack current (mean of nonzero) ---
+    # --- Pack current (time-weighted mean) ---
     telem_i_values = lap_telem["Pack Current"].values
     telem_i_mean = float(np.mean(np.abs(telem_i_values[np.abs(telem_i_values) > 0.5]))) if np.any(np.abs(telem_i_values) > 0.5) else 0.0
-    sim_i_mean = float(np.mean(np.abs(sim_states["pack_current_a"].values)))
+    sim_seg_time = sim_states["segment_time_s"].values
+    sim_i_mean = float(np.average(np.abs(sim_states["pack_current_a"].values),
+                                  weights=sim_seg_time))
     if telem_i_mean > 1.0:
         metrics.append(_metric("Mean |pack current|", "A", telem_i_mean, sim_i_mean, 20.0))
 
@@ -207,6 +222,10 @@ def validate_full_endurance(
     sim_total_energy_kwh: float,
     sim_laps: int,
     target_pct: float = 5.0,
+    *,
+    sim_total_discharge_j: float | None = None,
+    sim_total_regen_j: float | None = None,
+    sim_total_net_j: float | None = None,
 ) -> ValidationReport:
     """Compare full-endurance simulation against complete AiM recording.
 
@@ -248,21 +267,52 @@ def validate_full_endurance(
     sim_v_end = float(sim_states["pack_voltage_v"].iloc[-1])
     metrics.append(_metric("Final pack voltage", "V", telem_v_end, sim_v_end, target_pct))
 
-    # --- Mean pack current ---
+    # --- Mean pack current (time-weighted) ---
+    # Telemetry samples are uniform in time (20Hz), so unweighted mean is
+    # already time-weighted.  Sim segments are uniform in distance, so we
+    # must weight by segment_time_s to get a proper time-weighted average.
     telem_i = float(np.mean(np.abs(aim_df["Pack Current"][moving].values)))
-    sim_i = float(np.mean(np.abs(sim_states["pack_current_a"].values)))
+    sim_seg_time = sim_states["segment_time_s"].values
+    sim_i = float(np.average(np.abs(sim_states["pack_current_a"].values),
+                             weights=sim_seg_time))
     metrics.append(_metric("Mean |pack current|", "A", telem_i, sim_i, 20.0))
 
-    # --- Energy consumed ---
-    # Telemetry: integrate V*I over time
+    # --- Energy consumed (D-05: discharge / regen / net tracked) ---
+    # Telemetry: integrate V*I over time.  Previously only positive
+    # power was summed, which discarded every regen segment — biasing
+    # the telemetry total high vs any sim that tracks regen.  We now
+    # track gross discharge, gross regen, and net, and compare net.
     telem_power = aim_df["Pack Voltage"].values * aim_df["Pack Current"].values
     dt = np.diff(aim_df["Time"].values, prepend=aim_df["Time"].values[0])
-    telem_energy_j = float(np.sum(telem_power[telem_power > 0] * dt[telem_power > 0]))
-    telem_energy_kwh = telem_energy_j / 3.6e6
-    if telem_energy_kwh > 0.1:
-        metrics.append(_metric("Energy consumed", "kWh", telem_energy_kwh, sim_total_energy_kwh, 15.0))
+    telem_discharge_j = float(np.sum(np.maximum(telem_power, 0.0) * dt))
+    telem_regen_j = float(np.sum(np.maximum(-telem_power, 0.0) * dt))
+    telem_net_j = telem_discharge_j - telem_regen_j
+    telem_net_kwh = telem_net_j / 3.6e6
+    if telem_net_kwh > 0.1:
+        metrics.append(
+            _metric("Energy consumed (net)", "kWh",
+                    telem_net_kwh, sim_total_energy_kwh, 15.0)
+        )
 
-    return ValidationReport(metrics=metrics)
+    # Sim-side counters: use explicit values when the caller passes them
+    # (preferred — the caller has exact bookkeeping), otherwise derive
+    # from the net scalar so the field is non-zero for downstream code.
+    if sim_total_net_j is None:
+        sim_net_j_val = sim_total_energy_kwh * 3.6e6
+    else:
+        sim_net_j_val = float(sim_total_net_j)
+    sim_disch_j_val = float(sim_total_discharge_j) if sim_total_discharge_j is not None else max(sim_net_j_val, 0.0)
+    sim_regen_j_val = float(sim_total_regen_j) if sim_total_regen_j is not None else 0.0
+
+    return ValidationReport(
+        metrics=metrics,
+        telem_discharge_j=telem_discharge_j,
+        telem_regen_j=telem_regen_j,
+        telem_net_j=telem_net_j,
+        sim_discharge_j=sim_disch_j_val,
+        sim_regen_j=sim_regen_j_val,
+        sim_net_j=sim_net_j_val,
+    )
 
 
 def _metric(

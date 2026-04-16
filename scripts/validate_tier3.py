@@ -15,6 +15,7 @@ from fsae_sim.vehicle.dynamics import VehicleDynamics
 from fsae_sim.driver.strategies import CoastOnlyStrategy, ThresholdBrakingStrategy, ReplayStrategy
 from fsae_sim.sim.engine import SimulationEngine
 from fsae_sim.analysis.validation import validate_full_endurance, detect_lap_boundaries
+from fsae_sim.analysis.validation_plots import plot_validation
 
 
 def _annotate_laps(aim_df: pd.DataFrame) -> pd.DataFrame:
@@ -109,8 +110,12 @@ def main():
         # Approximate per-stint totals for sim; the report API still
         # accepts scalars so we hand it the held-out stint aggregates.
         holdout_time = float(sim_holdout["time_s"].iloc[-1] - sim_holdout["time_s"].iloc[0])
+        # D-05: report NET energy (discharge - regen), consistent with
+        # SimResult.total_energy_kwh and the telemetry-side net.
         holdout_energy_j_arr = sim_holdout["electrical_power_w"].values * sim_holdout["segment_time_s"].values
-        holdout_energy_kwh = float(np.sum(holdout_energy_j_arr[holdout_energy_j_arr > 0]) / 3.6e6)
+        holdout_discharge_j = float(np.sum(np.maximum(holdout_energy_j_arr, 0.0)))
+        holdout_regen_j = float(np.sum(np.maximum(-holdout_energy_j_arr, 0.0)))
+        holdout_energy_kwh = (holdout_discharge_j - holdout_regen_j) / 3.6e6
         holdout_final_soc = float(sim_holdout["soc_pct"].iloc[-1])
 
         report_holdout = validate_full_endurance(
@@ -132,6 +137,11 @@ def main():
         )
         print(report.summary())
     print(f"  Laps completed: {result.laps_completed}/{num_laps}")
+
+    # ── Validation plots ──
+    plot_path = "results/validation_plots.png"
+    plot_validation(result.states, aim_df, output_path=plot_path)
+    print(f"  Validation plots saved to {plot_path}")
 
     # ── 2. Corner Speed Comparison ──
     print("\n2. CORNER SPEED PREDICTION -- Pacejka vs Legacy")

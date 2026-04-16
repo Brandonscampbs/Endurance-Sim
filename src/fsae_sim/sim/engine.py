@@ -41,16 +41,25 @@ except ImportError:
 
 @dataclass
 class SimResult:
-    """Output of a single simulation run."""
+    """Output of a single simulation run.
+
+    Energy accounting (D-05): gross discharge and regen recovery are
+    tracked separately, and ``total_energy_kwh`` reports **net**
+    consumption (discharge - regen).  Consumers that need gross figures
+    should read ``total_discharge_kwh`` / ``total_regen_kwh`` directly.
+    """
 
     config_name: str
     strategy_name: str
     track_name: str
     states: pd.DataFrame  # time series of per-segment state snapshots
     total_time_s: float
-    total_energy_kwh: float
+    total_energy_kwh: float  # net = discharge - regen
     final_soc: float
     laps_completed: int
+    total_discharge_kwh: float = 0.0
+    total_regen_kwh: float = 0.0
+    total_net_kwh: float = 0.0
 
 
 class SimulationEngine:
@@ -148,8 +157,11 @@ class SimulationEngine:
         # avoid the NF-42 magic-number duplication.
         termination_temp_c = self.vehicle.battery.discharge_limits[-1].temp_c
 
-        # Accumulator for energy
-        total_energy_j = 0.0
+        # Accumulator for energy (D-05: track discharge, regen, net
+        # separately — previously only positive power was summed,
+        # discarding regen recovery entirely).
+        total_discharge_j = 0.0
+        total_regen_j = 0.0
 
         # State log
         records: list[dict] = []
@@ -270,18 +282,7 @@ class SimulationEngine:
                     motor_torque = 0.0
 
                 # 7. Electrical power and pack current
-                #    When the replay strategy has measured V×I data,
-                #    use it directly — this is the actual power at the
-                #    battery terminals, more accurate than computing
-                #    P_elec = torque × RPM / efficiency because the
-                #    CAN torque feedback has a ~10% positive bias vs
-                #    what V×I energy data implies.
-                #    For non-replay strategies, fall back to the
-                #    torque-based computation.
-                if is_replay and self.strategy.has_electrical_power:
-                    seg_mid_dist = distance + segment.length_m / 2.0
-                    elec_power = self.strategy.measured_electrical_power(seg_mid_dist)
-                elif cmd.action == ControlAction.COAST:
+                if cmd.action == ControlAction.COAST:
                     elec_power = self.powertrain.coast_electrical_power(avg_speed)
                 else:
                     elec_power = self.powertrain.electrical_power(motor_torque, motor_rpm)
@@ -298,10 +299,15 @@ class SimulationEngine:
                     pack_current, seg_time, soc, temp,
                 )
 
-                # 10. Energy accounting (positive = consumed)
+                # 10. Energy accounting (D-05)
+                #     discharge = positive power into the motor
+                #     regen     = negative power recovered to the pack
+                #     net       = discharge - regen
                 segment_energy_j = elec_power * seg_time
-                if segment_energy_j > 0:
-                    total_energy_j += segment_energy_j
+                if segment_energy_j > 0.0:
+                    total_discharge_j += segment_energy_j
+                else:
+                    total_regen_j += -segment_energy_j
 
                 # 11. Record state
                 records.append({
@@ -343,35 +349,44 @@ class SimulationEngine:
                 # Check termination conditions
                 if soc <= self.vehicle.battery.discharged_soc_pct:
                     return self._build_result(
-                        records, time, total_energy_j, soc, laps_completed,
+                        records, time, total_discharge_j, total_regen_j,
+                        soc, laps_completed,
                     )
                 if temp >= termination_temp_c:
                     return self._build_result(
-                        records, time, total_energy_j, soc, laps_completed,
+                        records, time, total_discharge_j, total_regen_j,
+                        soc, laps_completed,
                     )
 
             laps_completed += 1
 
         return self._build_result(
-            records, time, total_energy_j, soc, laps_completed,
+            records, time, total_discharge_j, total_regen_j,
+            soc, laps_completed,
         )
 
     def _build_result(
         self,
         records: list[dict],
         total_time: float,
-        total_energy_j: float,
+        total_discharge_j: float,
+        total_regen_j: float,
         final_soc: float,
         laps_completed: int,
     ) -> SimResult:
         states = pd.DataFrame(records)
+        total_net_j = total_discharge_j - total_regen_j
         return SimResult(
             config_name=self.vehicle.name,
             strategy_name=self.strategy.name,
             track_name=self.track.name,
             states=states,
             total_time_s=total_time,
-            total_energy_kwh=total_energy_j / 3.6e6,
+            # D-05: default total_energy_kwh is NET consumption.
+            total_energy_kwh=total_net_j / 3.6e6,
             final_soc=final_soc,
             laps_completed=laps_completed,
+            total_discharge_kwh=total_discharge_j / 3.6e6,
+            total_regen_kwh=total_regen_j / 3.6e6,
+            total_net_kwh=total_net_j / 3.6e6,
         )
