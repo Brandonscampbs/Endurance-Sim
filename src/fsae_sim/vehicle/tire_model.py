@@ -16,10 +16,9 @@ from __future__ import annotations
 
 import math
 import re
+import warnings
 from pathlib import Path
 from typing import Union
-
-from scipy.optimize import minimize_scalar
 
 
 class PacejkaTireModel:
@@ -413,42 +412,68 @@ class PacejkaTireModel:
         normal_load_n: float,
         camber_rad: float = 0.0,
     ) -> float:
-        """Find the peak lateral force magnitude by sweeping slip angle.
+        """Peak lateral force magnitude via PAC2002 closed-form |D_y|.
 
-        Args:
-            normal_load_n: Normal load (N).
-            camber_rad: Camber angle (rad).
-
-        Returns:
-            Peak |Fy| (N), always positive.
+        D_y = mu_y * Fz is the Magic Formula peak factor.  At the peak
+        slip angle, ``C_y * atan(inner)`` reaches pi/2 and sin() = 1, so
+        the peak of the full MF curve is exactly |D_y|.  Replacing the
+        prior ``minimize_scalar`` search avoids the sign-asymmetric
+        local-max selection the bounded Brent method suffered with
+        nonzero SVy (see SIMULATOR_AUDIT_2026-04-16 C4/M11).
         """
-        result = minimize_scalar(
-            lambda alpha: -abs(self.lateral_force(alpha, normal_load_n, camber_rad)),
-            bounds=(-math.pi / 2.0, math.pi / 2.0),
-            method="bounded",
-        )
-        return -result.fun
+        fz = max(normal_load_n, 1.0)
+        fz0 = self.fnomin * self._sc("LFZO")
+        dfz = (fz - fz0) / fz0 if fz0 > 0 else 0.0
+
+        pdy1 = self._lat("PDY1")
+        pdy2 = self._lat("PDY2")
+        pdy3 = self._lat("PDY3")
+        muy = (pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2) * self._sc("LMUY")
+        return abs(muy * fz)
 
     def peak_longitudinal_force(
         self,
         normal_load_n: float,
         camber_rad: float = 0.0,
     ) -> float:
-        """Find the peak longitudinal force magnitude by sweeping slip ratio.
+        """Peak longitudinal force magnitude via PAC2002 closed-form |D_x|.
 
-        Args:
-            normal_load_n: Normal load (N).
-            camber_rad: Camber angle (rad).
+        Mirrors ``peak_lateral_force`` for the longitudinal Magic
+        Formula: the peak of ``D * sin(C * atan(inner))`` is |D|.
 
-        Returns:
-            Peak |Fx| (N), always positive.
+        The current TTC .tir files have ``USE_MODE=2`` (lateral-only),
+        so all PDX coefficients are zero.  ``longitudinal_force`` mirrors
+        the lateral peak-mu expression ``|(PDY1 + PDY2*dfz)| * LMUY``,
+        and this peak must match that same mu exactly to keep the two
+        functions self-consistent.  If a PAC2002 parameter set with
+        nonzero PDX1 is loaded (e.g., via ``transplant_fx_coefficients``),
+        the orthodox PDX form is used instead.
         """
-        result = minimize_scalar(
-            lambda kappa: -abs(self.longitudinal_force(kappa, normal_load_n, camber_rad)),
-            bounds=(-1.0, 1.0),
-            method="bounded",
-        )
-        return -result.fun
+        fz = max(normal_load_n, 1.0)
+        fz0 = self.fnomin * self._sc("LFZO")
+        dfz = (fz - fz0) / fz0 if fz0 > 0 else 0.0
+
+        pdx1 = self._lon("PDX1")
+        pdx2 = self._lon("PDX2")
+        pdx3 = self._lon("PDX3")
+        if pdx1 != 0.0:
+            # Orthodox PAC2002: use longitudinal coefficients and LMUX.
+            mux = (
+                (pdx1 + pdx2 * dfz)
+                * (1.0 - pdx3 * camber_rad ** 2)
+                * self._sc("LMUX")
+            )
+        else:
+            # TTC USE_MODE=2 mirror: match the mu used inside
+            # ``longitudinal_force``: |PDY1 + PDY2*dfz| * (1 - PDY3*gamma^2) * LMUY.
+            pdy1 = self._lat("PDY1")
+            pdy2 = self._lat("PDY2")
+            pdy3 = self._lat("PDY3")
+            mux = (
+                abs((pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2))
+                * self._sc("LMUY")
+            )
+        return abs(mux * fz)
 
     # ------------------------------------------------------------------
     # Loaded radius
