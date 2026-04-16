@@ -14,7 +14,11 @@ from fsae_sim.vehicle.cornering_solver import CorneringSolver
 from fsae_sim.vehicle.dynamics import VehicleDynamics
 from fsae_sim.driver.strategies import CoastOnlyStrategy, ThresholdBrakingStrategy, ReplayStrategy
 from fsae_sim.sim.engine import SimulationEngine
-from fsae_sim.analysis.validation import validate_full_endurance, detect_lap_boundaries
+from fsae_sim.analysis.validation import (
+    detect_lap_boundaries,
+    validate_driver_channels,
+    validate_full_endurance,
+)
 from fsae_sim.analysis.validation_plots import plot_validation
 
 
@@ -94,54 +98,104 @@ def main():
     batt_replay.calibrate_from_voltt(voltt_df)
 
     engine = SimulationEngine(config, track, replay, batt_replay)
-    result = engine.run(
-        num_laps=num_laps,
-        initial_soc_pct=initial_soc,
-        initial_temp_c=initial_temp,
-        initial_speed_ms=max(initial_speed, 0.5),
-    )
+    try:
+        result = engine.run(
+            num_laps=num_laps,
+            initial_soc_pct=initial_soc,
+            initial_temp_c=initial_temp,
+            initial_speed_ms=max(initial_speed, 0.5),
+        )
+    except AttributeError as exc:
+        # Known in-flight bug: PowertrainModel regen branch references
+        # undefined _REGEN_EFFICIENCY_FACTOR (REMAINING_ISSUES #21).
+        # Agent 2's D-13/D-17 wave fixes this — skip section 1 until
+        # then so the rest of the report (and D-23 below) can run.
+        print(f"  SKIPPED: engine.run raised {exc!r}")
+        print("  See docs/REMAINING_ISSUES.md #21 (regen branch attr error).")
+        result = None
 
-    # C15 fix: validate on held-out stint only (laps 13-21).  The full
-    # endurance report is still printed for reference below.
     aim_holdout = aim_df[aim_df["lap"].isin(HOLDOUT_LAPS)].reset_index(drop=True)
-    sim_holdout = result.states[result.states["lap"].isin(HOLDOUT_LAPS)].reset_index(drop=True)
-
-    if len(aim_holdout) > 0 and len(sim_holdout) > 0:
-        # Approximate per-stint totals for sim; the report API still
-        # accepts scalars so we hand it the held-out stint aggregates.
-        holdout_time = float(sim_holdout["time_s"].iloc[-1] - sim_holdout["time_s"].iloc[0])
-        # D-05: report NET energy (discharge - regen), consistent with
-        # SimResult.total_energy_kwh and the telemetry-side net.
-        holdout_energy_j_arr = sim_holdout["electrical_power_w"].values * sim_holdout["segment_time_s"].values
-        holdout_discharge_j = float(np.sum(np.maximum(holdout_energy_j_arr, 0.0)))
-        holdout_regen_j = float(np.sum(np.maximum(-holdout_energy_j_arr, 0.0)))
-        holdout_energy_kwh = (holdout_discharge_j - holdout_regen_j) / 3.6e6
-        holdout_final_soc = float(sim_holdout["soc_pct"].iloc[-1])
-
-        report_holdout = validate_full_endurance(
-            sim_holdout, aim_holdout,
-            holdout_time, holdout_final_soc,
-            holdout_energy_kwh, int(sim_holdout["lap"].nunique()),
-            target_pct=5.0,
-        )
-        print("  Validation stint: laps", HOLDOUT_LAPS[0], "-", HOLDOUT_LAPS[-1])
-        print(report_holdout.summary())
-        report = report_holdout
+    if result is None:
+        sim_holdout = pd.DataFrame()
+        report = None
     else:
-        print("  WARNING: no held-out laps found; falling back to full endurance")
-        report = validate_full_endurance(
-            result.states, aim_df,
-            result.total_time_s, result.final_soc,
-            result.total_energy_kwh, result.laps_completed,
-            target_pct=5.0,
-        )
-        print(report.summary())
-    print(f"  Laps completed: {result.laps_completed}/{num_laps}")
+        # C15 fix: validate on held-out stint only (laps 13-21).
+        sim_holdout = result.states[result.states["lap"].isin(HOLDOUT_LAPS)].reset_index(drop=True)
 
-    # ── Validation plots ──
-    plot_path = "results/validation_plots.png"
-    plot_validation(result.states, aim_df, output_path=plot_path)
-    print(f"  Validation plots saved to {plot_path}")
+        if len(aim_holdout) > 0 and len(sim_holdout) > 0:
+            holdout_time = float(sim_holdout["time_s"].iloc[-1] - sim_holdout["time_s"].iloc[0])
+            # D-05: report NET energy (discharge - regen).
+            holdout_energy_j_arr = sim_holdout["electrical_power_w"].values * sim_holdout["segment_time_s"].values
+            holdout_discharge_j = float(np.sum(np.maximum(holdout_energy_j_arr, 0.0)))
+            holdout_regen_j = float(np.sum(np.maximum(-holdout_energy_j_arr, 0.0)))
+            holdout_energy_kwh = (holdout_discharge_j - holdout_regen_j) / 3.6e6
+            holdout_final_soc = float(sim_holdout["soc_pct"].iloc[-1])
+
+            report_holdout = validate_full_endurance(
+                sim_holdout, aim_holdout,
+                holdout_time, holdout_final_soc,
+                holdout_energy_kwh, int(sim_holdout["lap"].nunique()),
+                target_pct=5.0,
+            )
+            print("  Validation stint: laps", HOLDOUT_LAPS[0], "-", HOLDOUT_LAPS[-1])
+            print(report_holdout.summary())
+            report = report_holdout
+        else:
+            print("  WARNING: no held-out laps found; falling back to full endurance")
+            report = validate_full_endurance(
+                result.states, aim_df,
+                result.total_time_s, result.final_soc,
+                result.total_energy_kwh, result.laps_completed,
+                target_pct=5.0,
+            )
+            print(report.summary())
+        print(f"  Laps completed: {result.laps_completed}/{num_laps}")
+
+        # ── Validation plots ──
+        plot_path = "results/validation_plots.png"
+        plot_validation(result.states, aim_df, output_path=plot_path)
+        print(f"  Validation plots saved to {plot_path}")
+
+    # ── 1b. Driver-Channel Validation (D-23) ──
+    print("\n1b. DRIVER-CHANNEL VALIDATION -- Sim commands vs telemetry inputs")
+    print("-" * 50)
+    dc_report = None
+    sim_for_dc = sim_holdout if (result is not None and len(sim_holdout) > 0) else pd.DataFrame()
+
+    # Fallback: if replay blocked (Agent 2 bug), run CoastOnly as a
+    # pre-fix baseline driver so D-23 still produces numbers.  Coast
+    # never triggers the broken regen branch in electrical_power —
+    # it dispatches to coast_electrical_power instead.
+    if sim_for_dc.empty and len(aim_holdout) > 0:
+        print("  Replay blocked; falling back to CoastOnly driver for baseline.")
+        coast_bl = CoastOnlyStrategy(new_dyn, coast_margin_ms=2.0)
+        batt_bl = BatteryModel(config.battery)
+        batt_bl.calibrate_from_voltt(voltt_df)
+        engine_bl = SimulationEngine(config, track, coast_bl, batt_bl)
+        engine_bl.dynamics = new_dyn
+        try:
+            result_bl = engine_bl.run(
+                num_laps=num_laps,
+                initial_soc_pct=initial_soc,
+                initial_temp_c=initial_temp,
+                initial_speed_ms=max(initial_speed, 0.5),
+            )
+            # Engine "lap" is 0-indexed; aim_df["lap"] is 1-indexed.
+            # Align by offsetting.
+            states = result_bl.states.copy()
+            states["lap"] = states["lap"] + 1
+            sim_for_dc = states[states["lap"].isin(HOLDOUT_LAPS)].reset_index(drop=True)
+        except AttributeError as exc:
+            print(f"  Fallback failed too: {exc!r}")
+            sim_for_dc = pd.DataFrame()
+
+    if not sim_for_dc.empty and len(aim_holdout) > 0:
+        dc_report = validate_driver_channels(
+            sim_for_dc, aim_holdout, laps=HOLDOUT_LAPS,
+        )
+        print(dc_report.summary())
+    else:
+        print("  SKIPPED: no sim states available for comparison.")
 
     # ── 2. Corner Speed Comparison ──
     print("\n2. CORNER SPEED PREDICTION -- Pacejka vs Legacy")
@@ -245,8 +299,11 @@ def main():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"  Replay validation:     {report.num_passed}/{report.num_total} metrics pass")
-    print(f"  Worst metric error:    {max(m.relative_error_pct for m in report.metrics):.1f}%")
+    if report is not None:
+        print(f"  Replay validation:     {report.num_passed}/{report.num_total} metrics pass")
+        print(f"  Worst metric error:    {max(m.relative_error_pct for m in report.metrics):.1f}%")
+    else:
+        print("  Replay validation:     SKIPPED (see REMAINING_ISSUES.md #21)")
     print(f"  Pacejka vs Legacy:     Higher corner speeds (mu={pdy1:.1f} vs 1.3)")
     print(f"  Real car lateral G:    {actual_peak_g:.2f}g peak, {actual_mean_g:.2f}g mean in corners")
     print(f"  Force-based lap delta: {result_coast.total_time_s - result_leg.total_time_s:+.1f}s (Pacejka vs Legacy coast)")
