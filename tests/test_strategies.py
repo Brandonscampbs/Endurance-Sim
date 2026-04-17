@@ -245,3 +245,61 @@ class TestControlCommandMetadata:
         assert cmd.metadata is not None
         assert cmd.metadata["max_speed_ms"] == 12.5
         assert cmd.throttle_pct == 0.8
+
+
+class TestReplayThresholdConstants:
+    """D-24: ReplayStrategy uses module-level constants for action thresholds."""
+
+    def test_constants_exported(self):
+        from fsae_sim.driver import strategies as _s
+        assert _s._THROTTLE_ACTION_THRESHOLD == pytest.approx(0.05)
+        assert _s._BRAKE_ACTION_THRESHOLD == pytest.approx(0.05)
+
+    def test_decide_uses_constants(self, monkeypatch):
+        from fsae_sim.driver import strategies as _s
+        from fsae_sim.driver.strategy import ControlAction, SimState
+
+        dist = np.array([0.0, 100.0])
+        throttle = np.array([0.0, 1.0])
+        brake = np.array([0.0, 0.0])
+        torque = np.array([0.0, 80.0])
+
+        replay = _s.ReplayStrategy(dist, throttle, brake, torque, 100.0, wrap=False)
+        # Raising the threshold should demote a 0.1 throttle to COAST.
+        monkeypatch.setattr(_s, "_THROTTLE_ACTION_THRESHOLD", 0.2)
+        state = SimState(0, 10.0, 5.0, 0.9, 400, 0, 25, 0, 0)
+        cmd = replay.decide(state, [])
+        assert cmd.action == ControlAction.COAST
+
+
+class TestSegmentToZoneIndex:
+    """D-25: zone_for_segment uses an O(1) index array, matches linear scan."""
+
+    def test_matches_linear_scan(self):
+        from fsae_sim.analysis.telemetry_analysis import DriverZone
+        from fsae_sim.driver.strategies import CalibratedStrategy
+        from fsae_sim.driver.strategy import ControlAction
+
+        zones = [
+            DriverZone(
+                zone_id=0, segment_start=0, segment_end=3,
+                action=ControlAction.THROTTLE, intensity=0.8,
+                distance_start_m=0.0, distance_end_m=200.0, label="a",
+            ),
+            DriverZone(
+                zone_id=1, segment_start=4, segment_end=7,
+                action=ControlAction.COAST, intensity=0.0,
+                distance_start_m=200.0, distance_end_m=400.0, label="b",
+            ),
+            DriverZone(
+                zone_id=2, segment_start=8, segment_end=9,
+                action=ControlAction.BRAKE, intensity=0.5,
+                distance_start_m=400.0, distance_end_m=500.0, label="c",
+            ),
+        ]
+        strat = CalibratedStrategy(zones, num_segments=10)
+
+        for seg in range(10):
+            fast = strat.zone_for_segment(seg)
+            expected = next(z for z in zones if z.segment_start <= seg <= z.segment_end)
+            assert fast is expected, f"seg {seg}: fast={fast.zone_id} expected={expected.zone_id}"
