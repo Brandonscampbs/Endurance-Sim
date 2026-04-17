@@ -702,15 +702,6 @@ class TestClosedFormPeakRegression:
         4000.0: (6345.3211951293752, 1784.6513875190260),
     }
 
-    @pytest.mark.xfail(
-        reason=(
-            "Closed-form peak Fy drifts from the optimizer baseline after "
-            "in-progress tire/cornering_solver work. Tracked as a tire-model "
-            "issue alongside the longitudinal counterpart; out of scope for "
-            "the driver-model campaign. See docs/SIMULATOR_ISSUES.md."
-        ),
-        strict=False,
-    )
     def test_closed_form_peak_lateral_matches_optimizer(
         self, tire_10psi: PacejkaTireModel
     ) -> None:

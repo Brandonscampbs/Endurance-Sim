@@ -12,6 +12,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from fsae_sim.physics_constants import GRAVITY_M_S2
+
 if TYPE_CHECKING:
     from fsae_sim.vehicle.load_transfer import LoadTransferModel
     from fsae_sim.vehicle.tire_model import PacejkaTireModel
@@ -40,7 +42,7 @@ class CorneringSolver:
             per deg roll).
     """
 
-    GRAVITY: float = 9.81
+    GRAVITY: float = GRAVITY_M_S2  # NF-22: single source of truth
     _V_LOW: float = 0.5
     _V_HIGH: float = 50.0
     _ITERATIONS: int = 30  # hard cap; loop exits earlier on convergence

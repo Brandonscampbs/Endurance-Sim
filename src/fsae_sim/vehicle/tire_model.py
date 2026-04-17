@@ -598,59 +598,81 @@ class PacejkaTireModel:
         normal_load_n: float,
         camber_rad: float = 0.0,
     ) -> float:
-        """Peak lateral force magnitude via PAC2002 closed-form |D_y|.
+        """Peak lateral force magnitude via PAC2002 asymptotic |D_y| + |SV_y|.
 
-        D_y = mu_y * Fz is the Magic Formula peak factor.  At the peak
-        slip angle, ``C_y * atan(inner)`` reaches pi/2 and sin() = 1, so
-        the peak of the full MF curve is exactly |D_y|.  Replaces the
-        prior ``minimize_scalar`` search that suffered sign-asymmetric
-        local-max selection with nonzero SVy (C4/M11).
+        The full Magic Formula is Fy = D·sin(C·atan(inner)) + SV.  As
+        |α| → ∞ the sin term → ±1, so the peak magnitude is
+        max(|D+SV|, |D-SV|) = |D| + |SV|.  This replaces the earlier
+        closed-form that ignored the vertical-shift term — at high load
+        (Fz > 2 Fz0) SV grows enough to meaningfully shift the peak.
         """
         fz = max(normal_load_n, 1.0)
         fz0 = self.fnomin * self._sc("LFZO")
         dfz = (fz - fz0) / fz0 if fz0 > 0 else 0.0
 
+        lmuy = self._sc("LMUY")
+        lvy = self._sc("LVY")
+
         pdy1 = self._lat("PDY1")
         pdy2 = self._lat("PDY2")
         pdy3 = self._lat("PDY3")
-        muy = (pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2) * self._sc("LMUY")
-        return abs(muy * fz)
+        muy = (pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2) * lmuy
+        d_y = muy * fz
+
+        pvy1 = self._lat("PVY1")
+        pvy2 = self._lat("PVY2")
+        pvy3 = self._lat("PVY3")
+        pvy4 = self._lat("PVY4")
+        sv_y = fz * (
+            (pvy1 + pvy2 * dfz) * lvy
+            + (pvy3 + pvy4 * dfz) * camber_rad
+        ) * lmuy
+
+        return abs(d_y) + abs(sv_y)
 
     def peak_longitudinal_force(
         self,
         normal_load_n: float,
         camber_rad: float = 0.0,
     ) -> float:
-        """Peak longitudinal force magnitude via PAC2002 closed-form |D_x|.
+        """Peak longitudinal force magnitude via PAC2002 asymptotic |D_x| + |SV_x|.
 
-        Mirrors ``peak_lateral_force`` for the longitudinal Magic
-        Formula: the peak of ``D * sin(C * atan(inner))`` is |D|.  When
-        transplanted PDX coefficients are present they are used; else
-        the ``longitudinal_force`` lateral-mu mirror is used so the two
-        functions stay self-consistent.
+        Fx = D·sin(C·atan(inner)) + SV; asymptotic peak magnitude is
+        |D| + |SV|.  Ignoring SV was the R2-era bug (agent audit): at
+        high Fz, SV can become comparable to D in magnitude (opposite
+        sign), which flips which side of the MF curve carries the
+        absolute peak.  At Fz=4Fz0 the corrected formula differs from
+        the prior |D| by ~3×.
         """
         fz = max(normal_load_n, 1.0)
         fz0 = self.fnomin * self._sc("LFZO")
         dfz = (fz - fz0) / fz0 if fz0 > 0 else 0.0
 
+        lmux = self._sc("LMUX")
+        lvx = self._sc("LVX")
+
         pdx1 = self._lon("PDX1")
         pdx2 = self._lon("PDX2")
         pdx3 = self._lon("PDX3")
         if pdx1 != 0.0:
-            mux = (
-                (pdx1 + pdx2 * dfz)
-                * (1.0 - pdx3 * camber_rad ** 2)
-                * self._sc("LMUX")
-            )
-        else:
-            pdy1 = self._lat("PDY1")
-            pdy2 = self._lat("PDY2")
-            pdy3 = self._lat("PDY3")
-            mux = (
-                abs((pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2))
-                * self._sc("LMUY")
-            )
-        return abs(mux * fz)
+            mux = (pdx1 + pdx2 * dfz) * (1.0 - pdx3 * camber_rad ** 2) * lmux
+            d_x = mux * fz
+
+            pvx1 = self._lon("PVX1")
+            pvx2 = self._lon("PVX2")
+            sv_x = fz * (pvx1 + pvx2 * dfz) * lvx * lmux
+
+            return abs(d_x) + abs(sv_x)
+
+        # Fallback: TTC USE_MODE=2 has no transplanted PDX — mirror the
+        # lateral mu so Fx envelope matches Fy.  No SV in the fallback.
+        pdy1 = self._lat("PDY1")
+        pdy2 = self._lat("PDY2")
+        pdy3 = self._lat("PDY3")
+        mux = abs(
+            (pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2)
+        ) * self._sc("LMUY")
+        return mux * fz
 
     # ------------------------------------------------------------------
     # Loaded radius

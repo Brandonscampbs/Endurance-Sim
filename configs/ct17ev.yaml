@@ -34,6 +34,10 @@ powertrain:
 
 battery:
   cell_type: "P50B"
+  cell_capacity_ah: 5.0  # Molicel P50B datasheet (5000 mAh nominal)
+  # Structural thermal mass scales roughly with cell count:
+  # CT-16EV 110S4P had 7.5 kJ/K (440 cells) → 100S4P (400 cells) ~6.8 kJ/K.
+  pack_structural_thermal_mass_kj_per_k: 6.8
   topology:
     series: 100
     parallel: 4

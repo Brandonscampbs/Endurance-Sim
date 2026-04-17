@@ -376,38 +376,60 @@ class VehicleDynamics:
     def max_traction_force(self, speed_ms: float) -> float:
         """Maximum drive force (N) from rear tires.
 
-        When tire and load-transfer models are available, returns the
-        sum of peak longitudinal force from the two rear tires under
-        mild acceleration load transfer (0.3 g forward).
+        NF-6: solve the traction-limit / load-transfer fixed point
+        self-consistently.  Rear-tire peak Fx depends on rear load,
+        which depends on longitudinal acceleration, which depends on
+        the drive force — i.e. a = F_drive / (m·g).  Iterate until
+        the acceleration implied by the returned force matches the
+        acceleration used to compute the load transfer.
 
         In legacy mode (no tire/load-transfer models), returns infinity
         so that the powertrain limit is the only constraint.
         """
         if self.tire_model is None or self.load_transfer is None:
             return float("inf")
-        _, _, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, 0.3)
-        return (
-            self.tire_model.peak_longitudinal_force(rl)
-            + self.tire_model.peak_longitudinal_force(rr)
-        )
+
+        mg = self.vehicle.mass_kg * GRAVITY_M_S2
+        long_g = 0.3  # initial guess
+        for _ in range(8):  # converges in 2-3 iters for physical values
+            _, _, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, long_g)
+            f_drive = (
+                self.tire_model.peak_longitudinal_force(rl)
+                + self.tire_model.peak_longitudinal_force(rr)
+            )
+            long_g_new = f_drive / mg if mg > 0 else long_g
+            if abs(long_g_new - long_g) < 1e-3:
+                break
+            long_g = long_g_new
+        return f_drive
 
     def max_braking_force(self, speed_ms: float) -> float:
         """Maximum braking force (N) from all four tires.
 
-        When tire and load-transfer models are available, returns the
-        sum of peak longitudinal force from all four tires under hard
-        braking load transfer (-1.0 g).
+        NF-6: self-consistent fixed point on decel-induced load transfer,
+        mirroring max_traction_force but over all four tires.  Decel is
+        always negative in the load-transfer sign convention (weight
+        shifts forward under braking).
 
         In legacy mode (no tire/load-transfer models), returns infinity
         so that there is no tire-limited braking constraint.
         """
         if self.tire_model is None or self.load_transfer is None:
             return float("inf")
-        fl, fr, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, -1.0)
-        return sum(
-            self.tire_model.peak_longitudinal_force(f)
-            for f in [fl, fr, rl, rr]
-        )
+
+        mg = self.vehicle.mass_kg * GRAVITY_M_S2
+        long_g = -1.0  # initial guess (hard braking)
+        for _ in range(8):
+            fl, fr, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, long_g)
+            f_brake = sum(
+                self.tire_model.peak_longitudinal_force(f)
+                for f in [fl, fr, rl, rr]
+            )
+            long_g_new = -f_brake / mg if mg > 0 else long_g
+            if abs(long_g_new - long_g) < 1e-3:
+                break
+            long_g = long_g_new
+        return f_brake
 
     # ------------------------------------------------------------------
     # Longitudinal acceleration

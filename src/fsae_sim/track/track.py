@@ -23,7 +23,9 @@ _GPS_POS_ACC_BAD: float = 200.0
 _GPS_RADIUS_STRAIGHT: float = 10_000.0
 
 # Bin size for segmenting the lap.
-_SEGMENT_BIN_M: float = 5.0
+# D-14: 0.5 m default. Smoother window (_SMOOTH_DISTANCE_M) is a fixed
+# physical distance, so finer segmentation doesn't change smoothing scale.
+_SEGMENT_BIN_M: float = 0.5
 
 # Rolling-median smoother physical distance (metres). Fixed 5 m window
 # retains hairpin peaks (~10-15 m arcs) while still suppressing per-sample

@@ -30,6 +30,23 @@ from fsae_sim.analysis.telemetry_analysis import (
 )
 
 
+# D-24: module-level action thresholds for ReplayStrategy.decide.
+# Post-normalization these line up with the calibration pipeline's
+# classifier in extract_per_segment_actions / PedalProfileStrategy:
+#   throttle: 5% pedal (Throttle Pos / 100 ≥ 0.05)
+#   brake:    2 bar line pressure (brake_raw / brake_max_pressure_bar
+#             with brake_max_pressure_bar=60 → ~0.033 fraction, but
+#             Replay normalizes by the recorded 99th percentile
+#             — see ReplayStrategy.from_aim_data — so a 5% brake
+#             fraction there corresponds to roughly the same "driver
+#             is actively braking" regime.)
+# Same constants are intentionally reused so a sim run and a
+# calibration pass over the same telemetry agree on what counts
+# as throttle vs brake vs coast.
+_THROTTLE_ACTION_THRESHOLD = 0.05
+_BRAKE_ACTION_THRESHOLD = 0.05
+
+
 class ReplayStrategy(DriverStrategy):
     """Replay recorded driver inputs from AiM telemetry through the force model.
 
@@ -166,9 +183,9 @@ class ReplayStrategy(DriverStrategy):
         throttle = float(np.clip(self._throttle_interp(d), 0.0, 1.0))
         brake = float(np.clip(self._brake_interp(d), 0.0, 1.0))
 
-        if brake > 0.05:
+        if brake > _BRAKE_ACTION_THRESHOLD:
             return ControlCommand(ControlAction.BRAKE, throttle_pct=0.0, brake_pct=brake)
-        elif throttle > 0.05:
+        elif throttle > _THROTTLE_ACTION_THRESHOLD:
             return ControlCommand(ControlAction.THROTTLE, throttle_pct=throttle, brake_pct=0.0)
         else:
             return ControlCommand(ControlAction.COAST, throttle_pct=0.0, brake_pct=0.0)
@@ -298,12 +315,17 @@ class CalibratedStrategy(DriverStrategy):
         self._segment_actions: list[tuple[ControlAction, float, float]] = [
             (ControlAction.COAST, 0.0, 0.0)
         ] * num_segments
-        for zone in zones:
+        # D-25: O(1) segment→zone index map.  -1 means "no zone covers
+        # this segment" (fallback behavior below matches the old linear
+        # scan's ValueError path at the call site).
+        self._segment_to_zone: np.ndarray = np.full(num_segments, -1, dtype=np.int32)
+        for z_pos, zone in enumerate(zones):
             for seg_idx in range(zone.segment_start, zone.segment_end + 1):
                 if 0 <= seg_idx < num_segments:
                     self._segment_actions[seg_idx] = (
                         zone.action, zone.intensity, zone.max_speed_ms,
                     )
+                    self._segment_to_zone[seg_idx] = z_pos
 
     @property
     def zones(self) -> list[DriverZone]:
@@ -334,12 +356,18 @@ class CalibratedStrategy(DriverStrategy):
             )
 
     def zone_for_segment(self, segment_idx: int) -> DriverZone:
-        """Return the zone containing the given segment index."""
+        """Return the zone containing the given segment index.
+
+        D-25: O(1) lookup via pre-computed ``_segment_to_zone`` index
+        array.  Behavior matches the prior linear scan: returns the
+        first zone covering ``idx``, or raises ``ValueError`` if no
+        zone covers it.
+        """
         idx = segment_idx % self._num_segments
-        for zone in self._zones:
-            if zone.segment_start <= idx <= zone.segment_end:
-                return zone
-        raise ValueError(f"No zone found for segment {idx}")
+        z_pos = int(self._segment_to_zone[idx])
+        if z_pos < 0:
+            raise ValueError(f"No zone found for segment {idx}")
+        return self._zones[z_pos]
 
     def to_dataframe(self) -> pd.DataFrame:
         """Export zone table as a DataFrame."""
