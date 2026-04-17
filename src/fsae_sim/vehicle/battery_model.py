@@ -66,6 +66,10 @@ class BatteryModel:
     CELL_MASS_KG = 0.070
     CELL_SPECIFIC_HEAT_J_PER_KG_K = 1000.0
 
+    # Coulombic efficiency on the charge (regen) direction.  Discharge
+    # is 100% by definition; charge loses ~1% to side reactions.
+    _COULOMBIC_EFFICIENCY: float = 0.99
+
     def __init__(self, config: BatteryConfig, cell_capacity_ah: float | None = None) -> None:
         """Initialize battery model.
 
@@ -601,9 +605,17 @@ class BatteryModel:
         Returns:
             (new_soc_pct, new_mean_cell_temp_c, pack_voltage_v)
         """
-        # Coulomb counting: SOC change
+        # Coulomb counting: SOC change.
+        # M4: apply ~99% coulombic efficiency on regen.  Li-ion packs
+        # don't recover 100% of the charge pushed into them — a small
+        # fraction is lost to side reactions.  Discharge is 100% by
+        # definition (electrons leaving the cell are counted).
         cell_current = pack_current_a / self.config.parallel
-        dsoc = -(cell_current * dt_s) / (self.cell_capacity_ah * 3600) * 100
+        if cell_current < 0.0:  # regen / charge
+            effective_current = cell_current * self._COULOMBIC_EFFICIENCY
+        else:
+            effective_current = cell_current
+        dsoc = -(effective_current * dt_s) / (self.cell_capacity_ah * 3600) * 100
         new_soc = float(np.clip(soc_pct + dsoc, 0.0, 100.0))
 
         # Pack voltage at updated SOC
