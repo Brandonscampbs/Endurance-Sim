@@ -1,0 +1,118 @@
+{
+  "legacy": {
+    "backend": "legacy",
+    "metrics": {
+      "Driving time": {
+        "telemetry": 1608.7500000000002,
+        "simulation": 80.20354542353448,
+        "error_pct": 95.01454263101573,
+        "passed": false
+      },
+      "Total distance": {
+        "telemetry": 22100.22779444426,
+        "simulation": 1005.0,
+        "error_pct": 95.45253556050383,
+        "passed": false
+      },
+      "SOC consumed": {
+        "telemetry": 34.0,
+        "simulation": 2.3438716498626775,
+        "error_pct": 93.10625985334507,
+        "passed": false
+      },
+      "Final cell temp": {
+        "telemetry": 38.0,
+        "simulation": 25.364646972581994,
+        "error_pct": 33.25092901952107,
+        "passed": false
+      },
+      "Mean pack voltage": {
+        "telemetry": 411.67540725407923,
+        "simulation": 442.70644643304735,
+        "error_pct": 7.537744211136778,
+        "passed": false
+      },
+      "Final pack voltage": {
+        "telemetry": 390.8,
+        "simulation": 444.6755473265373,
+        "error_pct": 13.785964003719878,
+        "passed": false
+      },
+      "Mean |pack current|": {
+        "telemetry": 18.58054392229992,
+        "simulation": 20.25667242582758,
+        "error_pct": 9.020879639137,
+        "passed": true
+      },
+      "Energy consumed (net)": {
+        "telemetry": 3.2708718370479173,
+        "simulation": 0.18606588273186866,
+        "error_pct": 94.31142851198352,
+        "passed": false
+      }
+    },
+    "overall_pass_count": 1,
+    "overall_total": 8,
+    "sim_time_s": 80.20354542353448,
+    "sim_final_soc": 92.65612835013732,
+    "sim_energy_kwh": 0.18606588273186866
+  },
+  "dynamics6dof": {
+    "backend": "dynamics6dof",
+    "metrics": {
+      "Driving time": {
+        "telemetry": 1608.7500000000002,
+        "simulation": 76.88792576955312,
+        "error_pct": 95.22064175480634,
+        "passed": false
+      },
+      "Total distance": {
+        "telemetry": 22100.22779444426,
+        "simulation": 1005.0,
+        "error_pct": 95.45253556050383,
+        "passed": false
+      },
+      "SOC consumed": {
+        "telemetry": 34.0,
+        "simulation": 2.3456668824229325,
+        "error_pct": 93.10097975757961,
+        "passed": false
+      },
+      "Final cell temp": {
+        "telemetry": 38.0,
+        "simulation": 25.379529559691402,
+        "error_pct": 33.211764316601574,
+        "passed": false
+      },
+      "Mean pack voltage": {
+        "telemetry": 411.67540725407923,
+        "simulation": 442.41335395391434,
+        "error_pct": 7.466549169128327,
+        "passed": false
+      },
+      "Final pack voltage": {
+        "telemetry": 390.8,
+        "simulation": 444.27014452343553,
+        "error_pct": 13.682227360142148,
+        "passed": false
+      },
+      "Mean |pack current|": {
+        "telemetry": 18.58054392229992,
+        "simulation": 21.056209462007814,
+        "error_pct": 13.323966995049375,
+        "passed": true
+      },
+      "Energy consumed (net)": {
+        "telemetry": 3.2708718370479173,
+        "simulation": 0.18605361412854002,
+        "error_pct": 94.31180359862526,
+        "passed": false
+      }
+    },
+    "overall_pass_count": 1,
+    "overall_total": 8,
+    "sim_time_s": 76.88792576955312,
+    "sim_final_soc": 92.65433311757707,
+    "sim_energy_kwh": 0.18605361412854002
+  }
+}
