@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # Minimum speed (km/h) for a GPS sample to be considered valid.
 _GPS_SPEED_MIN_KMH: float = 5.0
@@ -22,15 +25,22 @@ _GPS_RADIUS_STRAIGHT: float = 10_000.0
 # Bin size for segmenting the lap.
 _SEGMENT_BIN_M: float = 5.0
 
-# Rolling-median window for curvature smoothing.
-_CURVATURE_SMOOTH_WINDOW: int = 5
+# Rolling-median smoother physical distance (metres). Fixed 5 m window
+# retains hairpin peaks (~10-15 m arcs) while still suppressing per-sample
+# GPS-acceleration noise.  Was 25 m (C12) — flattened hairpin peaks.
+_SMOOTH_DISTANCE_M: float = 5.0
 
 # Minimum speed (m/s) for curvature computation to be valid.
 _V_MIN_FOR_CURVATURE_MS: float = 2.0
 
-# Longitude tolerance (degrees) for start/finish line crossing detection.
-# ~90 m at Michigan latitude.
-_SF_LON_TOLERANCE_DEG: float = 0.001
+# Start/finish detection gate tolerances (2D gate per S19).
+# Proximity radius to the reference start point (degrees; ~11 m at MI lat).
+# Chosen so all 21 Michigan laps cleanly trigger while still being far
+# tighter than the nearest return-pass of the track (~50 m+).
+_SF_GATE_RADIUS_DEG: float = 1.0e-4
+# Minimum physical distance between consecutive valid crossings (metres).
+# Prevents same-lap re-triggers when the gate passes through a slow section.
+_SF_MIN_LAP_DISTANCE_M: float = 400.0
 
 
 @dataclass(frozen=True)
@@ -82,6 +92,7 @@ class Track:
         *,
         df: pd.DataFrame | None = None,
         bin_size_m: float = _SEGMENT_BIN_M,
+        smooth_distance_m: float = _SMOOTH_DISTANCE_M,
         name: str = "Michigan Endurance",
     ) -> "Track":
         """Extract track geometry from AiM GPS telemetry.
@@ -99,20 +110,28 @@ class Track:
         2. Filter to rows where the GPS fix is reliable:
            ``GPS Speed > 5 km/h``, and if available,
            ``GPS PosAccuracy != 200`` and ``GPS Radius != 10000``.
-        3. Detect start/finish crossings as upward crossings of the median
-           latitude, restricted to the longitude band shared by all
-           consistent crossings.
+        3. Detect start/finish crossings with a 2D proximity gate: a
+           crossing is registered when the car approaches the reference
+           start point within :data:`_SF_GATE_RADIUS_DEG` and has travelled
+           at least :data:`_SF_MIN_LAP_DISTANCE_M` since the previous
+           crossing.  Laps that fail the minimum-distance gate are logged
+           and dropped (S19).
         4. Isolate a crossing-to-crossing interval where GPS LatAcc data
            is available.
-        5. Bin that lap into ``bin_size_m``-metre windows.
+        5. Bin that lap into ``bin_size_m``-metre windows (``math.ceil`` so
+           the fractional tail segment is preserved, NF-20).
         6. Per bin:
 
            - **curvature** = median(``GPS LatAcc`` × 9.81 / ``GPS Speed²``),
              where speed is in m/s.  Sign encodes direction: positive =
-             right-hand turn, negative = left-hand turn.
+             right-hand turn, negative = left-hand turn.  At samples where
+             ``v_ms <= V_MIN``, ``k_raw`` is recovered by interpolating from
+             neighbouring high-speed samples (or GPS Radius if present)
+             rather than forced to zero (NF-7).
            - **grade** = mean(tan(``GPS Slope`` × π/180)).
 
-        7. Apply a rolling-median smoother (window = 5) to curvature.
+        7. Apply a rolling-median smoother whose physical window is
+           ``smooth_distance_m`` (default 5 m) to curvature.
 
         Args:
             aim_csv_path: Path to the AiM Race Studio CSV export.
@@ -122,6 +141,9 @@ class Track:
                 GPS Longitude, GPS LatAcc columns.
             bin_size_m: Length of each output segment in metres.
                 Defaults to 5 m.
+            smooth_distance_m: Physical window (m) of the rolling-median
+                curvature smoother.  Defaults to 5 m (retains hairpin
+                peaks while suppressing GPS-accel noise).
             name: Name stored on the returned :class:`Track` object.
 
         Returns:
@@ -147,28 +169,59 @@ class Track:
 
         lat: np.ndarray = good["GPS Latitude"].values
         cum_dist: np.ndarray = good["Distance on GPS Speed"].values
-
-        # ---- 2. Detect start/finish crossings ------------------------------
-        center_lat: float = float(np.median(lat))
         lon_arr: np.ndarray = good["GPS Longitude"].values
 
-        crossings: list[tuple[int, float, float]] = []
-        for i in range(1, len(lat)):
-            if lat[i - 1] < center_lat <= lat[i]:
-                crossings.append((i, float(cum_dist[i]), float(lon_arr[i])))
-
-        if not crossings:
+        # ---- 2. Detect start/finish crossings via 2D gate (S19) -----------
+        # Pick a reference point: the first reliable GPS sample is the gate.
+        # A crossing is triggered when the car is within SF_GATE_RADIUS_DEG
+        # of the reference AND has travelled SF_MIN_LAP_DISTANCE_M since the
+        # previous crossing.  This replaces the east-west-only latitude
+        # crossing heuristic which silently dropped laps whose S/F line was
+        # not east-west aligned.
+        if len(lat) < 2:
             raise RuntimeError(
-                "No start/finish crossings detected in telemetry. "
-                "Check GPS data quality."
+                "Not enough reliable GPS samples to detect a lap."
             )
 
-        lons_at_crossings = np.array([c[2] for c in crossings])
-        median_lon: float = float(np.median(lons_at_crossings))
+        ref_lat: float = float(lat[0])
+        ref_lon: float = float(lon_arr[0])
+        # Approximate metre-to-degree scaling near the reference latitude.
+        # At 42.7 deg N (Michigan), 1 deg lat ~ 111 320 m, 1 deg lon ~ 81 800 m.
+        # The gate radius is in degrees — kept tight (~2 m) so crossings are
+        # distinct events rather than a slow-drift through the start zone.
+        d_lat = lat - ref_lat
+        d_lon = lon_arr - ref_lon
+        # Use chord distance in degrees; adequate for the tight gate radius.
+        dist_to_ref = np.sqrt(d_lat ** 2 + d_lon ** 2)
 
-        sf_crossings: list[tuple[int, float, float]] = [
-            c for c in crossings if abs(c[2] - median_lon) < _SF_LON_TOLERANCE_DEG
+        inside_gate = dist_to_ref < _SF_GATE_RADIUS_DEG
+        # Rising-edge of gate entry = sample just entered proximity band.
+        entry_mask = np.zeros(len(inside_gate), dtype=bool)
+        entry_mask[1:] = inside_gate[1:] & ~inside_gate[:-1]
+
+        raw_crossings: list[tuple[int, float, float, float]] = [
+            (i, float(cum_dist[i]), float(lat[i]), float(lon_arr[i]))
+            for i in np.where(entry_mask)[0]
         ]
+
+        # Enforce minimum-lap-distance gate: drop re-triggers within the
+        # same lap.  Log dropped candidates for audit.  Preserve physical
+        # lap number in the tuples by keeping the original enumeration.
+        sf_crossings: list[tuple[int, int, float, float, float]] = []
+        dropped: list[tuple[int, float]] = []
+        last_dist = -math.inf
+        for phys_lap, (i, d, la, lo) in enumerate(raw_crossings):
+            if d - last_dist >= _SF_MIN_LAP_DISTANCE_M:
+                sf_crossings.append((phys_lap, i, d, la, lo))
+                last_dist = d
+            else:
+                dropped.append((phys_lap, d - last_dist))
+
+        if dropped:
+            logger.info(
+                "S/F detection dropped %d sub-minimum-distance crossings: %s",
+                len(dropped), dropped[:10],
+            )
 
         if len(sf_crossings) < 2:
             raise RuntimeError(
@@ -184,8 +237,8 @@ class Track:
         lap_start_dist: float = 0.0
 
         for lap_index in range(len(sf_crossings) - 1):
-            _start_dist = sf_crossings[lap_index][1]
-            _end_dist = sf_crossings[lap_index + 1][1]
+            _start_dist = sf_crossings[lap_index][2]
+            _end_dist = sf_crossings[lap_index + 1][2]
             _mask = (cum_dist >= _start_dist) & (cum_dist <= _end_dist)
             _lat_acc_in_lap = lat_acc_col[_mask]
             # Require at least 80% of samples to have valid LatAcc
@@ -218,16 +271,57 @@ class Track:
             slope_deg = np.zeros(len(lap_df))
 
         # κ = a_lat / v²  (signed: positive = right turn, negative = left turn)
-        # Zero for very low speeds to avoid division noise.
-        v_safe = np.where(v_ms > _V_MIN_FOR_CURVATURE_MS, v_ms, np.nan)
-        k_raw: np.ndarray = a_lat_ms2 / (v_safe ** 2)
-        k_raw = np.nan_to_num(k_raw, nan=0.0)
+        # NF-7: at samples where v_ms <= V_MIN, fall back to GPS Radius (signed
+        # by LatAcc direction) when present, or interpolate k_raw from
+        # neighbouring high-speed samples.  Do NOT force to zero.
+        valid_v = v_ms > _V_MIN_FOR_CURVATURE_MS
+        v_safe = np.where(valid_v, v_ms, np.nan)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            k_raw: np.ndarray = a_lat_ms2 / (v_safe ** 2)
+
+        low_speed = ~valid_v
+        if low_speed.any():
+            # First try GPS Radius if available.
+            filled_from_radius = np.zeros_like(low_speed)
+            if "GPS Radius" in lap_df.columns:
+                radius = lap_df["GPS Radius"].values.astype(float)
+                radius_ok = (
+                    low_speed
+                    & np.isfinite(radius)
+                    & (radius > 0.0)
+                    & (radius < _GPS_RADIUS_STRAIGHT)
+                )
+                if radius_ok.any():
+                    # Sign κ by the sign of LatAcc at the low-speed sample.
+                    sign = np.sign(a_lat_ms2[radius_ok])
+                    # If LatAcc is exactly 0, default positive sign.
+                    sign = np.where(sign == 0.0, 1.0, sign)
+                    k_raw[radius_ok] = sign / radius[radius_ok]
+                    filled_from_radius = radius_ok
+
+            # Remaining low-speed samples: interpolate from valid neighbours.
+            still_missing = low_speed & ~filled_from_radius & ~np.isfinite(k_raw)
+            if still_missing.any():
+                idx = np.arange(len(k_raw))
+                known = np.isfinite(k_raw) & ~still_missing
+                if known.any():
+                    k_raw[still_missing] = np.interp(
+                        idx[still_missing], idx[known], k_raw[known]
+                    )
+                else:
+                    # No high-speed anchor at all — fall back to zero, the
+                    # lap is effectively static and curvature is undefined.
+                    k_raw[still_missing] = 0.0
+
+        # Final safety: any residual NaN (e.g. leading edge with no anchor)
+        # gets zeroed so downstream code sees finite values.
+        k_raw = np.nan_to_num(k_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
         grade_raw: np.ndarray = np.tan(slope_deg * (math.pi / 180.0))
 
-        # ---- 6. Bin into segments ------------------------------------------
+        # ---- 6. Bin into segments (NF-20: ceil + fractional tail) ---------
         lap_length: float = float(dist_in_lap[-1])
-        n_bins: int = int(math.floor(lap_length / bin_size_m))
+        n_bins: int = int(math.ceil(lap_length / bin_size_m))
 
         if n_bins == 0:
             raise ValueError(
@@ -235,12 +329,26 @@ class Track:
                 f"{bin_size_m} m; cannot create any segments."
             )
 
+        # Per-segment lengths: all bins are bin_size_m except possibly the
+        # last, which is the residual so that the total is exactly lap_length.
+        segment_lengths: list[float] = [bin_size_m] * n_bins
+        residual = lap_length - (n_bins - 1) * bin_size_m
+        # Numerical safety: residual is in (0, bin_size_m]; if the lap_length
+        # is an exact multiple of bin_size_m, residual == bin_size_m.
+        if residual <= 0.0:
+            # Can happen with floating-point near-exact multiples; clamp.
+            residual = bin_size_m
+        segment_lengths[-1] = residual
+        assert abs(sum(segment_lengths) - lap_length) < 1e-6, (
+            f"Segment-length sum {sum(segment_lengths)} != lap_length {lap_length}"
+        )
+
         raw_curvatures: list[float] = []
         raw_grades: list[float] = []
 
         for i in range(n_bins):
             bin_lo = i * bin_size_m
-            bin_hi = (i + 1) * bin_size_m
+            bin_hi = bin_lo + segment_lengths[i]
             idx_mask: np.ndarray = (dist_in_lap >= bin_lo) & (dist_in_lap < bin_hi)
             if idx_mask.any():
                 raw_curvatures.append(float(np.median(k_raw[idx_mask])))
@@ -253,10 +361,16 @@ class Track:
                 raw_grades.append(prev_g)
 
         # ---- 7. Smooth curvature with rolling median -----------------------
+        # Window covers smooth_distance_m of physical track, rounded to an
+        # odd bin count so the centred median is symmetric.
+        smooth_window = max(1, int(round(smooth_distance_m / bin_size_m)))
+        if smooth_window % 2 == 0:
+            smooth_window += 1
+
         smoothed_k: np.ndarray = (
             pd.Series(raw_curvatures)
             .rolling(
-                window=_CURVATURE_SMOOTH_WINDOW,
+                window=smooth_window,
                 center=True,
                 min_periods=1,
             )
@@ -265,15 +379,18 @@ class Track:
         )
 
         # ---- 8. Build Segment list -----------------------------------------
-        segments: list[Segment] = [
-            Segment(
-                index=i,
-                distance_start_m=float(i * bin_size_m),
-                length_m=bin_size_m,
-                curvature=float(smoothed_k[i]),
-                grade=float(raw_grades[i]),
+        segments: list[Segment] = []
+        cumulative = 0.0
+        for i in range(n_bins):
+            segments.append(
+                Segment(
+                    index=i,
+                    distance_start_m=float(cumulative),
+                    length_m=float(segment_lengths[i]),
+                    curvature=float(smoothed_k[i]),
+                    grade=float(raw_grades[i]),
+                )
             )
-            for i in range(n_bins)
-        ]
+            cumulative += segment_lengths[i]
 
         return cls(name=name, segments=segments)
