@@ -24,6 +24,7 @@ from fsae_sim.analysis.telemetry_analysis import (
     DriverZone,
     extract_per_segment_actions,
     collapse_to_zones,
+    _detect_lap_boundaries_safe,
 )
 
 
@@ -89,8 +90,15 @@ class ReplayStrategy(DriverStrategy):
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
 
+        # S18: preserve regen. Previously clipped to [0, +limit] which
+        # silently deleted negative torque commands (coast-regen). Keep
+        # symmetric [-limit, +limit] so replay drives the true recorded
+        # electrical profile.
         inverter_torque_limit = 85.0
-        torque = np.clip(lap["LVCU Torque Req"].values, 0.0, inverter_torque_limit)
+        torque = np.clip(
+            lap["LVCU Torque Req"].values,
+            -inverter_torque_limit, inverter_torque_limit,
+        )
 
         return cls(dist, throttle, brake, torque, lap_distance_m, wrap=True)
 
@@ -120,8 +128,12 @@ class ReplayStrategy(DriverStrategy):
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
 
+        # S18: preserve regen (see from_aim_data).
         inverter_torque_limit = 85.0
-        torque = np.clip(clean["LVCU Torque Req"].values, 0.0, inverter_torque_limit)
+        torque = np.clip(
+            clean["LVCU Torque Req"].values,
+            -inverter_torque_limit, inverter_torque_limit,
+        )
 
         mean_torque = float(np.mean(torque))
 
@@ -273,7 +285,14 @@ class CalibratedStrategy(DriverStrategy):
         self.name = name
         self._zones = list(zones)
         self._num_segments = num_segments
-        self._segment_intensities = segment_intensities
+        # Kept for diagnostic/inspection use only. Audit C13: per-segment
+        # intensities MUST NOT override zone intensity at runtime — the
+        # driver brief (`to_driver_brief`) and sim `decide()` must agree,
+        # and both report zone-level intensity. Per-segment data feeds
+        # zone aggregation upstream (see `from_telemetry`).
+        self._segment_intensities = (
+            segment_intensities.copy() if segment_intensities is not None else None
+        )
 
         # Build flat lookup: segment_idx -> (action, intensity, max_speed_ms)
         self._segment_actions: list[tuple[ControlAction, float, float]] = [
@@ -285,16 +304,6 @@ class CalibratedStrategy(DriverStrategy):
                     self._segment_actions[seg_idx] = (
                         zone.action, zone.intensity, zone.max_speed_ms,
                     )
-
-        # Override with per-segment intensities when available.
-        # Zones still define action type and structure; per-segment
-        # intensities capture the real driver's fine-grained modulation.
-        if segment_intensities is not None:
-            for i in range(num_segments):
-                action, _, max_speed = self._segment_actions[i]
-                self._segment_actions[i] = (
-                    action, float(segment_intensities[i]), max_speed,
-                )
 
     @property
     def zones(self) -> list[DriverZone]:
@@ -373,14 +382,13 @@ class CalibratedStrategy(DriverStrategy):
                 ))
             else:
                 new_zones.append(z)
-        # Carry per-segment intensities, update overridden zone's segments
-        new_seg_intensities = None
-        if self._segment_intensities is not None:
-            new_seg_intensities = self._segment_intensities.copy()
-            zone = next(z for z in self._zones if z.zone_id == zone_id)
-            for seg_idx in range(zone.segment_start, zone.segment_end + 1):
-                if 0 <= seg_idx < self._num_segments:
-                    new_seg_intensities[seg_idx] = intensity
+        # Carry per-segment intensities (diagnostic only — not used at
+        # runtime after C13 fix). Copy so the derived strategy doesn't
+        # alias the original's array.
+        new_seg_intensities = (
+            self._segment_intensities.copy()
+            if self._segment_intensities is not None else None
+        )
         return CalibratedStrategy(new_zones, self._num_segments, name=self.name,
                                   segment_intensities=new_seg_intensities)
 
@@ -391,6 +399,7 @@ class CalibratedStrategy(DriverStrategy):
         track: Track,
         *,
         laps: list[int] | None = None,
+        holdout_laps: list[int] | None = None,
         throttle_col: str = "Throttle Pos",
         front_brake_col: str = "FBrakePressure",
         rear_brake_col: str = "RBrakePressure",
@@ -405,10 +414,41 @@ class CalibratedStrategy(DriverStrategy):
 
         Samples telemetry at each track segment midpoint, classifies
         actions, and collapses into coachable zones.
+
+        Args:
+            laps: explicit lap indices (0-based) to calibrate on. None =
+                auto-select non-outlier laps.
+            holdout_laps: S9 — lap indices to EXCLUDE from calibration so
+                they can be used as an unseen validation set. Applied
+                after `laps` selection (or auto-selection). Prevents the
+                same laps being used to both fit and validate.
         """
+        effective_laps = laps
+        if holdout_laps is not None:
+            holdout_set = set(holdout_laps)
+            # Resolve the candidate lap set: if the caller didn't pick
+            # explicit laps, subtract holdouts from "all laps" so the
+            # auto-selector inside `extract_per_segment_actions` sees a
+            # filtered list. We pass positive indices; the helper accepts
+            # a concrete `laps` list.
+            if laps is not None:
+                effective_laps = [i for i in laps if i not in holdout_set]
+            else:
+                # Determine lap count to build the complement.
+                boundaries = _detect_lap_boundaries_safe(aim_df)
+                if boundaries:
+                    effective_laps = [
+                        i for i in range(len(boundaries)) if i not in holdout_set
+                    ]
+            if effective_laps is not None and len(effective_laps) == 0:
+                raise ValueError(
+                    "holdout_laps removed every candidate lap; "
+                    "nothing left to calibrate on."
+                )
+
         seg_actions = extract_per_segment_actions(
             aim_df, track,
-            laps=laps,
+            laps=effective_laps,
             throttle_threshold=throttle_threshold,
             brake_threshold=brake_threshold,
         )
