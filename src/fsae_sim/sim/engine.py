@@ -278,8 +278,26 @@ class SimulationEngine:
                             cmd.throttle_pct, motor_rpm, bms_current_limit,
                         )
                 elif cmd.action == ControlAction.BRAKE:
-                    max_torque = self.powertrain.max_motor_torque(motor_rpm)
-                    motor_torque = -cmd.brake_pct * max_torque
+                    # D-16: derive the regen motor torque from the
+                    # *tire-clipped* wheel force, not from the raw brake
+                    # command × max torque.  The regen_f value above
+                    # was already clamped to the tire grip envelope via
+                    # max_braking_force; using -cmd.brake_pct × max_torque
+                    # here would credit the pack with energy the tires
+                    # couldn't actually apply.
+                    #
+                    # Inverse of wheel_torque / wheel_force, with sign
+                    # preserved:
+                    #   F_wheel = T_motor · gear_ratio · η_gearbox / r
+                    #   T_motor = F_wheel · r / (gear_ratio · η_gearbox)
+                    # regen_f is negative (decelerating); the resulting
+                    # motor_torque is also negative (regen).
+                    gr = self.powertrain.config.gear_ratio
+                    eta_g = self.powertrain._GEARBOX_EFFICIENCY
+                    motor_torque = (
+                        regen_f * self.powertrain.TIRE_RADIUS_M
+                        / (gr * eta_g)
+                    )
                 else:
                     motor_torque = 0.0
 
