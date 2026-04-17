@@ -41,8 +41,8 @@ def ct16ev_battery_config():
 def calibrated_model(ct16ev_battery_config, voltt_cell_path):
     """Battery model calibrated against 2025 Voltt cell data."""
     df = load_voltt_csv(voltt_cell_path)
-    model = BatteryModel(ct16ev_battery_config, cell_capacity_ah=4.5)
-    model.calibrate(df)
+    model = BatteryModel(ct16ev_battery_config)
+    model.calibrate_from_voltt(df)
     return model
 
 
@@ -62,7 +62,7 @@ class TestBatteryModelInit:
         assert calibrated_model.calibrated
 
     def test_pack_capacity(self, ct16ev_battery_config):
-        model = BatteryModel(ct16ev_battery_config, cell_capacity_ah=4.5)
+        model = BatteryModel(ct16ev_battery_config)
         assert model.pack_capacity_ah == 18.0
 
 

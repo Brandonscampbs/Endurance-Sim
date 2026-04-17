@@ -83,8 +83,8 @@ def main():
 
     # ── Run simulation ──
     print("\n[5/6] Running 22-lap simulation...")
-    battery = BatteryModel(config.battery, cell_capacity_ah=4.5)
-    battery.calibrate(voltt_df)
+    battery = BatteryModel(config.battery)
+    battery.calibrate_from_voltt(voltt_df)
     battery.calibrate_pack_from_telemetry(aim_df)
 
     engine = SimulationEngine(config, track, strategy, battery)
