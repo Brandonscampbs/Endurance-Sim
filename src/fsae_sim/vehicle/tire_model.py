@@ -61,6 +61,12 @@ class PacejkaTireModel:
         - Key-value lines: ``KEY = value $comment`` or ``KEY = value``.
         - Comment lines start with ``!`` or ``$``.
         - Values may be numeric or quoted strings (we only keep numerics).
+
+        NF-4: Non-numeric values that fail to parse are collected and
+        emitted as a single ``UserWarning`` at end of parse so typos in
+        coefficient files are not silently swallowed.  Required scalar
+        keys (FNOMIN, UNLOADED_RADIUS, VERTICAL_STIFFNESS) are asserted
+        positive.
         """
         text = self.tir_path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
@@ -96,6 +102,9 @@ class PacejkaTireModel:
             r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\s$!]+)"
         )
 
+        # NF-4: track keys whose values failed to parse as float
+        skipped: list[tuple[str, str, str]] = []  # (section, key, raw_val)
+
         for line in lines:
             stripped = line.strip()
 
@@ -124,7 +133,25 @@ class PacejkaTireModel:
                     value = float(val_str)
                     targets[target_key][key] = value
                 except ValueError:
-                    pass  # skip non-numeric values
+                    # NF-4: record skipped non-numeric values for end-of-parse warning.
+                    # Skip known-string keys (FILE_TYPE, TYRESIDE, UNITS) silently.
+                    if key not in {
+                        "FILE_TYPE",
+                        "FILE_VERSION",
+                        "FILE_FORMAT",
+                        "TYRESIDE",
+                        "LONGVL",
+                        "LENGTH",
+                        "FORCE",
+                        "ANGLE",
+                        "MASS",
+                        "TIME",
+                        "PROPERTY_FILE_FORMAT",
+                        "TEST_CONDITIONS",
+                        "USER_SUB_ID",
+                        "COMMENT",
+                    }:
+                        skipped.append((section, key, val_str))
 
         # Assign scalar parameters
         self.fnomin = _vertical.get("FNOMIN", 0.0)
@@ -136,6 +163,35 @@ class PacejkaTireModel:
         self.longitudinal = _longitudinal
         self.scaling = _scaling
         self.loaded_radius_coeffs = _loaded_radius
+
+        # NF-4: emit a single warning for all swallowed non-numeric values.
+        if skipped:
+            details = ", ".join(
+                f"[{sec}] {key}={val!r}" for sec, key, val in skipped[:10]
+            )
+            warnings.warn(
+                f"PacejkaTireModel: {len(skipped)} non-numeric coefficient "
+                f"value(s) skipped while parsing {self.tir_path.name}: "
+                f"{details}{' ...' if len(skipped) > 10 else ''}",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # NF-4: assert required scalar parameters are positive.  A missing
+        # or zero value here would produce silent divide-by-zero or a
+        # zero-radius tire in downstream physics; fail loud instead.
+        assert self.fnomin > 0.0, (
+            f"PacejkaTireModel({self.tir_path.name}): "
+            f"FNOMIN must be > 0, got {self.fnomin}"
+        )
+        assert self.unloaded_radius > 0.0, (
+            f"PacejkaTireModel({self.tir_path.name}): "
+            f"UNLOADED_RADIUS must be > 0, got {self.unloaded_radius}"
+        )
+        assert self.vertical_stiffness > 0.0, (
+            f"PacejkaTireModel({self.tir_path.name}): "
+            f"VERTICAL_STIFFNESS must be > 0, got {self.vertical_stiffness}"
+        )
 
     # ------------------------------------------------------------------
     # Helper: coefficient lookup with default
@@ -218,7 +274,11 @@ class PacejkaTireModel:
 
         pky1_fz0 = pky1 * fz0
         pky2_fz0 = pky2 * fz0
-        sin_arg = 2.0 * math.atan(fz / pky2_fz0) if abs(pky2_fz0) > 1e-9 else 0.0
+        # NF-18: PAC2002 expects |PKY2| in the denominator.  Without abs(),
+        # a negative PKY2 (the usual sign) flips the atan() and the
+        # cornering-stiffness sign, breaking the lateral-force sign.
+        denom_pky2 = abs(pky2_fz0)
+        sin_arg = 2.0 * math.atan(fz / denom_pky2) if denom_pky2 > 1e-9 else 0.0
         kya = (
             pky1_fz0
             * math.sin(sin_arg)
@@ -252,7 +312,7 @@ class PacejkaTireModel:
         # Shifted slip angle
         alpha_star = slip_angle_rad + shy
 
-        # Curvature factor (ey), clamped <= 1.0
+        # Curvature factor (ey), symmetrically clamped to [-1, 1] (NF-35)
         pey1 = self._lat("PEY1")
         pey2 = self._lat("PEY2")
         pey3 = self._lat("PEY3")
@@ -261,7 +321,7 @@ class PacejkaTireModel:
         ey = (pey1 + pey2 * dfz) * (
             1.0 - (pey3 + pey4 * camber_rad) * sign_a
         ) * ley
-        ey = min(ey, 1.0)
+        ey = max(-1.0, min(ey, 1.0))
 
         # Magic Formula: Fy = D * sin(C * atan(B*x - E*(B*x - atan(B*x)))) + SV
         bx = by * alpha_star
@@ -285,6 +345,10 @@ class PacejkaTireModel:
         Uses real longitudinal coefficients (PCX1, PDX1, PKX1, etc.)
         transplanted from TTC Round 6 R25B data and scaled to match
         the LC0's lateral grip envelope.
+
+        When PDX1 is zero (TTC USE_MODE=2 lateral-only data), falls back
+        to a symmetric mirror of the lateral peak-mu envelope so Fx
+        remains physically reasonable rather than identically zero.
 
         Args:
             slip_ratio: Longitudinal slip ratio (-1..1). Positive = driving.
@@ -313,49 +377,84 @@ class PacejkaTireModel:
         pdx1 = self._lon("PDX1")
         pdx2 = self._lon("PDX2")
         pdx3 = self._lon("PDX3")
-        mux = (pdx1 + pdx2 * dfz) * (1.0 - pdx3 * camber_rad ** 2) * lmux
 
-        # Longitudinal slip stiffness (kxk)
-        pkx1 = self._lon("PKX1")
-        pkx2 = self._lon("PKX2")
-        pkx3 = self._lon("PKX3")
-        kxk = fz * (pkx1 + pkx2 * dfz) * math.exp(pkx3 * dfz) * lkx
+        if pdx1 != 0.0:
+            # Orthodox PAC2002 path -- use transplanted PDX/PKX/PCX data.
+            mux = (pdx1 + pdx2 * dfz) * (1.0 - pdx3 * camber_rad ** 2) * lmux
 
-        # Shape factor (cx)
-        pcx1 = self._lon("PCX1")
-        cx = pcx1 * lcx
+            pkx1 = self._lon("PKX1")
+            pkx2 = self._lon("PKX2")
+            pkx3 = self._lon("PKX3")
+            kxk = fz * (pkx1 + pkx2 * dfz) * math.exp(pkx3 * dfz) * lkx
 
-        # Peak force and stiffness factor (bx)
-        dx = mux * fz
-        bx = kxk / (cx * dx + 1e-6)
+            pcx1 = self._lon("PCX1")
+            cx = pcx1 * lcx
 
-        # Horizontal shift (shx)
-        phx1 = self._lon("PHX1")
-        phx2 = self._lon("PHX2")
-        shx = (phx1 + phx2 * dfz) * lhx
+            dx = mux * fz
+            bx = kxk / (cx * dx + 1e-6)
 
-        # Vertical shift (svx)
-        pvx1 = self._lon("PVX1")
-        pvx2 = self._lon("PVX2")
-        svx = fz * (pvx1 + pvx2 * dfz) * lvx * lmux
+            phx1 = self._lon("PHX1")
+            phx2 = self._lon("PHX2")
+            shx = (phx1 + phx2 * dfz) * lhx
 
-        # Shifted slip ratio
-        kappa_x = slip_ratio + shx
+            pvx1 = self._lon("PVX1")
+            pvx2 = self._lon("PVX2")
+            svx = fz * (pvx1 + pvx2 * dfz) * lvx * lmux
 
-        # Curvature factor (ex), clamped <= 1.0
-        pex1 = self._lon("PEX1")
-        pex2 = self._lon("PEX2")
-        pex3 = self._lon("PEX3")
-        pex4 = self._lon("PEX4")
-        sign_k = 1.0 if kappa_x >= 0.0 else -1.0
-        ex = (pex1 + pex2 * dfz + pex3 * dfz ** 2) * (1.0 - pex4 * sign_k) * lex
-        ex = min(ex, 1.0)
+            kappa_x = slip_ratio + shx
 
-        # Magic Formula: Fx = Dx * sin(Cx * atan(Bx*k - Ex*(Bx*k - atan(Bx*k)))) + SVx
-        bk = bx * kappa_x
+            pex1 = self._lon("PEX1")
+            pex2 = self._lon("PEX2")
+            pex3 = self._lon("PEX3")
+            pex4 = self._lon("PEX4")
+            sign_k = 1.0 if kappa_x >= 0.0 else -1.0
+            ex = (pex1 + pex2 * dfz + pex3 * dfz ** 2) * (1.0 - pex4 * sign_k) * lex
+            # NF-35: symmetric clamp
+            ex = max(-1.0, min(ex, 1.0))
+
+            bk = bx * kappa_x
+            inner = bk - ex * (bk - math.atan(bk))
+            fx = dx * math.sin(cx * math.atan(inner)) + svx
+            return fx
+
+        # Fallback: TTC USE_MODE=2 -- mirror the lateral Magic Formula using
+        # |PDY| for peak mu so Fx has the same grip envelope as Fy.  No
+        # horizontal/vertical shift; symmetric about zero slip.
+        pdy1 = self._lat("PDY1")
+        pdy2 = self._lat("PDY2")
+        pdy3 = self._lat("PDY3")
+        mux = abs((pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2)) * self._sc("LMUY")
+
+        pky1 = self._lat("PKY1")
+        pky2 = self._lat("PKY2")
+        pky3 = self._lat("PKY3")
+        pky1_fz0 = pky1 * fz0
+        pky2_fz0 = pky2 * fz0
+        # NF-18: divide-protected absolute denominator.
+        denom_pky2 = abs(pky2_fz0)
+        sin_arg = 2.0 * math.atan(fz / denom_pky2) if denom_pky2 > 1e-9 else 0.0
+        kx = abs(
+            pky1_fz0
+            * math.sin(sin_arg)
+            * (1.0 - pky3 * abs(camber_rad))
+            * lfzo
+            * self._sc("LKY")
+        )
+
+        pcy1 = self._lat("PCY1")
+        cx = pcy1 * self._sc("LCY")
+        denom = cx * mux * fz + 1e-6
+        bx_coeff = kx / denom
+
+        pey1 = self._lat("PEY1")
+        pey2 = self._lat("PEY2")
+        ex = (pey1 + pey2 * dfz) * self._sc("LEY")
+        # NF-35: symmetric clamp
+        ex = max(-1.0, min(ex, 1.0))
+
+        bk = bx_coeff * slip_ratio
         inner = bk - ex * (bk - math.atan(bk))
-        fx = dx * math.sin(cx * math.atan(inner)) + svx
-
+        fx = mux * fz * math.sin(cx * math.atan(inner))
         return fx
 
     # ------------------------------------------------------------------
@@ -378,15 +477,6 @@ class PacejkaTireModel:
         When combined-slip coefficients are zero (no data), the weighting
         functions evaluate to 1.0 and Svyk to 0.0, so pure-slip forces
         pass through unchanged.
-
-        Args:
-            slip_angle_rad: Slip angle (rad).
-            slip_ratio: Longitudinal slip ratio.
-            normal_load_n: Normal load (N).
-            camber_rad: Camber angle (rad).
-
-        Returns:
-            Tuple of (Fx, Fy) in Newtons.
         """
         fx0 = self.longitudinal_force(slip_ratio, normal_load_n, camber_rad)
         fy0 = self.lateral_force(slip_angle_rad, normal_load_n, camber_rad)
@@ -408,7 +498,8 @@ class PacejkaTireModel:
         bxa = rbx1 * math.cos(math.atan(rbx2 * slip_ratio)) * lxal
         cxa = rcx1
         exa = rex1 + rex2 * dfz
-        exa = min(exa, 1.0)
+        # NF-35: symmetric clamp on curvature factor
+        exa = max(-1.0, min(exa, 1.0))
         alpha_s = slip_angle_rad + rhx1
 
         bxa_as = bxa * alpha_s
@@ -435,7 +526,8 @@ class PacejkaTireModel:
         byk = rby1 * math.cos(math.atan(rby2 * (slip_angle_rad - rby3))) * lyka
         cyk = rcy1
         eyk = rey1 + rey2 * dfz
-        eyk = min(eyk, 1.0)
+        # NF-35: symmetric clamp
+        eyk = max(-1.0, min(eyk, 1.0))
         kappa_s = slip_ratio + rhy1 + rhy2 * dfz
 
         byk_ks = byk * kappa_s
@@ -472,10 +564,28 @@ class PacejkaTireModel:
         fx = gxa * fx0
         fy = gyk * fy0 + svyk
 
+        # Fallback: if the .tir has no combined-slip coefficients (RBX1 =
+        # RBY1 = 0, LC0 USE_MODE=2 case), gxa and gyk both collapse to 1
+        # so pure forces pass through unattenuated.  Apply a friction-
+        # ellipse projection so combined slip still obeys the tire's
+        # overall grip envelope.  This is a safety net, not a substitute
+        # for proper weighting coefficients.
+        if rbx1 == 0.0 and rby1 == 0.0:
+            peak_fx = self.peak_longitudinal_force(normal_load_n, camber_rad)
+            peak_fy = self.peak_lateral_force(normal_load_n, camber_rad)
+            if peak_fx > 1e-9 and peak_fy > 1e-9:
+                norm_resultant = math.sqrt(
+                    (fx / peak_fx) ** 2 + (fy / peak_fy) ** 2
+                )
+                if norm_resultant > 1.0:
+                    scale = 1.0 / norm_resultant
+                    fx *= scale
+                    fy *= scale
+
         return fx, fy
 
     # ------------------------------------------------------------------
-    # Peak force computation
+    # Peak force computation (C4/M11 closed-form)
     # ------------------------------------------------------------------
 
     def peak_lateral_force(
@@ -487,10 +597,9 @@ class PacejkaTireModel:
 
         D_y = mu_y * Fz is the Magic Formula peak factor.  At the peak
         slip angle, ``C_y * atan(inner)`` reaches pi/2 and sin() = 1, so
-        the peak of the full MF curve is exactly |D_y|.  Replacing the
-        prior ``minimize_scalar`` search avoids the sign-asymmetric
-        local-max selection the bounded Brent method suffered with
-        nonzero SVy (see SIMULATOR_AUDIT_2026-04-16 C4/M11).
+        the peak of the full MF curve is exactly |D_y|.  Replaces the
+        prior ``minimize_scalar`` search that suffered sign-asymmetric
+        local-max selection with nonzero SVy (C4/M11).
         """
         fz = max(normal_load_n, 1.0)
         fz0 = self.fnomin * self._sc("LFZO")
@@ -510,15 +619,10 @@ class PacejkaTireModel:
         """Peak longitudinal force magnitude via PAC2002 closed-form |D_x|.
 
         Mirrors ``peak_lateral_force`` for the longitudinal Magic
-        Formula: the peak of ``D * sin(C * atan(inner))`` is |D|.
-
-        The current TTC .tir files have ``USE_MODE=2`` (lateral-only),
-        so all PDX coefficients are zero.  ``longitudinal_force`` mirrors
-        the lateral peak-mu expression ``|(PDY1 + PDY2*dfz)| * LMUY``,
-        and this peak must match that same mu exactly to keep the two
-        functions self-consistent.  If a PAC2002 parameter set with
-        nonzero PDX1 is loaded (e.g., via ``transplant_fx_coefficients``),
-        the orthodox PDX form is used instead.
+        Formula: the peak of ``D * sin(C * atan(inner))`` is |D|.  When
+        transplanted PDX coefficients are present they are used; else
+        the ``longitudinal_force`` lateral-mu mirror is used so the two
+        functions stay self-consistent.
         """
         fz = max(normal_load_n, 1.0)
         fz0 = self.fnomin * self._sc("LFZO")
@@ -528,15 +632,12 @@ class PacejkaTireModel:
         pdx2 = self._lon("PDX2")
         pdx3 = self._lon("PDX3")
         if pdx1 != 0.0:
-            # Orthodox PAC2002: use longitudinal coefficients and LMUX.
             mux = (
                 (pdx1 + pdx2 * dfz)
                 * (1.0 - pdx3 * camber_rad ** 2)
                 * self._sc("LMUX")
             )
         else:
-            # TTC USE_MODE=2 mirror: match the mu used inside
-            # ``longitudinal_force``: |PDY1 + PDY2*dfz| * (1 - PDY3*gamma^2) * LMUY.
             pdy1 = self._lat("PDY1")
             pdy2 = self._lat("PDY2")
             pdy3 = self._lat("PDY3")
@@ -562,14 +663,6 @@ class PacejkaTireModel:
 
         where r0 is the unloaded radius and kz is vertical stiffness.
         Clamped to a minimum of 0.01 m.
-
-        Args:
-            normal_load_n: Normal load (N). Use 0 for free radius.
-            speed_ms: Forward speed (m/s). Reserved for future centrifugal
-                growth; currently unused beyond clamping.
-
-        Returns:
-            Loaded radius (m).
         """
         r0 = self.unloaded_radius
         kz = self.vertical_stiffness
