@@ -196,3 +196,82 @@ class TestPackCurrentCarriedForward:
         # And the recorded DataFrame's final pack_current_a should match
         # what the next iteration would have seen if the loop continued.
         assert result.states["pack_current_a"].iloc[-1] != 0.0
+
+
+class TestRollingStartFlag:
+    """D-26: ``rolling_start=False`` skips the MIN_SPEED clamp."""
+
+    def _make_engine(self):
+        track = make_simple_track()
+        config = make_minimal_config()
+        strategy = StubStrategy()
+        batt = MagicMock(spec=BatteryModel)
+        batt.pack_voltage.return_value = 400.0
+        batt.max_discharge_current.return_value = 100.0
+        batt.step.return_value = (90.0, 26.0, 395.0)
+        return SimulationEngine(config, track, strategy, batt)
+
+    def test_standing_start_skips_clamp(self):
+        """With rolling_start=False the strategy observes a true zero entry."""
+        from fsae_sim.driver.strategy import ControlAction, ControlCommand
+
+        track = make_simple_track()
+        config = make_minimal_config()
+
+        class SpyStrategy(DriverStrategy):
+            name = "spy"
+
+            def __init__(self):
+                self.first_observed_speed = None
+
+            def decide(self, state, upcoming):
+                if self.first_observed_speed is None:
+                    self.first_observed_speed = state.speed
+                return ControlCommand(
+                    action=ControlAction.COAST,
+                    throttle_pct=0.0,
+                    brake_pct=0.0,
+                )
+
+        batt = MagicMock(spec=BatteryModel)
+        batt.pack_voltage.return_value = 400.0
+        batt.max_discharge_current.return_value = 100.0
+        batt.step.return_value = (90.0, 26.0, 395.0)
+
+        spy = SpyStrategy()
+        engine = SimulationEngine(config, track, spy, batt)
+        engine.run(
+            num_laps=1,
+            initial_soc_pct=95.0,
+            initial_speed_ms=0.0,
+            rolling_start=False,
+        )
+
+        # With rolling_start=False the engine must not bump the first
+        # entry speed up to _MIN_SPEED_MS (0.5). The strategy therefore
+        # sees exactly 0.0 on the first iteration.
+        assert spy.first_observed_speed == 0.0, (
+            "rolling_start=False should not clamp initial_speed_ms up "
+            f"(first observed speed was {spy.first_observed_speed})"
+        )
+
+    def test_rolling_start_warns_on_clamp(self):
+        import warnings
+        engine = self._make_engine()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            engine.run(
+                num_laps=1,
+                initial_soc_pct=95.0,
+                initial_speed_ms=0.0,
+                rolling_start=True,
+            )
+        clamp_warnings = [
+            w for w in caught
+            if issubclass(w.category, UserWarning)
+            and "rolling_start" in str(w.message)
+        ]
+        assert len(clamp_warnings) >= 1, (
+            "rolling_start=True with initial_speed_ms<_MIN_SPEED_MS "
+            "should emit a UserWarning"
+        )

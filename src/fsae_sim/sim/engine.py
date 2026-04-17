@@ -161,6 +161,7 @@ class SimulationEngine:
         initial_soc_pct: float = 95.0,
         initial_temp_c: float = 25.0,
         initial_speed_ms: float = 0.0,
+        rolling_start: bool = True,
     ) -> SimResult:
         """Run the endurance simulation.
 
@@ -169,6 +170,14 @@ class SimulationEngine:
             initial_soc_pct: Starting state-of-charge (percent).
             initial_temp_c: Starting cell temperature (Celsius).
             initial_speed_ms: Starting vehicle speed (m/s).
+            rolling_start: D-26. When True (default), ``initial_speed_ms``
+                is clamped up to ``_MIN_SPEED_MS`` to avoid divide-by-zero
+                in the power calculation — matches the Michigan endurance
+                rolling-start convention. If the clamp fires, emit a
+                ``UserWarning`` so the silent bump is visible. When False,
+                the initial speed is passed through as-is; the deep
+                divide-by-zero guards inside resolve_exit_speed and the
+                MIN_SPEED floor on exit_speed still keep the loop stable.
 
         Returns:
             SimResult with per-segment state history and summary metrics.
@@ -180,7 +189,23 @@ class SimulationEngine:
         # Mutable state
         time = 0.0
         distance = 0.0
-        speed = max(initial_speed_ms, self._MIN_SPEED_MS)
+        # D-26: apply rolling-start clamp only when requested.  When
+        # applied and the caller's initial_speed was below the floor,
+        # warn so the implicit bump is visible in logs.
+        if rolling_start:
+            if initial_speed_ms < self._MIN_SPEED_MS:
+                import warnings
+                warnings.warn(
+                    f"rolling_start=True: clamping initial_speed_ms="
+                    f"{initial_speed_ms:.3f} up to _MIN_SPEED_MS="
+                    f"{self._MIN_SPEED_MS} to avoid divide-by-zero. Pass "
+                    "rolling_start=False for a true standing start.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            speed = max(initial_speed_ms, self._MIN_SPEED_MS)
+        else:
+            speed = float(initial_speed_ms)
         soc = initial_soc_pct
         temp = initial_temp_c
         pack_voltage = self.battery_model.pack_voltage(soc, 0.0)
