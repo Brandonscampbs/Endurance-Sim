@@ -823,7 +823,7 @@ class TestBackEMFValidationMichigan:
     This test pins that finding so a future change doesn't silently
     re-introduce a fudge factor.  The -456 W must come from somewhere
     else (iron losses, inverter standby current, driveline drag seen
-    by the pack) — logged in REMAINING_ISSUES.md.
+    by the pack) — logged in SIMULATOR_ISSUES.md.
     """
 
     def test_michigan_coast_point_rectifier_off(self, model: PowertrainModel) -> None:

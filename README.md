@@ -122,7 +122,7 @@ pytest -v
 Repository scaffold, Docker, webapp skeleton, vehicle configs, data loaders
 
 ### Phase 2 — Core Simulation (In Progress)
-Battery model, powertrain model, vehicle dynamics with 4-wheel Pacejka tire model, driver model (CalibratedStrategy, zone-based), simulation engine validated against real telemetry (~2% energy error, 8/8 metrics pass). Remaining: physics model alignment and accuracy validation — see `docs/REMAINING_ISSUES.md` for open issues.
+Battery model, powertrain model, vehicle dynamics with 4-wheel Pacejka tire model, driver model (CalibratedStrategy, zone-based), simulation engine validated against real telemetry (~2% energy error, 8/8 metrics pass). Remaining: physics model alignment and accuracy validation — see `docs/SIMULATOR_ISSUES.md` for open issues.
 
 ### Phase 3 — Verification polish + Simulate page (Next)
 Close the residual physics gaps visible on the Verification page; ship the Simulate page (max RPM, max torque, SOC discharge-map sliders); keep Visualization honest so it can be used to spot physics bugs.

@@ -28,7 +28,7 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 
 ### Known Issues (MUST READ)
 
-**`docs/REMAINING_ISSUES.md`** documents all known physics bugs, approximations, and code issues. As of 2026-04-15: 5 fixed, 2 partially fixed, 13 still open. **Read this before trusting simulation results or starting new physics work.**
+**`docs/SIMULATOR_ISSUES.md`** is the authoritative tracker for all known physics bugs, approximations, and code issues (consolidated 2026-04-16 from former REMAINING_ISSUES / SIMULATOR_AUDIT / DRIVER_MODEL_ISSUES docs). **Read this before trusting simulation results or starting new physics work.**
 
 ### Key Vehicle Parameters (from DSS + Endurance Tune)
 | Parameter | Value | Source |
@@ -58,7 +58,7 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 See `docs/WEBAPP_REFOCUS_PLAN_2026-04-16.md` for the full plan.
 
 1. **Baseline simulation + validation** (DONE) -- quasi-static lap sim with 4-wheel Pacejka tire model, validated against Michigan 2025 telemetry (~2% energy error, 8/8 metrics pass).
-2. **Verification page correctness + physics fixes** (IN PROGRESS) -- fix the per-lap metrics regression, swap GPS Speed → LFspeed, add per-channel residuals + RMS/R²/correlation, add energy budget reconciliation, expand channel coverage to RPM/torque/pack V&I/temp. Also close the 13 open physics/code issues in `docs/REMAINING_ISSUES.md`.
+2. **Verification page correctness + physics fixes** (IN PROGRESS) -- fix the per-lap metrics regression, swap GPS Speed → LFspeed, add per-channel residuals + RMS/R²/correlation, add energy budget reconciliation, expand channel coverage to RPM/torque/pack V&I/temp. Also close remaining open physics/code issues tracked in `docs/SIMULATOR_ISSUES.md`.
 3. **Visualization page physics + polish** (NEXT) -- fix force-arrow frame math (body vs world), Euler order for roll/pitch/yaw, orbit camera target binding, backend Fy sign-by-curvature. Add trajectory trail, scrubbable time-series strip, friction-circle per wheel, sector/lap markers on timeline.
 4. **Simulate page** (AFTER VISUALIZATION) -- backend endpoint accepting `{max_rpm, max_torque_nm, soc_discharge_map}`, runs one sim with those overrides against the baseline, returns summary + per-lap table + time series. Frontend: three-knob form, baseline-comparison delta cards, overlay chart.
 5. **Retire Dash dashboard + unify Docker** -- webapp/ + FastAPI as a single Docker image; delete `dashboard/`; update README.

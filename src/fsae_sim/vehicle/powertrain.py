@@ -13,7 +13,7 @@ class PowertrainConfig:
     # LVCU software torque limit. Firmware default is 2200//x10 = 220 Nm
     # (LVCU Code.txt:109). Older configs used 150 Nm; that was an
     # operational cap for Michigan 2025, not the firmware value. See
-    # C17 in docs/SIMULATOR_AUDIT_2026-04-16.md.
+    # C17 in docs/SIMULATOR_ISSUES.md.
     torque_limit_lvcu_nm: float
     iq_limit_a: float
     id_limit_a: float

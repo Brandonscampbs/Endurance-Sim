@@ -135,6 +135,6 @@ These aren't full workstreams but are worth addressing as they come up:
 | Telemetry CSV validation | No schema checks on AiM data | Bad data rows propagate |
 | Docker health checks | No readiness/liveness probes | Dashboard can appear "up" while broken |
 | Multi-stage Docker build | Single-stage, includes dev deps | Larger image than necessary |
-| Physics bugs | 10+ documented in `docs/REMAINING_ISSUES.md` | Must fix before sweep results are trustworthy |
+| Physics bugs | Tracked in `docs/SIMULATOR_ISSUES.md` | Must fix before sweep results are trustworthy |
 | Benchmarking | No profiling infrastructure | Can't measure sweep performance gains |
 | API docs | No Sphinx/pdoc generation | Hard for new contributors to navigate |
