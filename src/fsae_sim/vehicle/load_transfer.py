@@ -44,6 +44,14 @@ class LoadTransferModel:
         weight_dist_front: float = 0.53,
         downforce_dist_front: float = 0.61,
     ) -> None:
+        # Validate track widths before any division (audit NF-40).
+        if suspension.front_track_mm < 1.0 or suspension.rear_track_mm < 1.0:
+            raise ValueError(
+                "SuspensionConfig track widths must be > 1 mm; got "
+                f"front={suspension.front_track_mm} mm, "
+                f"rear={suspension.rear_track_mm} mm"
+            )
+
         self._vehicle = vehicle
         self._suspension = suspension
         self._cg_height_m = cg_height_m
@@ -227,10 +235,24 @@ class LoadTransferModel:
             rl -= delta_lat_r
             rr += delta_lat_r
 
-        # Clamp to non-negative (tire cannot pull the ground)
-        fl = max(fl, 0.0)
-        fr = max(fr, 0.0)
-        rl = max(rl, 0.0)
-        rr = max(rr, 0.0)
-
-        return (fl, fr, rl, rr)
+        # Clamp to non-negative (tire cannot pull the ground) and redistribute
+        # any lifted-tire load to the same-axle opposite tire so global
+        # vertical equilibrium (sum_loads == m*g + F_downforce) is preserved.
+        # An inside tire that lifts transfers its share to the outside tire on
+        # the same axle — see audit C5.
+        fl_c = max(fl, 0.0)
+        fr_c = max(fr, 0.0)
+        rl_c = max(rl, 0.0)
+        rr_c = max(rr, 0.0)
+        # Front axle redistribution: negative value == "missing" load that must
+        # appear on the opposite tire.
+        if fl < 0.0:
+            fr_c += -fl
+        if fr < 0.0:
+            fl_c += -fr
+        # Rear axle redistribution
+        if rl < 0.0:
+            rr_c += -rl
+        if rr < 0.0:
+            rl_c += -rr
+        return (fl_c, fr_c, rl_c, rr_c)

@@ -16,7 +16,8 @@
       "Bash(git log:*)",
       "Bash(git cherry:*)",
       "Bash(git fsck:*)",
-      "Bash(git cherry-pick:*)"
+      "Bash(git cherry-pick:*)",
+      "Bash(npm run *)"
     ]
   }
 }
