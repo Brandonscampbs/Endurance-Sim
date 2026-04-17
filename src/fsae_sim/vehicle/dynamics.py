@@ -416,6 +416,24 @@ class VehicleDynamics:
             long_g = long_g_new
         return f_drive
 
+    def mechanical_brake_force(
+        self, brake_pct: float, speed_ms: float,
+    ) -> float:
+        """Friction-brake deceleration force (N), tire-limit capped.
+
+        CT-16EV has no regen — the driver's brake pedal drives hydraulic
+        pressure to the friction pads; energy dissipates as heat at the
+        pads, with zero electrical consequence.  This is the path to
+        use for brake commands.  Returns a positive number; the caller
+        subtracts it from net_force (it opposes motion).
+
+        Args:
+            brake_pct: Brake pedal fraction in [0, 1].
+            speed_ms: Instantaneous vehicle speed (m/s).
+        """
+        brake_pct = max(0.0, min(1.0, brake_pct))
+        return brake_pct * self.max_braking_force(speed_ms)
+
     def max_braking_force(self, speed_ms: float) -> float:
         """Maximum braking force (N) from all four tires.
 

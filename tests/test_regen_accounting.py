@@ -97,19 +97,30 @@ class TestSimResultRegenFields:
         # Default total_energy_kwh is net.
         assert result.total_energy_kwh == pytest.approx(result.net_energy_kwh, abs=1e-9)
 
-    def test_regen_is_strictly_positive_when_coasting(self, vehicle_config, battery):
+    def test_brake_produces_no_commanded_regen(self, vehicle_config, battery):
+        """CT-16EV brake pedal drives the hydraulic brakes, not motor
+        regen.  ``ControlAction.BRAKE`` events must NOT appear as
+        positive regen energy in the SimResult — the only way regen
+        should accumulate is a strategy that explicitly commands
+        negative motor torque (which the 2025 telemetry never does).
+
+        We allow a tiny floor (<= 1% of discharge) for coast back-EMF
+        at high RPM, which is physically real.
+        """
         track = _make_simple_track()
         engine = SimulationEngine(
             vehicle_config, track, MixedThrottleCoastStrategy(), battery,
         )
         result = engine.run(num_laps=2, initial_soc_pct=95.0, initial_temp_c=25.0)
-        assert result.regen_energy_kwh > 0.0, (
-            "Alternating throttle/regen-brake must produce some regen"
+        # Regen energy should be at most a tiny coast back-EMF floor,
+        # not the large phantom-regen values the old BRAKE-as-regen
+        # path produced (~10-50% of discharge).
+        floor_kwh = 0.01 * result.discharge_energy_kwh
+        assert result.regen_energy_kwh <= floor_kwh + 1e-6, (
+            f"BRAKE action must not generate commanded regen; got "
+            f"regen={result.regen_energy_kwh:.4f} kWh vs discharge="
+            f"{result.discharge_energy_kwh:.4f} kWh (floor={floor_kwh:.4f})"
         )
-        # Gross is larger than net (i.e., regen is actually being tracked,
-        # not silently zeroed).
-        assert (result.discharge_energy_kwh + result.regen_energy_kwh
-                > result.discharge_energy_kwh)
 
 
 class TestValidationRegenAccounting:

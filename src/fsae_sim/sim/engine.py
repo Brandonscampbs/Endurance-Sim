@@ -321,11 +321,22 @@ class SimulationEngine:
                     drive_f = min(drive_f, self.dynamics.max_traction_force(speed))
                     regen_f = 0.0
                 elif cmd.action == ControlAction.BRAKE:
+                    # CT-16EV uses MECHANICAL brakes only — brake pedal
+                    # drives hydraulic pressure to the friction pads.
+                    # We use ``powertrain.regen_force`` here ONLY as a
+                    # convenient brake-pedal → decel-force mapping
+                    # (which happens to match real brake-system design:
+                    # peak brake force sized similar to peak motor
+                    # torque).  The force is applied as a DECELERATION
+                    # only; the electrical side is intentionally
+                    # disabled via motor_torque = 0 below, so no
+                    # phantom regen accumulates.  Regen is reserved
+                    # for strategies that command negative motor
+                    # torque explicitly (2025 telemetry never does).
                     drive_f = 0.0
-                    regen_f = self.powertrain.regen_force(cmd.brake_pct, speed)
+                    brake_force = abs(self.powertrain.regen_force(cmd.brake_pct, speed))
                     max_brake = self.dynamics.max_braking_force(speed)
-                    if abs(regen_f) > max_brake:
-                        regen_f = -max_brake
+                    regen_f = -min(brake_force, max_brake)
                 else:  # COAST
                     drive_f = 0.0
                     regen_f = 0.0
@@ -372,17 +383,13 @@ class SimulationEngine:
                             cmd.throttle_pct, motor_rpm, bms_current_limit,
                         )
                 elif cmd.action == ControlAction.BRAKE:
-                    # NF-5: derive motor_torque from the tire-clipped regen_f
-                    # rather than the raw brake command.  When the wheel can't
-                    # support the requested regen force we must reflect the
-                    # clipped force in the electrical power calculation too,
-                    # otherwise the sim reports more regen energy than the
-                    # tires actually transferred.
-                    gear = self.powertrain.config.gear_ratio
-                    eff = self.powertrain._GEARBOX_EFFICIENCY
-                    tire_r = self.powertrain.TIRE_RADIUS_M
-                    # regen_f is negative (braking); motor_torque is negative.
-                    motor_torque = regen_f * tire_r / (gear * eff)
+                    # Mechanical brake: motor stays off, decel is
+                    # dissipated as heat at the friction pads.  Any
+                    # electrical contribution during brake comes from
+                    # coasting back-EMF (handled via motor_torque=0 in
+                    # the electrical_power coast branch), not from
+                    # commanded motor regen.
+                    motor_torque = 0.0
                 else:
                     motor_torque = 0.0
 
