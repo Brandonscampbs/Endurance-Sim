@@ -233,3 +233,68 @@ class TestZoneIntensityIsAuthoritative:
         import inspect
         sig = inspect.signature(CalibratedStrategy.__init__)
         assert "segment_intensities" not in sig.parameters
+
+
+# ---------------------------------------------------------------------------
+# D-19: column-name kwargs plumbed through
+# ---------------------------------------------------------------------------
+
+
+class TestD19ColumnNameKwargs:
+    """The `throttle_col` / `front_brake_col` / etc. kwargs on
+    `CalibratedStrategy.from_telemetry` used to be accepted by the
+    signature and then dropped on the floor. They must be honoured so
+    callers with renamed columns can calibrate without rewriting
+    their dataframes."""
+
+    def _make_df(self, *, throttle_col: str, front_brake_col: str,
+                 rear_brake_col: str, speed_col: str, distance_col: str):
+        import numpy as np
+        n_laps = 3
+        n_samples_per_lap = 200
+        lap_distance = 800.0
+        rows = []
+        for lap in range(n_laps):
+            dist_per_lap = np.linspace(
+                0.0, lap_distance, n_samples_per_lap, endpoint=False,
+            )
+            for i, d in enumerate(dist_per_lap):
+                frac = i / n_samples_per_lap
+                if frac < 0.5:
+                    lat = 42.0 - 0.001 + frac * 2 * 0.002
+                else:
+                    lat = 42.0 + 0.001 - (frac - 0.5) * 2 * 0.002
+                rows.append({
+                    distance_col: lap * lap_distance + d,
+                    speed_col: 40.0,
+                    throttle_col: 60.0,
+                    "LVCU Torque Req": 0.6 * 85.0,
+                    front_brake_col: 0.0,
+                    rear_brake_col: 0.0,
+                    "GPS Latitude": lat,
+                    "GPS Longitude": -83.5,
+                    "GPS LatAcc": 0.0,
+                    "GPS Slope": 0.0,
+                })
+        return pd.DataFrame(rows)
+
+    def test_renamed_columns_roundtrip(self):
+        """Calibrating with renamed columns succeeds."""
+        track = make_track(n_segments=10, length_m=80.0)
+        df = self._make_df(
+            throttle_col="pedal_throttle",
+            front_brake_col="brake_F_bar",
+            rear_brake_col="brake_R_bar",
+            speed_col="vehicle_speed_kmh",
+            distance_col="cum_distance_m",
+        )
+        strategy = CalibratedStrategy.from_telemetry(
+            df, track,
+            throttle_col="pedal_throttle",
+            front_brake_col="brake_F_bar",
+            rear_brake_col="brake_R_bar",
+            speed_col="vehicle_speed_kmh",
+            distance_col="cum_distance_m",
+        )
+        # Strategy produced a non-empty zone list.
+        assert len(strategy.zones) >= 1

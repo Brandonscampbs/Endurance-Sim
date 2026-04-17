@@ -439,12 +439,19 @@ class CalibratedStrategy(DriverStrategy):
                     "nothing left to calibrate on."
                 )
 
+        # D-19: plumb column-name kwargs through to the extractor.
+        # Previously accepted but dropped on the floor.
         seg_actions = extract_per_segment_actions(
             aim_df, track,
             laps=effective_laps,
             throttle_threshold=throttle_threshold,
             brake_threshold=brake_threshold,
             brake_max_pressure_bar=brake_max_pressure_bar,
+            throttle_col=throttle_col,
+            front_brake_col=front_brake_col,
+            rear_brake_col=rear_brake_col,
+            speed_col=speed_col,
+            distance_col=distance_col,
         )
         zones = collapse_to_zones(seg_actions, track, merge_tolerance=merge_tolerance)
 

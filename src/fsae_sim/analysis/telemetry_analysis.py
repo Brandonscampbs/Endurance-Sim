@@ -132,6 +132,11 @@ def extract_per_segment_actions(
     throttle_threshold: float = 5.0,
     brake_threshold: float = 2.0,
     brake_max_pressure_bar: float | None = None,
+    throttle_col: str = "Throttle Pos",
+    front_brake_col: str = "FBrakePressure",
+    rear_brake_col: str = "RBrakePressure",
+    speed_col: str = "GPS Speed",
+    distance_col: str = "Distance on GPS Speed",
 ) -> pd.DataFrame:
     """Sample telemetry at each segment midpoint and classify actions.
 
@@ -167,6 +172,11 @@ def extract_per_segment_actions(
             throttle_threshold=throttle_threshold,
             brake_threshold=brake_threshold,
             brake_max_pressure_bar=brake_max_pressure_bar,
+            throttle_col=throttle_col,
+            front_brake_col=front_brake_col,
+            rear_brake_col=rear_brake_col,
+            speed_col=speed_col,
+            distance_col=distance_col,
         )
     else:
         # Fallback for synthetic/simple data: single-pass
@@ -175,6 +185,11 @@ def extract_per_segment_actions(
             throttle_threshold=throttle_threshold,
             brake_threshold=brake_threshold,
             brake_max_pressure_bar=brake_max_pressure_bar,
+            throttle_col=throttle_col,
+            front_brake_col=front_brake_col,
+            rear_brake_col=rear_brake_col,
+            speed_col=speed_col,
+            distance_col=distance_col,
         )
 
 
@@ -270,6 +285,11 @@ def _extract_per_lap_then_aggregate(
     throttle_threshold: float = 5.0,
     brake_threshold: float = 2.0,
     brake_max_pressure_bar: float | None = None,
+    throttle_col: str = "Throttle Pos",
+    front_brake_col: str = "FBrakePressure",
+    rear_brake_col: str = "RBrakePressure",
+    speed_col: str = "GPS Speed",
+    distance_col: str = "Distance on GPS Speed",
 ) -> pd.DataFrame:
     """Classify per-lap, then aggregate across laps with majority vote.
 
@@ -318,7 +338,7 @@ def _extract_per_lap_then_aggregate(
 
     for start_idx, end_idx, _ in selected:
         lap_df = aim_df.iloc[start_idx:end_idx]
-        lap_dist_raw = lap_df["Distance on GPS Speed"].values
+        lap_dist_raw = lap_df[distance_col].values
         # D-07: rescale each lap's arc-length onto the track total distance.
         # The AiM "Distance on GPS Speed" channel accumulates with some
         # drift across laps (GPS noise, slight route variation). A raw
@@ -333,10 +353,10 @@ def _extract_per_lap_then_aggregate(
             )
         else:
             lap_d = lap_dist_raw - lap_dist_raw[0]
-        lap_throttle = lap_df["Throttle Pos"].values
-        lap_speed = lap_df["GPS Speed"].values
-        lap_fbr = lap_df["FBrakePressure"].values
-        lap_rbr = lap_df["RBrakePressure"].values
+        lap_throttle = lap_df[throttle_col].values
+        lap_speed = lap_df[speed_col].values
+        lap_fbr = lap_df[front_brake_col].values
+        lap_rbr = lap_df[rear_brake_col].values
         lap_brake = np.maximum(lap_fbr, lap_rbr)
 
         if has_torque:
@@ -465,15 +485,20 @@ def _extract_single_pass(
     throttle_threshold: float = 5.0,
     brake_threshold: float = 2.0,
     brake_max_pressure_bar: float | None = None,
+    throttle_col: str = "Throttle Pos",
+    front_brake_col: str = "FBrakePressure",
+    rear_brake_col: str = "RBrakePressure",
+    speed_col: str = "GPS Speed",
+    distance_col: str = "Distance on GPS Speed",
 ) -> pd.DataFrame:
     """Single-pass extraction for synthetic data without lap boundaries."""
     lap_dist = track.total_distance_m
-    dist = aim_df["Distance on GPS Speed"].values
-    throttle = aim_df["Throttle Pos"].values
-    speed = aim_df["GPS Speed"].values
+    dist = aim_df[distance_col].values
+    throttle = aim_df[throttle_col].values
+    speed = aim_df[speed_col].values
 
-    front_brake = aim_df["FBrakePressure"].values
-    rear_brake = aim_df["RBrakePressure"].values
+    front_brake = aim_df[front_brake_col].values
+    rear_brake = aim_df[rear_brake_col].values
     brake_pressure = np.maximum(front_brake, rear_brake)
 
     telem_lap_dist = dist % lap_dist
