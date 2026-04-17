@@ -193,6 +193,37 @@ class TestCollapseToZones:
         # All within tolerance => single zone
         assert len(zones) == 1
 
+    def test_max_speed_ms_tracks_peak_not_mean(self):
+        """D-10: max_speed_ms must reflect near-peak speed, not the mean.
+
+        Feed a zone with increasing per-segment speeds (synthetic ramp).
+        ``np.mean`` would yield ~30 kph; the post-fix 95th-percentile
+        must be ≥ 49 kph (converted to m/s, ~13.6).
+        """
+        track = make_track(5, 50.0)
+        # Single-zone throttle with the speeds ramping segment-by-segment.
+        seg_df = pd.DataFrame({
+            "segment_idx": list(range(5)),
+            "distance_m": [seg.distance_start_m + seg.length_m / 2 for seg in track.segments],
+            "curvature": [seg.curvature for seg in track.segments],
+            "mean_throttle_pct": [80.0] * 5,
+            "mean_brake_bar": [0.0] * 5,
+            "mean_speed_kmh": [10.0, 20.0, 30.0, 40.0, 50.0],
+            "action": [ControlAction.THROTTLE] * 5,
+            "intensity": [0.8] * 5,
+        })
+
+        zones = collapse_to_zones(seg_df, track)
+
+        assert len(zones) == 1
+        peak_kmh = zones[0].max_speed_ms * 3.6
+        # 95th percentile of [10,20,30,40,50] = 48; mean would be 30.
+        # Guard against a regression to the mean: must exceed 45.
+        assert peak_kmh > 45.0, (
+            f"D-10 regression: max_speed_ms {peak_kmh:.2f} kph ≤ 45; "
+            "collapse_to_zones is averaging instead of peaking."
+        )
+
 
 # ---------------------------------------------------------------------------
 # detect_laps
