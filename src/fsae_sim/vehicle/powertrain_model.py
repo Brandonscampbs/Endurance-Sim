@@ -196,60 +196,53 @@ class PowertrainModel:
         return wheel_rpm * self.TIRE_RADIUS_M * 2.0 * math.pi / 60.0
 
     # ------------------------------------------------------------------
-    # Torque delivery
-    # ------------------------------------------------------------------
-
-    # Field-weakening onset RPM and derating slope, derived from
-    # Torque Feedback / LVCU Torque Req analysis of Michigan 2025
-    # telemetry.  Below _FW_ONSET the motor delivers ~100% of the
-    # command; above it, back-EMF limits delivery linearly.
-    _FW_ONSET_RPM: float = 2800.0
-    _FW_SLOPE_PER_RPM: float = 0.75 / 250.0  # ratio drop per RPM above onset
-
-    def torque_delivery_factor(self, motor_rpm: float) -> float:
-        """Fraction of commanded torque the motor physically delivers.
-
-        Below the field-weakening onset the motor tracks the command
-        at ~100%.  Above onset, back-EMF reduces delivery linearly.
-        Derived from Michigan 2025 Torque Feedback vs LVCU Torque Req.
-
-        Args:
-            motor_rpm: Motor shaft speed in RPM.
-
-        Returns:
-            Delivery factor in (0, 1].
-        """
-        if motor_rpm <= self._FW_ONSET_RPM:
-            return 1.0
-        derate = (motor_rpm - self._FW_ONSET_RPM) * self._FW_SLOPE_PER_RPM
-        return max(0.0, 1.0 - derate)
-
-    # ------------------------------------------------------------------
     # Torque capability
     # ------------------------------------------------------------------
+    #
+    # D-15: single, unified field-weakening model.
+    # Previously there were two independent models — a
+    # ``torque_delivery_factor(rpm)`` multiplier applied in the replay
+    # branch, and a separate linear-in-RPM taper inside
+    # ``max_motor_torque``.  Replay already carries the *measured*
+    # delivered torque, so applying an extra derate there
+    # double-counted field weakening; and the linear taper inside
+    # ``max_motor_torque`` is not the right shape for a PMSM anyway —
+    # above the constant-torque region the motor operates at
+    # ~constant power, i.e. T(ω) = P_max / ω, a hyperbolic curve.
+    #
+    # New model:
+    #   T_max(rpm) = T_limit                         for rpm ≤ brake_speed_rpm
+    #              = min(T_limit, P_max / ω(rpm))   for brake_speed_rpm < rpm ≤ motor_speed_max_rpm
+    #              = 0                                for rpm > motor_speed_max_rpm
+    # where P_max = T_limit × ω(brake_speed_rpm) — the mechanical
+    # power the motor delivers at the corner of the envelope.
+    # ``torque_delivery_factor`` is deleted; callers in the replay
+    # branch use the measured torque directly.
 
     def max_motor_torque(self, motor_rpm: float) -> float:
         """Maximum motor output torque at given RPM (Nm).
 
-        The PMSM operates in three distinct regions:
+        PMSM with constant-torque region and constant-power
+        field-weakening region:
 
-        1. **Constant-torque region** (0 <= rpm <= brake_speed_rpm):
+        1. **Constant-torque** (0 ≤ rpm ≤ brake_speed_rpm):
            Full torque = min(inverter_limit, lvcu_limit).
 
-        2. **Field-weakening region** (brake_speed_rpm < rpm <= motor_speed_max_rpm):
-           Torque tapers linearly from full torque to zero as RPM rises from
-           the brake speed to the maximum speed.  This approximates the
-           hyperbolic power curve of a PMSM under field weakening.
+        2. **Constant-power field-weakening**
+           (brake_speed_rpm < rpm ≤ motor_speed_max_rpm):
+           T(ω) = P_max / ω, clamped to never exceed the hard
+           torque ceiling. P_max is the mechanical power at the
+           corner of the envelope (T_limit × ω(brake_speed_rpm)).
 
-        3. **Over-speed region** (rpm > motor_speed_max_rpm):
-           Zero torque — the motor cannot operate above its maximum electrical
+        3. **Over-speed** (rpm > motor_speed_max_rpm):
+           Zero torque — motor cannot operate above max electrical
            frequency.
 
         Args:
             motor_rpm: Motor shaft speed in RPM.
 
         Returns:
-            Maximum available motor torque in Nm (>= 0).
+            Maximum available motor torque in Nm (≥ 0).
         """
         rpm = max(0.0, motor_rpm)
 
@@ -257,11 +250,10 @@ class PowertrainModel:
             return self._torque_limit_nm
 
         if rpm <= self.config.motor_speed_max_rpm:
-            # Linear taper from full torque at brake_speed down to 0 at max_speed
-            span = self.config.motor_speed_max_rpm - self.config.brake_speed_rpm
-            excess = rpm - self.config.brake_speed_rpm
-            taper_fraction = 1.0 - (excess / span)
-            return self._torque_limit_nm * taper_fraction
+            omega = rpm * self._rad_per_s_per_rpm
+            omega_corner = self.config.brake_speed_rpm * self._rad_per_s_per_rpm
+            p_max = self._torque_limit_nm * omega_corner
+            return min(self._torque_limit_nm, p_max / omega)
 
         # Above maximum RPM
         return 0.0

@@ -217,11 +217,12 @@ class SimulationEngine:
                 #    Other strategies: raw throttle through full LVCU model.
                 if cmd.action == ControlAction.THROTTLE:
                     if is_replay:
+                        # D-15: replay torque is the measured delivered
+                        # torque — field-weakening is already baked in.
+                        # Do not apply torque_delivery_factor here
+                        # (double-count).
                         seg_mid_dist = distance + segment.length_m / 2.0
-                        motor_torque = (
-                            self.strategy.target_torque(seg_mid_dist)
-                            * self.powertrain.torque_delivery_factor(motor_rpm)
-                        )
+                        motor_torque = self.strategy.target_torque(seg_mid_dist)
                     elif is_calibrated:
                         ceiling = self.powertrain.lvcu_torque_ceiling(
                             motor_rpm, bms_current_limit,
@@ -261,11 +262,12 @@ class SimulationEngine:
                 # Recompute torque at resolved avg speed for accurate power calc
                 if cmd.action == ControlAction.THROTTLE:
                     if is_replay:
+                        # D-15: replay torque is the measured delivered
+                        # torque — field-weakening is already baked in.
+                        # Do not apply torque_delivery_factor here
+                        # (double-count).
                         seg_mid_dist = distance + segment.length_m / 2.0
-                        motor_torque = (
-                            self.strategy.target_torque(seg_mid_dist)
-                            * self.powertrain.torque_delivery_factor(motor_rpm)
-                        )
+                        motor_torque = self.strategy.target_torque(seg_mid_dist)
                     elif is_calibrated:
                         ceiling = self.powertrain.lvcu_torque_ceiling(
                             motor_rpm, bms_current_limit,

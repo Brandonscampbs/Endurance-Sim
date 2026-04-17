@@ -114,37 +114,43 @@ class TestMaxMotorTorque:
         assert model.max_motor_torque(2400.0) == pytest.approx(85.0)
 
     def test_torque_tapers_in_field_weakening_region(self, model: PowertrainModel) -> None:
-        """Torque must decrease linearly from 2400 to 2900 RPM."""
+        """D-15: torque decreases monotonically from 2400 to 2900 RPM
+        following a constant-power curve T(ω) = P_max / ω.
+        """
         t_2400 = model.max_motor_torque(2400.0)
-        t_2650 = model.max_motor_torque(2650.0)  # midpoint of taper range
+        t_2650 = model.max_motor_torque(2650.0)
         t_2900 = model.max_motor_torque(2900.0)
 
         assert t_2400 > t_2650 > t_2900
-        # Midpoint should be very close to half of full torque
-        assert abs(t_2650 - 85.0 / 2.0) < 1.0
+        # Constant-power: T(ω)·ω = P_max = T_limit · ω_corner.
+        # So T(2650) = 85 × 2400/2650 ≈ 76.98 Nm.
+        assert abs(t_2650 - 85.0 * 2400.0 / 2650.0) < 0.01
 
-    def test_torque_reaches_zero_at_max_rpm(self, model: PowertrainModel) -> None:
-        """At motor_speed_max_rpm the taper should reach exactly zero."""
-        assert model.max_motor_torque(2900.0) == pytest.approx(0.0, abs=1e-9)
+    def test_torque_nonzero_at_max_rpm(self, model: PowertrainModel) -> None:
+        """D-15: constant-power field-weakening leaves residual torque at
+        motor_speed_max_rpm. T(2900) = 85 × 2400/2900 ≈ 70.3 Nm.
+
+        (The old linear taper dropped to exactly 0 at max RPM; that shape
+        was unphysical for a PMSM under field weakening.)
+        """
+        t_max = model.max_motor_torque(2900.0)
+        assert t_max == pytest.approx(85.0 * 2400.0 / 2900.0, abs=0.01)
 
     def test_zero_torque_above_max_rpm(self, model: PowertrainModel) -> None:
         """Above the maximum RPM, the motor produces no torque."""
         assert model.max_motor_torque(3000.0) == 0.0
         assert model.max_motor_torque(5000.0) == 0.0
 
-    def test_torque_taper_linearity(self, model: PowertrainModel) -> None:
-        """Torque drop per RPM should be constant across the field-weakening range."""
-        rpms = [2400.0, 2550.0, 2700.0, 2850.0, 2900.0]
-        torques = [model.max_motor_torque(r) for r in rpms]
-        # First-order differences should all be equal (or very close)
-        diffs = [torques[i] - torques[i + 1] for i in range(len(torques) - 1)]
-        for d in diffs:
-            assert d >= 0.0, "Torque should not increase in field-weakening region"
-        # Check constant slope: all diffs normalised by ΔRPM should match
-        rpm_steps = [rpms[i + 1] - rpms[i] for i in range(len(rpms) - 1)]
-        slopes = [d / step for d, step in zip(diffs, rpm_steps)]
-        for slope in slopes:
-            assert abs(slope - slopes[0]) < 1e-9, "Taper slope is not linear"
+    def test_constant_power_in_fw_region(self, model: PowertrainModel) -> None:
+        """D-15: in the field-weakening region, T × ω is constant (= P_max)."""
+        import math
+        rpms = [2400.0, 2550.0, 2700.0, 2850.0]
+        powers = []
+        for rpm in rpms:
+            omega = rpm * math.pi / 30.0
+            powers.append(model.max_motor_torque(rpm) * omega)
+        for p in powers:
+            assert abs(p - powers[0]) < 1e-6
 
     def test_inverter_limit_is_binding(self, model: PowertrainModel) -> None:
         """Inverter limit (85 Nm) is less than LVCU (220 Nm), so it must bind."""
