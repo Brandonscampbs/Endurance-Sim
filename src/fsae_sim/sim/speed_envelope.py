@@ -79,19 +79,30 @@ class SpeedEnvelope:
             v_entry_sq = v * v + 2.0 * a_brake * seg.length_m
             v_back[i] = min(v_corner[i], math.sqrt(max(0.0, v_entry_sq)))
 
-        # Lap-wrap: check if the last segment can feed into the first
-        last_seg = segments[n - 1]
-        v_last = v_back[n - 1]
-        f_resist = self._resistance(v_back[0], last_seg.grade, last_seg.curvature)
-        f_regen = abs(self._powertrain.regen_force(1.0, v_back[0]))
-        f_tire_limit = self._dynamics.max_braking_force(v_back[0])
-        f_brake = min(f_resist + f_regen, f_tire_limit)
-        a_brake = f_brake / m_eff
-        v_wrap_sq = v_back[0] * v_back[0] + 2.0 * a_brake * last_seg.length_m
-        v_wrap = math.sqrt(max(0.0, v_wrap_sq))
+        # Lap-wrap: iterate until fixed point.  A reduction propagated
+        # into segment 0 can change what the last segment must brake
+        # for; one pass with an early break can miss the feedback.
+        # Cap iterations as a safety — typical convergence in ≤ 3 rounds.
+        for _wrap_iter in range(5):
+            last_seg = segments[n - 1]
+            v_last = v_back[n - 1]
+            f_resist = self._resistance(
+                v_back[0], last_seg.grade, last_seg.curvature
+            )
+            f_regen = abs(self._powertrain.regen_force(1.0, v_back[0]))
+            f_tire_limit = self._dynamics.max_braking_force(v_back[0])
+            f_brake = min(f_resist + f_regen, f_tire_limit)
+            a_brake = f_brake / m_eff
+            v_wrap_sq = (
+                v_back[0] * v_back[0] + 2.0 * a_brake * last_seg.length_m
+            )
+            v_wrap = math.sqrt(max(0.0, v_wrap_sq))
 
-        if v_last > v_wrap:
+            if v_last <= v_wrap:
+                break  # fixed point: last segment already satisfies wrap
+
             v_back[n - 1] = min(v_back[n - 1], v_wrap)
+            changed = False
             for i in range(n - 2, -1, -1):
                 v = v_back[i + 1]
                 seg = segments[i]
@@ -102,9 +113,11 @@ class SpeedEnvelope:
                 a_brake = f_brake / m_eff
                 v_entry_sq = v * v + 2.0 * a_brake * seg.length_m
                 new_limit = min(v_corner[i], math.sqrt(max(0.0, v_entry_sq)))
-                if new_limit >= v_back[i]:
-                    break
-                v_back[i] = new_limit
+                if new_limit < v_back[i]:
+                    v_back[i] = new_limit
+                    changed = True
+            if not changed:
+                break
 
         # Pass 3: forward pass (acceleration feasibility)
         # Use lap-wrapped backward-pass limit as initial speed.  The backward

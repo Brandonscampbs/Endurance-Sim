@@ -238,20 +238,80 @@ def validate_full_endurance(
     driver-change stationary period.
     """
     # --- Stint-aware segmentation (C16) ---
+    # Per-stint sub-reports compare a per-stint SLICE of sim_states
+    # against the matching telemetry stint.  Previous code passed the
+    # full sim_states against each stint's telemetry, yielding always-
+    # wrong sub-reports (full-sim-vs-partial-telem).
     stints = None
     if "stint" in aim_df.columns:
         stint_ids = sorted(int(s) for s in pd.unique(aim_df["stint"]) if pd.notna(s))
         if len(stint_ids) > 1:
             stints = []
+            # Slice sim_states by stint using the telemetry's share of
+            # total samples.  Prefers slicing by lap when both frames
+            # carry a lap column; falls back to proportional row slicing.
+            has_sim_lap = "lap" in sim_states.columns
+            has_telem_lap = "lap" in aim_df.columns
+
+            sim_lap_cursor = 0
+            sim_row_cursor = 0
+            total_rows = len(aim_df)
             for sid in stint_ids:
                 sub = aim_df[aim_df["stint"] == sid].reset_index(drop=True)
-                # Per-stint report: no recursion into stints (already segmented)
                 sub_no_stint = sub.drop(columns=["stint"])
+
+                if has_sim_lap and has_telem_lap:
+                    n_stint_laps = int(sub["lap"].nunique())
+                    sim_lap_end = min(sim_lap_cursor + n_stint_laps, sim_laps)
+                    sim_slice = sim_states[
+                        (sim_states["lap"] >= sim_lap_cursor)
+                        & (sim_states["lap"] < sim_lap_end)
+                    ].reset_index(drop=True)
+                    sim_lap_cursor = sim_lap_end
+                else:
+                    # Proportional row slicing fallback.
+                    frac = len(sub) / total_rows if total_rows > 0 else 0.0
+                    n_rows = max(1, int(round(len(sim_states) * frac)))
+                    sim_row_end = min(sim_row_cursor + n_rows, len(sim_states))
+                    sim_slice = sim_states.iloc[sim_row_cursor:sim_row_end].reset_index(drop=True)
+                    sim_row_cursor = sim_row_end
+                    n_stint_laps = max(1, int(round(sim_laps * frac)))
+
+                if len(sim_slice) == 0:
+                    continue
+
+                # Per-stint sim totals from the slice.
+                if "segment_time_s" in sim_slice.columns:
+                    stint_sim_time_s = float(sim_slice["segment_time_s"].sum())
+                elif "time_s" in sim_slice.columns:
+                    stint_sim_time_s = float(
+                        sim_slice["time_s"].iloc[-1] - sim_slice["time_s"].iloc[0]
+                    )
+                else:
+                    # No timing data — fall back to proportional share.
+                    frac = len(sim_slice) / max(1, len(sim_states))
+                    stint_sim_time_s = sim_total_time_s * frac
+
+                stint_sim_final_soc = float(sim_slice["soc_pct"].iloc[-1])
+
+                # Stint energy: sum signed power over segment times (net).
+                if {"pack_voltage_v", "pack_current_a", "segment_time_s"}.issubset(
+                    sim_slice.columns
+                ):
+                    p = (
+                        sim_slice["pack_voltage_v"] * sim_slice["pack_current_a"]
+                    ).values
+                    dt = sim_slice["segment_time_s"].values
+                    stint_sim_energy_kwh = float(np.sum(p * dt) / 3.6e6)
+                else:
+                    frac = len(sim_slice) / max(1, len(sim_states))
+                    stint_sim_energy_kwh = sim_total_energy_kwh * frac
+
                 stints.append(
                     validate_full_endurance(
-                        sim_states, sub_no_stint,
-                        sim_total_time_s, sim_final_soc,
-                        sim_total_energy_kwh, sim_laps,
+                        sim_slice, sub_no_stint,
+                        stint_sim_time_s, stint_sim_final_soc,
+                        stint_sim_energy_kwh, n_stint_laps,
                         target_pct=target_pct,
                     )
                 )

@@ -331,8 +331,11 @@ class PowertrainModel:
         #       else            bse_error = tps_combined >= 0.05;
         # We replicate the two-state hysteresis using the caller-supplied
         # `prior_bse_latched` to make the call sequence explicit.
+        # Firmware clears BSE when tps_combined < 0.05 (strict), so the
+        # clear condition here mirrors that with `> 0.05` on the retain
+        # side.  Using `>= 0.05` left the latch stuck at exactly 5%.
         if prior_bse_latched:
-            bse_latched = pedal_pct >= 0.05
+            bse_latched = pedal_pct > 0.05
         else:
             bse_latched = brake_pressed and (pedal_pct >= 0.10)
         if bse_latched:
@@ -583,15 +586,18 @@ class PowertrainModel:
             return 0.0
 
         # Commanded regen (p_mechanical < 0).
-        # C3: do NOT multiply the map efficiency by _REGEN_EFFICIENCY_FACTOR.
-        # That factor double-counted losses already encoded in the
-        # MotorEfficiencyMap (motoring + inverter). The motor-vs-regen
-        # asymmetry is a small (~1-2 pp) offset, applied only on the
-        # fallback path via _REGEN_EFFICIENCY_OFFSET_PP.
+        # C3: do NOT multiply the map efficiency by _REGEN_EFFICIENCY_FACTOR
+        # (the old factor double-counted motor+inverter losses already
+        # encoded in the MotorEfficiencyMap).  The motor-vs-regen
+        # asymmetry is a small (~1-2 pp) offset — apply it on BOTH the
+        # map and fallback paths so the two are consistent and the
+        # "motor map off" toggle doesn't silently change regen
+        # accounting by 2 pp.
         if self._efficiency_map is not None:
-            eta_regen = self._efficiency_map.efficiency(
+            eta_motoring = self._efficiency_map.efficiency(
                 motor_rpm, abs(motor_torque_nm)
             )
+            eta_regen = max(0.0, eta_motoring - self._REGEN_EFFICIENCY_OFFSET_PP)
         else:
             eta_regen = self._regen_efficiency_fallback
         return p_mechanical * eta_regen

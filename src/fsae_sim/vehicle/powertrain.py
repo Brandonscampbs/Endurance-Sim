@@ -21,7 +21,12 @@ class PowertrainConfig:
     drivetrain_efficiency: float
     # LVCU torque command parameters (from real LVCU Code.txt)
     lvcu_power_constant: float = 420.0        # 4200 in 0.1Nm CAN units / 10
-    lvcu_rpm_scale: float = 0.1076            # RPM to angular velocity scale
+    # Firmware fixed-point constant; intentionally offset from pi/30 ≈ 0.10472
+    # (~2.7%).  Matches the LVCU's own rpm→omega conversion so the
+    # power-ceiling math reproduces firmware behaviour.  Do NOT replace
+    # with math.pi/30 — doing so would shift the constant-power torque
+    # curve by ~2.7% relative to the real car.
+    lvcu_rpm_scale: float = 0.1076            # RPM to angular velocity scale (firmware)
     lvcu_omega_floor: float = 23.04           # 230.4 in CAN units / 10
     lvcu_pedal_deadzone_low: float = 0.1      # tmap_lut V_MIN
     lvcu_pedal_deadzone_high: float = 0.9     # tmap_lut V_MAX

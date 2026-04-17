@@ -155,8 +155,15 @@ class CorneringSolver:
         a_lat = speed * speed * curvature  # m/s^2
         a_lat_g = a_lat / self.GRAVITY  # in g-units
 
-        # Per-tire normal loads: (FL, FR, RL, RR)
-        fl, fr, rl, rr = self._load_transfer.tire_loads(speed, a_lat_g, 0.0)
+        # Per-tire normal loads: (FL, FR, RL, RR).
+        # Pass longitudinal_g through so the load transfer reflects
+        # simultaneous accel/brake weight shift (front-to-rear), not
+        # just pure lateral transfer.  Without this, fx/fy capacity in
+        # the ellipse is computed on pure-cornering loads even under
+        # trail-brake / corner-exit accel.
+        fl, fr, rl, rr = self._load_transfer.tire_loads(
+            speed, a_lat_g, longitudinal_g,
+        )
 
         # Roll angle estimation
         # Total lateral force = mass * a_lat
@@ -212,7 +219,17 @@ class CorneringSolver:
 
             total_capacity = 0.0
             for fz, camber, fx in zip(loads, cambers, fx_per_tire):
-                fx_peak = self._tire.peak_longitudinal_force(fz, camber)
+                # Apply mu_scale to BOTH peaks so the ellipse axes scale
+                # consistently in low-grip conditions.  Earlier code
+                # scaled only fy_peak (after the sqrt), which meant
+                # fx_ratio was measured against an unscaled fx_peak and
+                # under-reported saturation when mu_scale < 1.
+                fx_peak = (
+                    self._tire.peak_longitudinal_force(fz, camber) * mu_scale
+                )
+                fy_peak = (
+                    self._tire.peak_lateral_force(fz, camber) * mu_scale
+                )
                 # Physical friction ellipse (NF-33): no 0.99 cap — when the
                 # tire is at or past longitudinal peak it has zero lateral
                 # capacity, not 14%.  Divide-by-zero is protected by fx_peak
@@ -221,10 +238,9 @@ class CorneringSolver:
                     fx_ratio = min(abs(fx) / fx_peak, 1.0)
                 else:
                     fx_ratio = 1.0
-                fy_peak = self._tire.peak_lateral_force(fz, camber)
                 arg = max(0.0, 1.0 - fx_ratio * fx_ratio)
                 fy_available = fy_peak * math.sqrt(arg)
-                total_capacity += fy_available * mu_scale
+                total_capacity += fy_available
         else:
             # Pure cornering (no longitudinal demand)
             total_capacity = sum(

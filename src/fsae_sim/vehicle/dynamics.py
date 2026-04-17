@@ -199,37 +199,43 @@ class VehicleDynamics:
         if normal_load < 1.0 or f_lat_needed < 1.0:
             return 0.0
 
-        # Use pi/2 as the upper search bound, consistent with peak_lateral_force.
-        _ALPHA_MAX = math.pi / 2.0
+        # Pacejka Fy is non-monotonic past its peak: it rises, hits
+        # peak_Fy at alpha_peak, then decays.  Brentq over a non-monotonic
+        # interval can pick either the pre-peak or post-peak root; we
+        # always want the pre-peak (smaller) solution.  Approach:
+        #   1. Locate alpha_peak numerically within [0.001, 0.5 rad].
+        #   2. If demand exceeds peak_Fy, tire is saturated — return
+        #      alpha_peak (the physically correct "stuck" slip angle).
+        #   3. Otherwise Fy is monotonic in [0, alpha_peak]; brentq finds
+        #      the unique pre-peak root there.
+        # This replaces the earlier check `f_lat_needed >= Fy(pi/2)`,
+        # which mistakenly classified demands between Fy(pi/2) (post-peak
+        # degraded) and peak_Fy as saturated.
+        _ALPHA_SEARCH_MAX = 0.5  # ~29 deg — past any physical peak
 
-        # Pacejka models can produce a small non-zero Fy at alpha=0 due to
-        # residual camber/alignment effects.  When f_lat_needed is less than
-        # that residual, both bracket endpoints have the same sign and brentq
-        # would raise.  The demanded lateral force is already met at zero slip.
+        # Pacejka residual at alpha=0 (from SVy / camber); demands below
+        # this are already satisfied at zero slip.
         fy_at_zero = abs(self.tire_model.lateral_force(0.0, normal_load))
         if f_lat_needed <= fy_at_zero:
             return 0.0
 
-        # When demand exceeds what the tire can produce within [0, _ALPHA_MAX],
-        # the tire is saturated — return the slip angle at the bracket ceiling.
-        fy_at_max = abs(self.tire_model.lateral_force(_ALPHA_MAX, normal_load))
-        if f_lat_needed >= fy_at_max:
-            result = minimize_scalar(
-                lambda a: -abs(
-                    self.tire_model.lateral_force(a, normal_load)
-                ),
-                bounds=(0.001, _ALPHA_MAX),
-                method="bounded",
-            )
-            return abs(result.x)
+        result = minimize_scalar(
+            lambda a: -abs(self.tire_model.lateral_force(a, normal_load)),
+            bounds=(0.001, _ALPHA_SEARCH_MAX),
+            method="bounded",
+        )
+        alpha_peak = abs(result.x)
+        peak_fy = abs(self.tire_model.lateral_force(alpha_peak, normal_load))
 
-        # Fy is monotonic below peak — brentq finds the unique root
+        if f_lat_needed >= peak_fy:
+            return alpha_peak  # saturated — no pre-peak solution exists
+
         return brentq(
             lambda a: abs(
                 self.tire_model.lateral_force(a, normal_load)
             ) - f_lat_needed,
             0.0,
-            _ALPHA_MAX,
+            alpha_peak,
             xtol=1e-4,
         )
 

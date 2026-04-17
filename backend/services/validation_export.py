@@ -125,23 +125,28 @@ def _compute_per_lap_metrics(
             _lap_metric("Mean pack voltage", "V", real_v, sim_v, target_pct=5.0)
         )
 
-    # --- Energy consumed (positive-power-only, fix C3) ---
+    # --- Energy consumed (net: discharge − regen) ---
+    # Signed-power integration matches the main validation.py aggregate
+    # ("Energy consumed (net)") and the FSAE competition meter.  Using
+    # np.maximum(p, 0) dropped regen and left two "Energy consumed"
+    # numbers on the Verification page with different conventions.
     if len(sim_lap) > 0 and len(real_lap) > 1:
         sim_power = sim_lap["electrical_power_w"].values
         sim_dt = sim_lap["segment_time_s"].values
-        sim_energy_kwh = float(np.sum(np.maximum(sim_power, 0.0) * sim_dt)) / 3_600_000.0
+        sim_energy_kwh = float(np.sum(sim_power * sim_dt)) / 3_600_000.0
 
         real_power = (
             real_lap["Pack Voltage"].values * real_lap["Pack Current"].values
         )
         real_dt = real_lap["Time"].diff().fillna(0).values
         real_energy_kwh = (
-            float(np.sum(np.maximum(real_power, 0.0) * real_dt)) / 3_600_000.0
+            float(np.sum(real_power * real_dt)) / 3_600_000.0
         )
         if real_energy_kwh > 0.01:
             metrics.append(
                 _lap_metric(
-                    "Energy consumed", "kWh", real_energy_kwh, sim_energy_kwh,
+                    "Energy consumed (net)", "kWh",
+                    real_energy_kwh, sim_energy_kwh,
                     target_pct=15.0,
                 )
             )
@@ -317,16 +322,15 @@ def get_all_laps_summary() -> AllLapsResponse:
         real_time = float(real_lap["Time"].iloc[-1] - real_lap["Time"].iloc[0])
         time_err = abs(sim_time - real_time) / real_time * 100 if real_time > 0 else 0
 
-        # (C3) Energy = positive-power-only V*I*dt on both sim and real to match
-        # the full-endurance convention in validate_full_endurance (regen is
-        # excluded from "energy consumed"). Previous signed integral made the
-        # per-lap number incomparable to the all-laps aggregate.
+        # Energy = signed V*I*dt (net: discharge − regen) on both sides,
+        # matching validate_full_endurance's "Energy consumed (net)"
+        # aggregate and the FSAE competition meter convention.
         sim_power = sim_lap["electrical_power_w"].values
         sim_dt = sim_lap["segment_time_s"].values
-        sim_energy = float(np.sum(np.maximum(sim_power, 0.0) * sim_dt)) / 3_600_000
+        sim_energy = float(np.sum(sim_power * sim_dt)) / 3_600_000
         real_dt = real_lap["Time"].diff().fillna(0).values
         real_power = real_lap["Pack Voltage"].values * real_lap["Pack Current"].values
-        real_energy = float(np.sum(np.maximum(real_power, 0.0) * real_dt)) / 3_600_000
+        real_energy = float(np.sum(real_power * real_dt)) / 3_600_000
         energy_err = abs(sim_energy - real_energy) / abs(real_energy) * 100 if real_energy != 0 else 0
 
         sim_mean_speed = float(sim_lap["speed_kmh"].mean())

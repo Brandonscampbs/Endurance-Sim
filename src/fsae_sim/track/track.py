@@ -188,12 +188,11 @@ class Track:
         ref_lat: float = float(lat[0])
         ref_lon: float = float(lon_arr[0])
         # Approximate metre-to-degree scaling near the reference latitude.
-        # At 42.7 deg N (Michigan), 1 deg lat ~ 111 320 m, 1 deg lon ~ 81 800 m.
-        # The gate radius is in degrees — kept tight (~2 m) so crossings are
-        # distinct events rather than a slow-drift through the start zone.
+        # At 42.7 deg N (Michigan), 1 deg lat ~ 111 320 m, 1 deg lon ~ 81 800 m
+        # — a 1.36× anisotropy.  Scale d_lon by cos(ref_lat) so the gate is
+        # a real circle rather than an ellipse stretched east-west.
         d_lat = lat - ref_lat
-        d_lon = lon_arr - ref_lon
-        # Use chord distance in degrees; adequate for the tight gate radius.
+        d_lon = (lon_arr - ref_lon) * math.cos(math.radians(ref_lat))
         dist_to_ref = np.sqrt(d_lat ** 2 + d_lon ** 2)
 
         inside_gate = dist_to_ref < _SF_GATE_RADIUS_DEG
