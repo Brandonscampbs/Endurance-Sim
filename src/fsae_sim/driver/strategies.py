@@ -725,11 +725,18 @@ class PedalProfileStrategy(DriverStrategy):
 
         final_actions = np.zeros(num_segments, dtype=int)
         brake_threshold_norm = brake_threshold / brake_norm
+        # D-01: classify on torque fraction, not raw pedal %.
+        # `final_throttle` is the median LVCU-torque / inverter_cap per
+        # segment (or pedal/100 fallback). Using it directly keeps the
+        # classifier aligned with the intensity the driver will actually
+        # command, so low-pedal-but-high-torque segments (back-EMF-limited
+        # region) no longer drop to COAST. Threshold is 3% of inverter cap.
+        TORQUE_FRACTION_THROTTLE_THRESHOLD = 0.03
         for i in range(num_segments):
             if final_brake[i] > brake_threshold_norm:
                 final_actions[i] = 2
                 final_throttle[i] = 0.0
-            elif final_pedal[i] > throttle_threshold:
+            elif final_throttle[i] > TORQUE_FRACTION_THROTTLE_THRESHOLD:
                 final_actions[i] = 1
                 final_brake[i] = 0.0
             else:

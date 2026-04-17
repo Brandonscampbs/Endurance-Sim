@@ -310,3 +310,53 @@ class TestFromTelemetry:
 
         strategy = PedalProfileStrategy.from_telemetry(aim_df, track)
         assert np.all(strategy._ref_speed_ms > 0.0)
+
+    def test_d01_classify_on_torque_fraction(self):
+        """D-01: a segment with low raw pedal (3%) but high torque request
+        (15% of inverter cap) should classify as THROTTLE with the torque
+        fraction as intensity — not COAST based on raw pedal alone."""
+        from fsae_sim.driver.strategies import PedalProfileStrategy
+
+        n_samples = 400
+        n_half = n_samples // 2
+        lap_distance = 50.0
+        dist_per_lap = np.linspace(0, lap_distance, n_half, endpoint=False)
+        dist = np.concatenate([dist_per_lap, dist_per_lap + lap_distance])
+        speed = np.full(len(dist), 40.0)
+
+        # Raw pedal pinned at 3% throughout (below the old 5% threshold).
+        throttle = np.full(len(dist), 3.0)
+        # LVCU Torque Req at 15% of inverter cap (85 Nm) = 12.75 Nm.
+        torque_req = np.full(len(dist), 0.15 * 85.0)
+        brake_f = np.zeros(len(dist))
+        brake_r = np.zeros(len(dist))
+
+        lat = np.linspace(42.0, 42.001, n_half)
+        lat = np.concatenate([lat, lat])
+        lon = np.full(len(dist), -83.5)
+
+        aim_df = pd.DataFrame({
+            "Distance on GPS Speed": dist,
+            "GPS Speed": speed,
+            "Throttle Pos": throttle,
+            "LVCU Torque Req": torque_req,
+            "FBrakePressure": brake_f,
+            "RBrakePressure": brake_r,
+            "GPS Latitude": lat,
+            "GPS Longitude": lon,
+            "GPS LatAcc": np.zeros(len(dist)),
+            "GPS Slope": np.zeros(len(dist)),
+        })
+        track = make_track(n_segments=10, length_m=5.0)
+        strategy = PedalProfileStrategy.from_telemetry(aim_df, track)
+
+        # All segments should classify as THROTTLE (action==1).
+        assert np.any(strategy._actions == 1), (
+            "D-01: low pedal + high torque must classify as THROTTLE, "
+            f"got actions={strategy._actions!r}"
+        )
+        throttle_mask = strategy._actions == 1
+        # Intensity should be the torque fraction, ~0.15.
+        np.testing.assert_allclose(
+            strategy._throttle_pct[throttle_mask], 0.15, atol=0.01,
+        )
