@@ -282,19 +282,17 @@ class CalibratedStrategy(DriverStrategy):
         zones: list[DriverZone],
         num_segments: int,
         name: str = "calibrated",
-        segment_intensities: np.ndarray | None = None,
     ) -> None:
         self.name = name
         self._zones = list(zones)
         self._num_segments = num_segments
-        # Kept for diagnostic/inspection use only. Audit C13: per-segment
-        # intensities MUST NOT override zone intensity at runtime — the
-        # driver brief (`to_driver_brief`) and sim `decide()` must agree,
-        # and both report zone-level intensity. Per-segment data feeds
-        # zone aggregation upstream (see `from_telemetry`).
-        self._segment_intensities = (
-            segment_intensities.copy() if segment_intensities is not None else None
-        )
+
+        # D-02: per-segment intensity override has been removed entirely.
+        # Zones are the unit of control: `decide()`, `to_driver_brief()`,
+        # and `to_dataframe()` all read `zone.intensity` exclusively. The
+        # previous two-pass init (write zone intensity, then overwrite
+        # from `segment_intensities`) created a three-way inconsistency
+        # between runtime behavior, exported dataframe, and driver brief.
 
         # Build flat lookup: segment_idx -> (action, intensity, max_speed_ms)
         self._segment_actions: list[tuple[ControlAction, float, float]] = [
@@ -384,15 +382,7 @@ class CalibratedStrategy(DriverStrategy):
                 ))
             else:
                 new_zones.append(z)
-        # Carry per-segment intensities (diagnostic only — not used at
-        # runtime after C13 fix). Copy so the derived strategy doesn't
-        # alias the original's array.
-        new_seg_intensities = (
-            self._segment_intensities.copy()
-            if self._segment_intensities is not None else None
-        )
-        return CalibratedStrategy(new_zones, self._num_segments, name=self.name,
-                                  segment_intensities=new_seg_intensities)
+        return CalibratedStrategy(new_zones, self._num_segments, name=self.name)
 
     @classmethod
     def from_telemetry(
@@ -456,11 +446,9 @@ class CalibratedStrategy(DriverStrategy):
         )
         zones = collapse_to_zones(seg_actions, track, merge_tolerance=merge_tolerance)
 
-        # Extract per-segment intensities for fine-grained driver modulation
-        segment_intensities = seg_actions["intensity"].values.copy()
-
-        return cls(zones, track.num_segments, name=name,
-                   segment_intensities=segment_intensities)
+        # D-02: no per-segment intensity passed — zone intensity is the
+        # single source of runtime truth.
+        return cls(zones, track.num_segments, name=name)
 
     @classmethod
     def from_zone_list(

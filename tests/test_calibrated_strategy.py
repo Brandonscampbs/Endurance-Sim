@@ -149,30 +149,18 @@ class TestHelpers:
         assert "Straight" in brief
         assert "Turn 1" in brief
 
-    def test_decide_uses_zone_intensity_not_per_segment(self):
-        """C13: decide() must return zone.intensity, not per-segment overrides.
-
-        Brief (``to_driver_brief``) and sim runtime must agree: both read
-        the zone-level intensity. Per-segment intensity arrays are only
-        used as an input to zone aggregation, never as a runtime override.
+    def test_decide_uses_zone_intensity(self):
+        """D-02: decide() returns zone.intensity. The `segment_intensities`
+        parameter has been removed — zones are the single source of
+        runtime truth so `to_driver_brief()`, `to_dataframe()`, and
+        `decide()` all agree.
         """
-        import numpy as np
-
         zones = make_zones()  # throttle zone 0 has intensity 0.8
-        # Pass per-segment intensities that DIFFER from zone intensity.
-        # If decide() reads per-segment (the C13 bug), it returns 0.2.
-        # Correct behavior: decide() returns 0.8 (the zone intensity).
-        seg_intensities = np.array([0.2] * 10)
-        strategy = CalibratedStrategy(
-            zones, num_segments=10,
-            segment_intensities=seg_intensities,
-        )
+        strategy = CalibratedStrategy(zones, num_segments=10)
 
         cmd = strategy.decide(make_state(segment_idx=0), [])
         assert cmd.action == ControlAction.THROTTLE
-        assert cmd.throttle_pct == pytest.approx(0.8), (
-            "decide() should return zone intensity (0.8), not per-segment (0.2)"
-        )
+        assert cmd.throttle_pct == pytest.approx(0.8)
 
     def test_with_zone_override(self):
         zones = make_zones()
@@ -201,11 +189,9 @@ class TestZoneIntensityIsAuthoritative:
     Otherwise to_driver_brief() and the simulated behavior diverge.
     """
 
-    def test_decide_returns_zone_intensity_not_segment(self):
-        """Build zones with intensity=0.8, pass segment_intensities=[0.2]*10.
-        decide() must return 0.8 (zone-level), NOT 0.2 (per-segment).
-        """
-        import numpy as np
+    def test_decide_returns_zone_intensity(self):
+        """D-02: decide() returns the zone's intensity for every segment
+        in the zone range."""
         zones = [
             DriverZone(
                 zone_id=0, segment_start=0, segment_end=9,
@@ -214,21 +200,15 @@ class TestZoneIntensityIsAuthoritative:
                 label="Full Straight",
             )
         ]
-        per_segment = np.full(10, 0.2)
-        strategy = CalibratedStrategy(
-            zones, num_segments=10, segment_intensities=per_segment,
-        )
+        strategy = CalibratedStrategy(zones, num_segments=10)
 
         for seg_idx in range(10):
             cmd = strategy.decide(make_state(segment_idx=seg_idx), [])
             assert cmd.action == ControlAction.THROTTLE
-            assert cmd.throttle_pct == pytest.approx(0.8), (
-                f"segment {seg_idx} returned {cmd.throttle_pct}, expected 0.8"
-            )
+            assert cmd.throttle_pct == pytest.approx(0.8)
 
     def test_brief_matches_decide(self):
-        """to_driver_brief() and decide() must agree on intensity."""
-        import numpy as np
+        """D-02: to_driver_brief() and decide() agree on zone intensity."""
         zones = [
             DriverZone(
                 zone_id=0, segment_start=0, segment_end=4,
@@ -241,14 +221,15 @@ class TestZoneIntensityIsAuthoritative:
                 distance_start_m=250.0, distance_end_m=500.0, label="Turn 1",
             ),
         ]
-        per_segment = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
-        strategy = CalibratedStrategy(
-            zones, num_segments=10, segment_intensities=per_segment,
-        )
+        strategy = CalibratedStrategy(zones, num_segments=10)
 
         brief = strategy.to_driver_brief()
-        # Brief reports 75% throttle in zone 0
         assert "75% throttle" in brief
-        # And decide() must also use 75% throttle
         cmd = strategy.decide(make_state(segment_idx=2), [])
         assert cmd.throttle_pct == pytest.approx(0.75)
+
+    def test_segment_intensities_param_removed(self):
+        """D-02: `segment_intensities` is no longer a __init__ kwarg."""
+        import inspect
+        sig = inspect.signature(CalibratedStrategy.__init__)
+        assert "segment_intensities" not in sig.parameters
