@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from fsae_sim.driver.strategy import ControlAction, DriverStrategy, SimState
-from fsae_sim.driver.strategies import CalibratedStrategy, PedalProfileStrategy, ReplayStrategy
+from fsae_sim.driver.strategies import CalibratedStrategy, ReplayStrategy
 from fsae_sim.track.track import Track
 from fsae_sim.vehicle import VehicleConfig
 from fsae_sim.vehicle.battery_model import BatteryModel
@@ -41,25 +41,22 @@ except ImportError:
 
 @dataclass
 class SimResult:
-    """Output of a single simulation run.
-
-    Energy accounting (D-05): gross discharge and regen recovery are
-    tracked separately, and ``total_energy_kwh`` reports **net**
-    consumption (discharge - regen).  Consumers that need gross figures
-    should read ``total_discharge_kwh`` / ``total_regen_kwh`` directly.
-    """
+    """Output of a single simulation run."""
 
     config_name: str
     strategy_name: str
     track_name: str
     states: pd.DataFrame  # time series of per-segment state snapshots
     total_time_s: float
-    total_energy_kwh: float  # net = discharge - regen
+    total_energy_kwh: float
     final_soc: float
     laps_completed: int
-    total_discharge_kwh: float = 0.0
-    total_regen_kwh: float = 0.0
-    total_net_kwh: float = 0.0
+    # C8: track discharge and regen separately so we can reconcile the
+    # energy budget against telemetry.  ``total_energy_kwh`` remains the
+    # discharge-only number for backwards compatibility.
+    discharge_energy_kwh: float = 0.0
+    regen_energy_kwh: float = 0.0
+    net_energy_kwh: float = 0.0
 
 
 class SimulationEngine:
@@ -84,10 +81,17 @@ class SimulationEngine:
         self.strategy = strategy
         self.battery_model = battery_model
 
-        # Load motor efficiency map if available
+        # Load motor efficiency map if available.
+        # NF-3: resolve path relative to the package, not the caller's CWD,
+        # so sims run from any directory (tests, webapp, notebooks).
         motor_map = None
         if _HAS_MOTOR_MAP:
-            motor_map_path = Path("Real-Car-Data-And-Stats/emrax228_hv_cc_motor_map_long.csv")
+            repo_root = Path(__file__).resolve().parents[3]
+            motor_map_path = (
+                repo_root
+                / "Real-Car-Data-And-Stats"
+                / "emrax228_hv_cc_motor_map_long.csv"
+            )
             if motor_map_path.exists():
                 motor_map = MotorEfficiencyMap(motor_map_path)
 
@@ -151,17 +155,10 @@ class SimulationEngine:
         temp = initial_temp_c
         pack_voltage = self.battery_model.pack_voltage(soc, 0.0)
 
-        # Termination temperature: top of the configured discharge-limit table
-        # (the last entry is the hottest, where max_current_a hits 0 and the
-        # pack is effectively disabled by the BMS).  Pulled from config to
-        # avoid the NF-42 magic-number duplication.
-        termination_temp_c = self.vehicle.battery.discharge_limits[-1].temp_c
-
-        # Accumulator for energy (D-05: track discharge, regen, net
-        # separately — previously only positive power was summed,
-        # discarding regen recovery entirely).
-        total_discharge_j = 0.0
-        total_regen_j = 0.0
+        # Accumulator for energy (C8: discharge and regen tracked separately)
+        total_energy_j = 0.0
+        discharge_energy_j = 0.0
+        regen_energy_j = 0.0
 
         # State log
         records: list[dict] = []
@@ -170,7 +167,7 @@ class SimulationEngine:
         # Pre-compute speed envelope (cornering limits from tire grip)
         v_max = self._envelope.compute(initial_speed=speed)
         is_replay = isinstance(self.strategy, ReplayStrategy)
-        is_calibrated = isinstance(self.strategy, (CalibratedStrategy, PedalProfileStrategy))
+        is_calibrated = isinstance(self.strategy, CalibratedStrategy)
 
         for lap in range(num_laps):
             for seg_idx, segment in enumerate(segments):
@@ -209,20 +206,18 @@ class SimulationEngine:
                 # 3. Compute forces based on driver action
                 #    ReplayStrategy: use recorded LVCU Torque Req directly
                 #    (already the final inverter command, no re-processing).
-                #    CalibratedStrategy / PedalProfileStrategy: throttle_pct
-                #    is a calibrated pedal fraction (0-1). AiM's Throttle
-                #    Pos is already de-dead-zoned by sensor calibration.
-                #    Use lvcu_torque_ceiling to apply power limiting
-                #    without double-processing the dead zone.
+                #    CalibratedStrategy: intensity is a torque fraction
+                #    (LVCU Torque Req / 85 Nm), already through the dead
+                #    zone remap. Use lvcu_torque_ceiling to apply power
+                #    limiting without double-processing the dead zone.
                 #    Other strategies: raw throttle through full LVCU model.
                 if cmd.action == ControlAction.THROTTLE:
                     if is_replay:
-                        # D-15: replay torque is the measured delivered
-                        # torque — field-weakening is already baked in.
-                        # Do not apply torque_delivery_factor here
-                        # (double-count).
                         seg_mid_dist = distance + segment.length_m / 2.0
-                        motor_torque = self.strategy.target_torque(seg_mid_dist)
+                        motor_torque = (
+                            self.strategy.target_torque(seg_mid_dist)
+                            * self.powertrain.torque_delivery_factor(motor_rpm)
+                        )
                     elif is_calibrated:
                         ceiling = self.powertrain.lvcu_torque_ceiling(
                             motor_rpm, bms_current_limit,
@@ -262,12 +257,11 @@ class SimulationEngine:
                 # Recompute torque at resolved avg speed for accurate power calc
                 if cmd.action == ControlAction.THROTTLE:
                     if is_replay:
-                        # D-15: replay torque is the measured delivered
-                        # torque — field-weakening is already baked in.
-                        # Do not apply torque_delivery_factor here
-                        # (double-count).
                         seg_mid_dist = distance + segment.length_m / 2.0
-                        motor_torque = self.strategy.target_torque(seg_mid_dist)
+                        motor_torque = (
+                            self.strategy.target_torque(seg_mid_dist)
+                            * self.powertrain.torque_delivery_factor(motor_rpm)
+                        )
                     elif is_calibrated:
                         ceiling = self.powertrain.lvcu_torque_ceiling(
                             motor_rpm, bms_current_limit,
@@ -278,52 +272,22 @@ class SimulationEngine:
                             cmd.throttle_pct, motor_rpm, bms_current_limit,
                         )
                 elif cmd.action == ControlAction.BRAKE:
-                    # D-16: derive the regen motor torque from the
-                    # *tire-clipped* wheel force, not from the raw brake
-                    # command × max torque.  The regen_f value above
-                    # was already clamped to the tire grip envelope via
-                    # max_braking_force; using -cmd.brake_pct × max_torque
-                    # here would credit the pack with energy the tires
-                    # couldn't actually apply.
-                    #
-                    # Inverse of wheel_torque / wheel_force, with sign
-                    # preserved:
-                    #   F_wheel = T_motor · gear_ratio · η_gearbox / r
-                    #   T_motor = F_wheel · r / (gear_ratio · η_gearbox)
-                    # regen_f is negative (decelerating); the resulting
-                    # motor_torque is also negative (regen).
-                    gr = self.powertrain.config.gear_ratio
-                    eta_g = self.powertrain._GEARBOX_EFFICIENCY
-                    motor_torque = (
-                        regen_f * self.powertrain.TIRE_RADIUS_M
-                        / (gr * eta_g)
-                    )
+                    # NF-5: derive motor_torque from the tire-clipped regen_f
+                    # rather than the raw brake command.  When the wheel can't
+                    # support the requested regen force we must reflect the
+                    # clipped force in the electrical power calculation too,
+                    # otherwise the sim reports more regen energy than the
+                    # tires actually transferred.
+                    gear = self.powertrain.config.gear_ratio
+                    eff = self.powertrain._GEARBOX_EFFICIENCY
+                    tire_r = self.powertrain.TIRE_RADIUS_M
+                    # regen_f is negative (braking); motor_torque is negative.
+                    motor_torque = regen_f * tire_r / (gear * eff)
                 else:
                     motor_torque = 0.0
 
-                # 7. Electrical power and pack current.
-                #
-                # D-13: asymmetric power source by strategy type —
-                #   * Replay with measured V×I: use the recorded pack
-                #     terminal power directly. That's ground truth —
-                #     it bypasses every torque-sensor bias and every
-                #     motor-efficiency-map uncertainty.  CAN Torque
-                #     Feedback has a documented ~10% positive bias
-                #     vs what V×I energy implies, so computing
-                #     P = T·ω / η here would over-count discharge.
-                #   * All other paths (CalibratedStrategy,
-                #     PedalProfileStrategy, CoastOnly, ThreshBrake,
-                #     Replay without V×I): modeled electrical power
-                #     via PowertrainModel.electrical_power, which
-                #     dispatches on motor state (D-17) and consumes
-                #     pack_voltage for the back-EMF rectifier branch.
-                if is_replay and self.strategy.has_electrical_power:
-                    seg_mid_dist = distance + segment.length_m / 2.0
-                    elec_power = self.strategy.measured_electrical_power(seg_mid_dist)
-                else:
-                    elec_power = self.powertrain.electrical_power(
-                        motor_torque, motor_rpm, pack_voltage,
-                    )
+                # 7. Electrical power and pack current
+                elec_power = self.powertrain.electrical_power(motor_torque, motor_rpm)
                 if pack_voltage > 0:
                     pack_current = elec_power / pack_voltage
                 else:
@@ -337,15 +301,17 @@ class SimulationEngine:
                     pack_current, seg_time, soc, temp,
                 )
 
-                # 10. Energy accounting (D-05)
-                #     discharge = positive power into the motor
-                #     regen     = negative power recovered to the pack
-                #     net       = discharge - regen
+                # 10. Energy accounting.
+                # C8: keep discharge-only (positive pack power) for legacy
+                # metric ``total_energy_kwh`` but also accumulate regen and
+                # net so the verification page can reconcile against
+                # telemetry's pack V*I integral.
                 segment_energy_j = elec_power * seg_time
-                if segment_energy_j > 0.0:
-                    total_discharge_j += segment_energy_j
+                if segment_energy_j > 0:
+                    total_energy_j += segment_energy_j
+                    discharge_energy_j += segment_energy_j
                 else:
-                    total_regen_j += -segment_energy_j
+                    regen_energy_j += -segment_energy_j
 
                 # 11. Record state
                 records.append({
@@ -358,8 +324,7 @@ class SimulationEngine:
                     "soc_pct": soc,
                     "pack_voltage_v": pack_voltage,
                     "pack_current_a": pack_current,
-                    "cell_temp_c": temp,  # deprecated alias; prefer mean_cell_temp_c
-                    "mean_cell_temp_c": temp,  # NF-10: lumped-mean cell temperature (AiM Pack Temp is max-cell)
+                    "cell_temp_c": temp,
                     "motor_rpm": motor_rpm,
                     "motor_torque_nm": motor_torque,
                     "electrical_power_w": elec_power,
@@ -387,44 +352,43 @@ class SimulationEngine:
                 # Check termination conditions
                 if soc <= self.vehicle.battery.discharged_soc_pct:
                     return self._build_result(
-                        records, time, total_discharge_j, total_regen_j,
-                        soc, laps_completed,
+                        records, time, total_energy_j, soc, laps_completed,
+                        discharge_energy_j, regen_energy_j,
                     )
-                if temp >= termination_temp_c:
+                if temp >= 65.0:
                     return self._build_result(
-                        records, time, total_discharge_j, total_regen_j,
-                        soc, laps_completed,
+                        records, time, total_energy_j, soc, laps_completed,
+                        discharge_energy_j, regen_energy_j,
                     )
 
             laps_completed += 1
 
         return self._build_result(
-            records, time, total_discharge_j, total_regen_j,
-            soc, laps_completed,
+            records, time, total_energy_j, soc, laps_completed,
+            discharge_energy_j, regen_energy_j,
         )
 
     def _build_result(
         self,
         records: list[dict],
         total_time: float,
-        total_discharge_j: float,
-        total_regen_j: float,
+        total_energy_j: float,
         final_soc: float,
         laps_completed: int,
+        discharge_energy_j: float = 0.0,
+        regen_energy_j: float = 0.0,
     ) -> SimResult:
         states = pd.DataFrame(records)
-        total_net_j = total_discharge_j - total_regen_j
         return SimResult(
             config_name=self.vehicle.name,
             strategy_name=self.strategy.name,
             track_name=self.track.name,
             states=states,
             total_time_s=total_time,
-            # D-05: default total_energy_kwh is NET consumption.
-            total_energy_kwh=total_net_j / 3.6e6,
+            total_energy_kwh=total_energy_j / 3.6e6,
             final_soc=final_soc,
             laps_completed=laps_completed,
-            total_discharge_kwh=total_discharge_j / 3.6e6,
-            total_regen_kwh=total_regen_j / 3.6e6,
-            total_net_kwh=total_net_j / 3.6e6,
+            discharge_energy_kwh=discharge_energy_j / 3.6e6,
+            regen_energy_kwh=regen_energy_j / 3.6e6,
+            net_energy_kwh=(discharge_energy_j - regen_energy_j) / 3.6e6,
         )
