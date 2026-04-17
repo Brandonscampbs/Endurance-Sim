@@ -619,14 +619,10 @@ class PedalProfileStrategy(DriverStrategy):
             if laps is not None:
                 selected = [lap_boundaries[i] for i in laps if i < len(lap_boundaries)]
             else:
-                selected = []
-                median_dist = float(np.median([d for _, _, d in lap_boundaries]))
-                for i, (s, e, d) in enumerate(lap_boundaries):
-                    if i == 0:
-                        continue
-                    if abs(d - median_dist) > median_dist * 0.15:
-                        continue
-                    selected.append((s, e, d))
+                # D-18: distance + time + mean_speed filter (shared
+                # helper with extract_per_segment_actions).
+                from fsae_sim.analysis.telemetry_analysis import _auto_select_laps
+                selected = _auto_select_laps(aim_df, lap_boundaries)
             if not selected:
                 selected = lap_boundaries
         else:

@@ -178,6 +178,72 @@ def extract_per_segment_actions(
         )
 
 
+def _auto_select_laps(
+    aim_df: pd.DataFrame,
+    lap_boundaries: list[tuple[int, int, float]],
+    *,
+    distance_tolerance: float = 0.15,
+    time_tolerance: float = 0.20,
+    min_mean_speed_fraction: float = 0.70,
+) -> list[tuple[int, int, float]]:
+    """D-18: filter laps by distance AND time AND mean_speed.
+
+    The old filter only checked distance (±15% of median), which let the
+    driver-change lap through (normal distance, long dwell time at
+    stationary pause, low mean speed). Now we also reject laps whose
+    duration is >20% off the median and whose mean moving speed is
+    below 70% of the across-laps median mean speed.
+
+    Always skips lap index 0 (warmup / pit-out partial).
+    """
+    if len(lap_boundaries) == 0:
+        return []
+
+    # Compute per-lap duration and mean speed.
+    durations: list[float] = []
+    mean_speeds: list[float] = []
+    has_time = "Time" in aim_df.columns
+    speed_col = aim_df.get("GPS Speed")
+    n_rows = len(aim_df)
+    for start_idx, end_idx, _ in lap_boundaries:
+        # end_idx is exclusive; clamp for `iloc` to stay within bounds.
+        end_ref = min(end_idx, n_rows) - 1
+        start_ref = max(0, min(start_idx, n_rows - 1))
+        if has_time and end_ref > start_ref:
+            t = aim_df["Time"].iloc[end_ref] - aim_df["Time"].iloc[start_ref]
+            durations.append(float(t))
+        else:
+            durations.append(float("nan"))
+        if speed_col is not None:
+            v = speed_col.iloc[start_idx:end_idx].values
+            mean_speeds.append(float(np.mean(v)) if len(v) else 0.0)
+        else:
+            mean_speeds.append(float("nan"))
+
+    median_dist = float(np.median([d for _, _, d in lap_boundaries]))
+    # Medians robust to the outlier we're trying to reject.
+    finite_dur = [d for d in durations if np.isfinite(d)]
+    median_dur = float(np.median(finite_dur)) if finite_dur else float("nan")
+    finite_speed = [s for s in mean_speeds if np.isfinite(s)]
+    median_speed = float(np.median(finite_speed)) if finite_speed else float("nan")
+
+    selected: list[tuple[int, int, float]] = []
+    for i, (s, e, d) in enumerate(lap_boundaries):
+        if i == 0:
+            continue
+        if abs(d - median_dist) > median_dist * distance_tolerance:
+            continue
+        if np.isfinite(median_dur) and np.isfinite(durations[i]):
+            if abs(durations[i] - median_dur) > median_dur * time_tolerance:
+                continue
+        if np.isfinite(median_speed) and np.isfinite(mean_speeds[i]):
+            if mean_speeds[i] < min_mean_speed_fraction * median_speed:
+                continue
+        selected.append((s, e, d))
+
+    return selected
+
+
 def _detect_lap_boundaries_safe(
     aim_df: pd.DataFrame,
 ) -> list[tuple[int, int, float]]:
@@ -228,14 +294,7 @@ def _extract_per_lap_then_aggregate(
     if laps is not None:
         selected = [lap_boundaries[i] for i in laps if i < len(lap_boundaries)]
     else:
-        selected = []
-        median_dist = float(np.median([d for _, _, d in lap_boundaries]))
-        for i, (s, e, d) in enumerate(lap_boundaries):
-            if i == 0:
-                continue
-            if abs(d - median_dist) > median_dist * 0.15:
-                continue
-            selected.append((s, e, d))
+        selected = _auto_select_laps(aim_df, lap_boundaries)
 
     if not selected:
         selected = lap_boundaries

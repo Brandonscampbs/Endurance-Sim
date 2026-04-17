@@ -222,6 +222,52 @@ class TestDetectLaps:
 # ---------------------------------------------------------------------------
 
 
+class TestD18AutoSelectLaps:
+    """D-18: the auto-lap-select filter rejects the driver-change lap
+    (normal distance, extended time, low mean speed) — old filter only
+    checked distance and let it through."""
+
+    def test_driver_change_lap_rejected(self):
+        from fsae_sim.analysis.telemetry_analysis import _auto_select_laps
+
+        # 4 laps: normal, normal, driver-change, normal. Driver-change
+        # has normal distance but 50% longer time and 50% slower mean speed.
+        base_time = 60.0  # 60s per normal lap
+        base_speed = 40.0  # km/h
+        n_per_lap = 100
+        rows = []
+        boundaries = []
+        row_idx = 0
+        t = 0.0
+        for lap in range(4):
+            is_driver_change = (lap == 2)
+            lap_time = base_time * 1.5 if is_driver_change else base_time
+            lap_speed = base_speed * 0.5 if is_driver_change else base_speed
+            start_idx = row_idx
+            dt = lap_time / n_per_lap
+            for i in range(n_per_lap):
+                rows.append({
+                    "Time": t,
+                    "Distance on GPS Speed": row_idx * 5.0,  # unused
+                    "GPS Speed": lap_speed,
+                })
+                t += dt
+                row_idx += 1
+            # All laps have the same "distance" (sanity — filter needs
+            # distance matching median).
+            boundaries.append((start_idx, row_idx, 800.0))
+
+        df = pd.DataFrame(rows)
+        selected = _auto_select_laps(df, boundaries)
+        # Lap 0 skipped (warmup); lap 2 (driver change) rejected.
+        # Expect only laps 1 and 3.
+        start_indices = [s for s, _, _ in selected]
+        expected_starts = {boundaries[1][0], boundaries[3][0]}
+        assert set(start_indices) == expected_starts, (
+            f"Expected laps 1 & 3, got start_indices={start_indices!r}"
+        )
+
+
 class TestD07PerLapDistanceRescale:
     """Per-lap arc-length is rescaled to track.total_distance_m so that
     segment-midpoint lookups land at the right physical location across
