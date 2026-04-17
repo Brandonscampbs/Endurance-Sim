@@ -11,13 +11,6 @@ from fsae_sim.analysis.telemetry_analysis import (
     compare_driver_stints,
 )
 
-# NF-55: `compute_lap_times`, `compute_energy_per_lap`, and
-# `compute_pareto_frontier` in `fsae_sim.analysis.metrics` still raise
-# `NotImplementedError`.  They are intentionally NOT re-exported here so
-# IDE autocomplete and `from fsae_sim.analysis import *` do not suggest
-# callable APIs that aren't callable.  They remain importable directly
-# from `fsae_sim.analysis.metrics` until implemented or removed.
-
 __all__ = [
     "CompetitionField",
     "FSAEScoreResult",
