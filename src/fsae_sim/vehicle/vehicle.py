@@ -63,19 +63,22 @@ class VehicleConfig:
     def from_yaml(cls, path: str | Path) -> "VehicleConfig":
         """Load vehicle configuration from a YAML file."""
         path = Path(path)
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
         tire_data = data.get("tire")
         suspension_data = data.get("suspension")
 
-        return cls(
-            name=data["name"],
-            year=data["year"],
-            description=data["description"],
-            vehicle=VehicleParams(**data["vehicle"]),
-            powertrain=PowertrainConfig(**data["powertrain"]),
-            battery=BatteryConfig.from_dict(data["battery"]),
-            tire=TireConfig(**tire_data) if tire_data is not None else None,
-            suspension=SuspensionConfig(**suspension_data) if suspension_data is not None else None,
-        )
+        try:
+            return cls(
+                name=data["name"],
+                year=data["year"],
+                description=data["description"],
+                vehicle=VehicleParams(**data["vehicle"]),
+                powertrain=PowertrainConfig(**data["powertrain"]),
+                battery=BatteryConfig.from_dict(data["battery"]),
+                tire=TireConfig(**tire_data) if tire_data is not None else None,
+                suspension=SuspensionConfig(**suspension_data) if suspension_data is not None else None,
+            )
+        except TypeError as e:
+            raise ValueError(f"{path}: {e}") from e
