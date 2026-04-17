@@ -81,32 +81,11 @@ class PowertrainModel:
     # regen efficiency envelopes at 400 V DC, 10-200 A phase current).
     _REGEN_EFFICIENCY_OFFSET_PP: float = 0.02  # 2 percentage points
 
-    # D-17: Regen efficiency multiplicative factor used on the efficiency
-    # map path.  Separate from the fallback path's small OFFSET (above),
-    # this is the body-diode + synchronous-rectifier derate applied on top
-    # of the motor+inverter efficiency map for commanded regen torque.
-    # Chosen so map_eta * FACTOR ≈ map_eta - 0.02 across the operating
-    # envelope (ballpark 0.977 at eta=0.88).
-    _REGEN_EFFICIENCY_FACTOR: float = 0.977
-
-    # D-17: PMSM back-EMF constant K_e in V·s/rad (phase-neutral peak ≈
-    # line-line peak / sqrt(3), but we use the effective line-line
-    # constant for the passive-rectifier threshold comparison against
-    # V_pack — conservative; overstates regen threshold by sqrt(3)).
-    #
-    # Derived from EMRAX 228 MV LC datasheet:
-    #   Kv ≈ 15 RPM/V (no-load) →
-    #   K_e = 60 / (2π · Kv) = 60 / (2π · 15) ≈ 0.6366 V·s/rad.
-    #
-    # Sanity check: at 2500 RPM, ω = 261.8 rad/s,
-    #   V_bemf = 0.6366 × 261.8 ≈ 167 V.  Pack typically 380-410 V,
-    # so V_bemf < V_pack at all normal operating points — i.e. the
-    # passive body-diode rectifier stays OFF under the Michigan stint.
-    #
-    # This means the back-EMF rectifier model alone does NOT explain
-    # the measured -456 W coast power at 2299 RPM (mean Michigan).
-    # See REMAINING_ISSUES.md #21 updated note.
-    _BACK_EMF_CONSTANT_VS_PER_RAD: float = 0.6366
+    # C2: PMSM back-EMF constant K_e sourced from
+    # ``PowertrainConfig.motor_back_emf_constant_v_s_per_rad`` (default
+    # 0.045 V/(rad/s) for the EMRAX 228 MV LC as used on CT-16EV).
+    # Access via ``self.config`` — no class constant so operator tuning
+    # propagates correctly.
 
     # APPS mismatch trip threshold, from firmware
     # (`tps_dist_error = fabs(tps1 - tps2) > APPS_TRIP_PERCENT`).  The
@@ -469,11 +448,8 @@ class PowertrainModel:
     def regen_force(self, brake_pct: float, vehicle_speed_ms: float) -> float:
         """Regenerative braking force (N, negative = decelerating).
 
-        Regen torque capability is limited by the motor torque envelope
-        (same hyperbolic shape as motoring), *derated* by the regen
-        efficiency factor because the generator side of the Cascadia
-        CM200DX cannot sustain quite the same current envelope as
-        motoring. The returned force is negative (opposing motion).
+        Regen torque capability is limited by the same motor torque envelope
+        used for driving.  The returned force is negative (opposing motion).
 
         S12 note on gearbox sign: in generator (regen) mode, gearbox friction
         *adds* to the retarding torque at the wheel, because the wheel must
@@ -483,14 +459,10 @@ class PowertrainModel:
             T_wheel = T_motor * gear_ratio / η_gearbox
 
         (not ``* η_gearbox`` as in the motoring direction).  This makes the
-        mechanical retarding force ~3 % larger than a naïve multiply.
-        The electrical-energy asymmetry (recovering less than the
-        mechanical input because of motor+inverter losses) is handled
-        separately in ``electrical_power()``.
-
-        D-22: the max regen torque envelope is now explicitly derated by
-        ``_REGEN_EFFICIENCY_FACTOR`` — previously the docstring claimed
-        that happened but the code used the full motoring envelope.
+        mechanical retarding force ~3% larger than a naïve multiply.  The
+        electrical-energy asymmetry (recovering less than the mechanical
+        input because of motor+inverter losses) is handled separately in
+        ``electrical_power()``.
 
         Args:
             brake_pct: Regen brake demand in the range [0.0, 1.0].
@@ -506,8 +478,8 @@ class PowertrainModel:
             return 0.0
 
         rpm = self.motor_rpm_from_speed(speed)
-        # D-22: derate the generator envelope.
-        max_regen_torque = self.max_motor_torque(rpm) * self._REGEN_EFFICIENCY_FACTOR
+        # Generator torque capability uses the same RPM-torque envelope.
+        max_regen_torque = self.max_motor_torque(rpm)
         commanded_torque = brake * max_regen_torque
         # S12: divide by η_gearbox, not multiply. Gearbox friction adds
         # to the retarding torque the car feels at the contact patch.
@@ -574,7 +546,7 @@ class PowertrainModel:
         if abs(motor_torque_nm) <= self._COAST_TORQUE_THRESHOLD_NM:
             if pack_voltage_v is None or pack_voltage_v <= 0.0:
                 return 0.0
-            v_bemf = self._BACK_EMF_CONSTANT_VS_PER_RAD * omega
+            v_bemf = self.config.motor_back_emf_constant_v_s_per_rad * omega
             if v_bemf <= pack_voltage_v:
                 # Body diodes reverse-biased → no current flow.
                 return 0.0
@@ -611,10 +583,14 @@ class PowertrainModel:
             return 0.0
 
         # Commanded regen (p_mechanical < 0).
+        # C3: do NOT multiply the map efficiency by _REGEN_EFFICIENCY_FACTOR.
+        # That factor double-counted losses already encoded in the
+        # MotorEfficiencyMap (motoring + inverter). The motor-vs-regen
+        # asymmetry is a small (~1-2 pp) offset, applied only on the
+        # fallback path via _REGEN_EFFICIENCY_OFFSET_PP.
         if self._efficiency_map is not None:
-            eta_regen = (
-                self._efficiency_map.efficiency(motor_rpm, abs(motor_torque_nm))
-                * self._REGEN_EFFICIENCY_FACTOR
+            eta_regen = self._efficiency_map.efficiency(
+                motor_rpm, abs(motor_torque_nm)
             )
         else:
             eta_regen = self._regen_efficiency_fallback
