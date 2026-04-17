@@ -711,14 +711,10 @@ class TestRegenGearboxSign:
 
         Gearbox friction adds to retarding torque at the wheel, so the
         retarding force magnitude is ~3% HIGHER than a naïve (× η) model.
-
-        D-22: max regen torque is derated by _REGEN_EFFICIENCY_FACTOR.
         """
         speed = 10.0
         rpm = model.motor_rpm_from_speed(speed)
-        max_torque = (
-            model.max_motor_torque(rpm) * PowertrainModel._REGEN_EFFICIENCY_FACTOR
-        )
+        max_torque = model.max_motor_torque(rpm)
         expected_mag = max_torque * model.config.gear_ratio / (
             PowertrainModel._GEARBOX_EFFICIENCY * PowertrainModel.TIRE_RADIUS_M
         )
@@ -729,19 +725,15 @@ class TestRegenGearboxSign:
     def test_regen_force_exceeds_naive_multiply(
         self, model: PowertrainModel,
     ) -> None:
-        """After S12 fix, |regen| with divide is 1/η² higher than multiply
-        (modulo the D-22 regen-efficiency derate on both sides, which
-        cancels when we take the ratio).
+        """After S12 fix, |regen| with divide is 1/η² higher than multiply.
 
         Old (wrong): |F| = T * gear * η / r
         New (right): |F| = T * gear / (η * r)
-        Ratio after S12 and D-22:  1/η_gearbox²
+        Ratio:        1/η_gearbox²
         """
         speed = 12.0
         rpm = model.motor_rpm_from_speed(speed)
-        max_torque = (
-            model.max_motor_torque(rpm) * PowertrainModel._REGEN_EFFICIENCY_FACTOR
-        )
+        max_torque = model.max_motor_torque(rpm)
         eta = PowertrainModel._GEARBOX_EFFICIENCY
         r = PowertrainModel.TIRE_RADIUS_M
 

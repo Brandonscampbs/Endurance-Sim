@@ -213,11 +213,10 @@ class SimulationEngine:
                 #    Other strategies: raw throttle through full LVCU model.
                 if cmd.action == ControlAction.THROTTLE:
                     if is_replay:
+                        # D-15: replay torque is the measured delivered
+                        # torque — field-weakening is already baked in.
                         seg_mid_dist = distance + segment.length_m / 2.0
-                        motor_torque = (
-                            self.strategy.target_torque(seg_mid_dist)
-                            * self.powertrain.torque_delivery_factor(motor_rpm)
-                        )
+                        motor_torque = self.strategy.target_torque(seg_mid_dist)
                     elif is_calibrated:
                         ceiling = self.powertrain.lvcu_torque_ceiling(
                             motor_rpm, bms_current_limit,
@@ -257,11 +256,10 @@ class SimulationEngine:
                 # Recompute torque at resolved avg speed for accurate power calc
                 if cmd.action == ControlAction.THROTTLE:
                     if is_replay:
+                        # D-15: replay torque is the measured delivered
+                        # torque — field-weakening is already baked in.
                         seg_mid_dist = distance + segment.length_m / 2.0
-                        motor_torque = (
-                            self.strategy.target_torque(seg_mid_dist)
-                            * self.powertrain.torque_delivery_factor(motor_rpm)
-                        )
+                        motor_torque = self.strategy.target_torque(seg_mid_dist)
                     elif is_calibrated:
                         ceiling = self.powertrain.lvcu_torque_ceiling(
                             motor_rpm, bms_current_limit,
@@ -286,8 +284,21 @@ class SimulationEngine:
                 else:
                     motor_torque = 0.0
 
-                # 7. Electrical power and pack current
-                elec_power = self.powertrain.electrical_power(motor_torque, motor_rpm)
+                # 7. Electrical power and pack current.
+                #
+                # D-13: when replay carries measured V × I power, use it
+                # directly (ground truth at the battery terminals — CAN
+                # Torque Feedback has ~10 % positive bias vs V×I energy).
+                # D-17: otherwise dispatch to the back-EMF-aware electrical
+                # model with pack_voltage so coast segments route through
+                # the rectifier branch.
+                if is_replay and getattr(self.strategy, "has_electrical_power", False):
+                    seg_mid_dist = distance + segment.length_m / 2.0
+                    elec_power = self.strategy.measured_electrical_power(seg_mid_dist)
+                else:
+                    elec_power = self.powertrain.electrical_power(
+                        motor_torque, motor_rpm, pack_voltage,
+                    )
                 if pack_voltage > 0:
                     pack_current = elec_power / pack_voltage
                 else:
