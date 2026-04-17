@@ -687,45 +687,108 @@ def detect_laps(
     return boundaries
 
 
+def _auto_split_driver_laps(
+    aim_df: pd.DataFrame,
+    lap_boundaries: list[tuple[int, int, float]],
+) -> tuple[list[int], list[int]]:
+    """Auto-detect driver change by finding the longest stationary pause.
+
+    Returns ``(pre_change_laps, post_change_laps)`` as index lists into
+    ``lap_boundaries``.  If no lap-internal pause is detected, falls back
+    to a simple midpoint split.
+    """
+    speed_col = "GPS Speed" if "GPS Speed" in aim_df.columns else None
+    if speed_col is None or not lap_boundaries:
+        half = len(lap_boundaries) // 2
+        return list(range(half)), list(range(half, len(lap_boundaries)))
+
+    # Find the lap whose minimum speed stays nearest zero the longest —
+    # that's the lap the driver-change pit stop lands in.
+    speeds = aim_df[speed_col].values
+    best_lap, best_stopped = -1, 0
+    for i, (s, e, _) in enumerate(lap_boundaries):
+        stopped = int(np.sum(speeds[s:e] < 1.0))
+        if stopped > best_stopped:
+            best_stopped = stopped
+            best_lap = i
+
+    if best_lap < 0 or best_stopped < 10:
+        half = len(lap_boundaries) // 2
+        return list(range(half)), list(range(half, len(lap_boundaries)))
+
+    pre = list(range(0, best_lap))
+    post = list(range(best_lap + 1, len(lap_boundaries)))
+    return pre, post
+
+
 def compare_driver_stints(
     aim_df: pd.DataFrame,
     track: Track,
+    *,
+    driver1_laps: list[int] | None = None,
+    driver2_laps: list[int] | None = None,
 ) -> pd.DataFrame:
-    """Compare Driver 1 vs Driver 2 per-zone behavior.
+    """Compare Driver 1 vs Driver 2 per-zone behavior (D-12 + D-21).
 
-    Assumes Michigan endurance format: Driver 1 = laps 2-10,
-    Driver 2 = laps 13-21. Returns per-zone differences in
-    throttle intensity, coast points, and brake points.
+    Both drivers are zone-aligned through the shared track-segment
+    decomposition: each driver's telemetry is extracted separately,
+    collapsed to zones on the same track, and compared at the zone
+    level.  Returns one row per Driver 1 zone so result rows are
+    zone-indexed (D-21), not segment-indexed.
 
     Args:
         aim_df: Full AiM endurance telemetry.
         track: Track geometry.
+        driver1_laps: Lap indices (0-based into detected boundaries)
+            for driver 1. ``None`` (default) detects the driver-change
+            lap via stationary pause and uses all laps before it.
+        driver2_laps: Lap indices for driver 2. ``None`` uses all laps
+            after the auto-detected driver-change lap.
 
     Returns:
-        DataFrame with zone-level comparison columns.
+        DataFrame with columns: zone_id, segment_start, segment_end,
+        d1_action, d1_intensity, d2_action, d2_intensity, action_match,
+        intensity_diff.
     """
-    # Extract per-segment actions for each driver
-    d1 = extract_per_segment_actions(aim_df, track)
-    d2 = extract_per_segment_actions(aim_df, track)
+    lap_boundaries = _detect_lap_boundaries_safe(aim_df)
 
-    # Build zones for each
+    if driver1_laps is None or driver2_laps is None:
+        auto_d1, auto_d2 = _auto_split_driver_laps(aim_df, lap_boundaries)
+        if driver1_laps is None:
+            driver1_laps = auto_d1
+        if driver2_laps is None:
+            driver2_laps = auto_d2
+
+    # Extract per-segment actions for each driver's lap set separately.
+    d1 = extract_per_segment_actions(aim_df, track, laps=driver1_laps)
+    d2 = extract_per_segment_actions(aim_df, track, laps=driver2_laps)
+
+    # Collapse to zones on the same track so both share the segment
+    # decomposition used for zone-aligned comparison.
     zones_d1 = collapse_to_zones(d1, track)
     zones_d2 = collapse_to_zones(d2, track)
 
-    # Compare at segment level
-    comparison_rows = []
-    for seg_idx in range(track.num_segments):
-        z1 = next((z for z in zones_d1 if z.segment_start <= seg_idx <= z.segment_end), None)
-        z2 = next((z for z in zones_d2 if z.segment_start <= seg_idx <= z.segment_end), None)
-        if z1 and z2:
-            comparison_rows.append({
-                "segment_idx": seg_idx,
-                "d1_action": z1.action.value,
-                "d1_intensity": z1.intensity,
-                "d2_action": z2.action.value,
-                "d2_intensity": z2.intensity,
-                "action_match": z1.action == z2.action,
-                "intensity_diff": abs(z1.intensity - z2.intensity),
-            })
+    # Zone-indexed output: use D1's zones as the anchor and look up the
+    # D2 zone covering each D1 zone's midpoint.
+    rows = []
+    for z1 in zones_d1:
+        mid_seg = (z1.segment_start + z1.segment_end) // 2
+        z2 = next(
+            (z for z in zones_d2 if z.segment_start <= mid_seg <= z.segment_end),
+            None,
+        )
+        if z2 is None:
+            continue
+        rows.append({
+            "zone_id": z1.zone_id,
+            "segment_start": z1.segment_start,
+            "segment_end": z1.segment_end,
+            "d1_action": z1.action.value,
+            "d1_intensity": z1.intensity,
+            "d2_action": z2.action.value,
+            "d2_intensity": z2.intensity,
+            "action_match": z1.action == z2.action,
+            "intensity_diff": abs(z1.intensity - z2.intensity),
+        })
 
-    return pd.DataFrame(comparison_rows)
+    return pd.DataFrame(rows)
