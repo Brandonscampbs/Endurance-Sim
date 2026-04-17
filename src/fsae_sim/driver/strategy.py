@@ -15,10 +15,23 @@ class ControlAction(Enum):
 
 @dataclass(frozen=True)
 class ControlCommand:
-    """Output of a driver strategy decision."""
+    """Output of a driver strategy decision.
+
+    Attributes:
+        action: discrete control action (THROTTLE/COAST/BRAKE).
+        throttle_pct: fraction of LVCU/inverter torque-limit envelope
+            to request, in [0, 1]. Sim consumes it as
+            ``motor_torque = throttle_pct * max_motor_torque(rpm)``.
+        brake_pct: **brake-pressure** fraction in [0, 1], normalized to
+            the 99th-percentile recorded brake-line pressure. NF-30:
+            this is NOT the same as "fraction of max regen torque."
+            Consumers that need a regen-torque command must map
+            pressure→regen explicitly; see `regen_force`.
+    """
+
     action: ControlAction
     throttle_pct: float = 0.0  # 0 to 1
-    brake_pct: float = 0.0  # 0 to 1
+    brake_pct: float = 0.0  # 0 to 1 — brake-PRESSURE fraction, not regen-torque
 
 
 @dataclass

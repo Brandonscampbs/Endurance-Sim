@@ -149,6 +149,31 @@ class TestHelpers:
         assert "Straight" in brief
         assert "Turn 1" in brief
 
+    def test_decide_uses_zone_intensity_not_per_segment(self):
+        """C13: decide() must return zone.intensity, not per-segment overrides.
+
+        Brief (``to_driver_brief``) and sim runtime must agree: both read
+        the zone-level intensity. Per-segment intensity arrays are only
+        used as an input to zone aggregation, never as a runtime override.
+        """
+        import numpy as np
+
+        zones = make_zones()  # throttle zone 0 has intensity 0.8
+        # Pass per-segment intensities that DIFFER from zone intensity.
+        # If decide() reads per-segment (the C13 bug), it returns 0.2.
+        # Correct behavior: decide() returns 0.8 (the zone intensity).
+        seg_intensities = np.array([0.2] * 10)
+        strategy = CalibratedStrategy(
+            zones, num_segments=10,
+            segment_intensities=seg_intensities,
+        )
+
+        cmd = strategy.decide(make_state(segment_idx=0), [])
+        assert cmd.action == ControlAction.THROTTLE
+        assert cmd.throttle_pct == pytest.approx(0.8), (
+            "decide() should return zone intensity (0.8), not per-segment (0.2)"
+        )
+
     def test_with_zone_override(self):
         zones = make_zones()
         strategy = CalibratedStrategy(zones, num_segments=10)

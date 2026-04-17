@@ -1,6 +1,5 @@
 """Concrete driver strategy implementations.
 
-- PedalProfileStrategy: per-segment pedal profile from telemetry (primary)
 - ReplayStrategy: reproduce recorded telemetry behavior
 - CoastOnlyStrategy: full throttle on straights, coast into corners
 - ThresholdBrakingStrategy: coast + brake when speed exceeds corner limit
@@ -8,8 +7,6 @@
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -27,21 +24,8 @@ from fsae_sim.analysis.telemetry_analysis import (
     DriverZone,
     extract_per_segment_actions,
     collapse_to_zones,
+    _detect_lap_boundaries_safe,
 )
-
-
-@dataclass(frozen=True)
-class DriverParams:
-    """Tunable driver behavior parameters for sweeps.
-
-    All multipliers default to 1.0 (baseline = telemetry behavior).
-    """
-
-    throttle_scale: float = 1.0
-    brake_scale: float = 1.0
-    coast_throttle: float = 0.0
-    max_throttle: float = 1.0
-    max_brake: float = 1.0
 
 
 class ReplayStrategy(DriverStrategy):
@@ -69,17 +53,10 @@ class ReplayStrategy(DriverStrategy):
         lap_distance_m: float,
         *,
         wrap: bool = True,
-        electrical_power_w: np.ndarray | None = None,
     ) -> None:
         self._lap_distance_m = lap_distance_m
         self._total_distance_m = float(distances_m[-1])
         self._wrap = wrap
-        self._has_power = electrical_power_w is not None
-        if self._has_power:
-            self._power_interp = interp1d(
-                distances_m, electrical_power_w, kind="linear",
-                bounds_error=False, fill_value=(0.0, 0.0),
-            )
         self._throttle_interp = interp1d(
             distances_m, throttle_pct, kind="linear",
             bounds_error=False, fill_value=(float(throttle_pct[0]), float(throttle_pct[-1])),
@@ -113,13 +90,14 @@ class ReplayStrategy(DriverStrategy):
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
 
-        # D-06: preserve sign so regen commands (negative LVCU Torque Req)
-        # are replayed faithfully. Clipping at 0 deleted all regen events.
+        # S18: preserve regen. Previously clipped to [0, +limit] which
+        # silently deleted negative torque commands (coast-regen). Keep
+        # symmetric [-limit, +limit] so replay drives the true recorded
+        # electrical profile.
         inverter_torque_limit = 85.0
         torque = np.clip(
             lap["LVCU Torque Req"].values,
-            -inverter_torque_limit,
-            inverter_torque_limit,
+            -inverter_torque_limit, inverter_torque_limit,
         )
 
         return cls(dist, throttle, brake, torque, lap_distance_m, wrap=True)
@@ -150,22 +128,14 @@ class ReplayStrategy(DriverStrategy):
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
 
-        # D-06: preserve sign (see from_aim_data). Clipping at 0 deleted regen.
+        # S18: preserve regen (see from_aim_data).
         inverter_torque_limit = 85.0
         torque = np.clip(
             clean["LVCU Torque Req"].values,
-            -inverter_torque_limit,
-            inverter_torque_limit,
+            -inverter_torque_limit, inverter_torque_limit,
         )
 
         mean_torque = float(np.mean(torque))
-
-        # Measured electrical power from pack: V × I (W).
-        # Positive = discharge, negative = regen/charging.
-        # This is the most accurate energy measurement — direct from
-        # the battery terminals, bypassing any torque sensor bias or
-        # motor efficiency model uncertainty.
-        elec_power = clean["Pack Voltage"].values * clean["Pack Current"].values
 
         # Extend interpolation data with a point beyond the last distance
         # so extrapolation uses reasonable values if sim distance exceeds
@@ -175,10 +145,9 @@ class ReplayStrategy(DriverStrategy):
         throttle_ext = np.append(throttle, 0.5)
         brake_ext = np.append(brake, 0.0)
         torque_ext = np.append(torque, mean_torque)
-        power_ext = np.append(elec_power, 0.0)
 
         return cls(dist_ext, throttle_ext, brake_ext, torque_ext,
-                   lap_distance_m, wrap=False, electrical_power_w=power_ext)
+                   lap_distance_m, wrap=False)
 
     def _resolve_distance(self, cumulative_distance_m: float) -> float:
         """Map cumulative sim distance to interpolation distance."""
@@ -189,22 +158,6 @@ class ReplayStrategy(DriverStrategy):
     def target_torque(self, distance_m: float) -> float:
         """Recorded motor torque (Nm) at given cumulative distance."""
         return float(self._torque_interp(self._resolve_distance(distance_m)))
-
-    @property
-    def has_electrical_power(self) -> bool:
-        """True if this replay includes measured V×I power data."""
-        return self._has_power
-
-    def measured_electrical_power(self, distance_m: float) -> float:
-        """Recorded Pack Voltage × Pack Current (W) at given distance.
-
-        Returns the actual electrical power measured at the battery
-        terminals.  Positive = discharging, negative = charging.
-        Only available when constructed with ``electrical_power_w``.
-        """
-        if not self._has_power:
-            return 0.0
-        return float(self._power_interp(self._resolve_distance(distance_m)))
 
     def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
         d = self._resolve_distance(state.distance)
@@ -332,7 +285,14 @@ class CalibratedStrategy(DriverStrategy):
         self.name = name
         self._zones = list(zones)
         self._num_segments = num_segments
-        self._segment_intensities = segment_intensities
+        # Kept for diagnostic/inspection use only. Audit C13: per-segment
+        # intensities MUST NOT override zone intensity at runtime — the
+        # driver brief (`to_driver_brief`) and sim `decide()` must agree,
+        # and both report zone-level intensity. Per-segment data feeds
+        # zone aggregation upstream (see `from_telemetry`).
+        self._segment_intensities = (
+            segment_intensities.copy() if segment_intensities is not None else None
+        )
 
         # Build flat lookup: segment_idx -> (action, intensity, max_speed_ms)
         self._segment_actions: list[tuple[ControlAction, float, float]] = [
@@ -344,16 +304,6 @@ class CalibratedStrategy(DriverStrategy):
                     self._segment_actions[seg_idx] = (
                         zone.action, zone.intensity, zone.max_speed_ms,
                     )
-
-        # Override with per-segment intensities when available.
-        # Zones still define action type and structure; per-segment
-        # intensities capture the real driver's fine-grained modulation.
-        if segment_intensities is not None:
-            for i in range(num_segments):
-                action, _, max_speed = self._segment_actions[i]
-                self._segment_actions[i] = (
-                    action, float(segment_intensities[i]), max_speed,
-                )
 
     @property
     def zones(self) -> list[DriverZone]:
@@ -432,14 +382,13 @@ class CalibratedStrategy(DriverStrategy):
                 ))
             else:
                 new_zones.append(z)
-        # Carry per-segment intensities, update overridden zone's segments
-        new_seg_intensities = None
-        if self._segment_intensities is not None:
-            new_seg_intensities = self._segment_intensities.copy()
-            zone = next(z for z in self._zones if z.zone_id == zone_id)
-            for seg_idx in range(zone.segment_start, zone.segment_end + 1):
-                if 0 <= seg_idx < self._num_segments:
-                    new_seg_intensities[seg_idx] = intensity
+        # Carry per-segment intensities (diagnostic only — not used at
+        # runtime after C13 fix). Copy so the derived strategy doesn't
+        # alias the original's array.
+        new_seg_intensities = (
+            self._segment_intensities.copy()
+            if self._segment_intensities is not None else None
+        )
         return CalibratedStrategy(new_zones, self._num_segments, name=self.name,
                                   segment_intensities=new_seg_intensities)
 
@@ -450,6 +399,7 @@ class CalibratedStrategy(DriverStrategy):
         track: Track,
         *,
         laps: list[int] | None = None,
+        holdout_laps: list[int] | None = None,
         throttle_col: str = "Throttle Pos",
         front_brake_col: str = "FBrakePressure",
         rear_brake_col: str = "RBrakePressure",
@@ -464,10 +414,41 @@ class CalibratedStrategy(DriverStrategy):
 
         Samples telemetry at each track segment midpoint, classifies
         actions, and collapses into coachable zones.
+
+        Args:
+            laps: explicit lap indices (0-based) to calibrate on. None =
+                auto-select non-outlier laps.
+            holdout_laps: S9 — lap indices to EXCLUDE from calibration so
+                they can be used as an unseen validation set. Applied
+                after `laps` selection (or auto-selection). Prevents the
+                same laps being used to both fit and validate.
         """
+        effective_laps = laps
+        if holdout_laps is not None:
+            holdout_set = set(holdout_laps)
+            # Resolve the candidate lap set: if the caller didn't pick
+            # explicit laps, subtract holdouts from "all laps" so the
+            # auto-selector inside `extract_per_segment_actions` sees a
+            # filtered list. We pass positive indices; the helper accepts
+            # a concrete `laps` list.
+            if laps is not None:
+                effective_laps = [i for i in laps if i not in holdout_set]
+            else:
+                # Determine lap count to build the complement.
+                boundaries = _detect_lap_boundaries_safe(aim_df)
+                if boundaries:
+                    effective_laps = [
+                        i for i in range(len(boundaries)) if i not in holdout_set
+                    ]
+            if effective_laps is not None and len(effective_laps) == 0:
+                raise ValueError(
+                    "holdout_laps removed every candidate lap; "
+                    "nothing left to calibrate on."
+                )
+
         seg_actions = extract_per_segment_actions(
             aim_df, track,
-            laps=laps,
+            laps=effective_laps,
             throttle_threshold=throttle_threshold,
             brake_threshold=brake_threshold,
         )
@@ -522,266 +503,3 @@ class CalibratedStrategy(DriverStrategy):
                 label=label,
             ))
         return cls(driver_zones, track.num_segments, name=name)
-
-
-class PedalProfileStrategy(DriverStrategy):
-    """Per-segment pedal-profile driver model.
-
-    Stores raw throttle position and brake pressure per track segment,
-    extracted from telemetry.  At runtime, outputs pedal values that
-    the engine routes through ``lvcu_torque_command()`` — the same
-    firmware chain the real car uses.
-
-    For sweeps, ``DriverParams`` multipliers scale pedal inputs (driver
-    behavior) while ``PowertrainConfig`` changes affect LVCU processing
-    (car tune).  Both sweep independently.
-    """
-
-    name = "pedal_profile"
-
-    def __init__(
-        self,
-        throttle_pct: np.ndarray,
-        brake_pct: np.ndarray,
-        actions: np.ndarray,
-        ref_speed_ms: np.ndarray,
-        num_segments: int,
-        *,
-        params: DriverParams | None = None,
-    ) -> None:
-        if not (len(throttle_pct) == len(brake_pct) == len(actions) == len(ref_speed_ms) == num_segments):
-            raise ValueError(
-                f"All arrays must have the same length as num_segments ({num_segments}), "
-                f"got throttle={len(throttle_pct)}, brake={len(brake_pct)}, "
-                f"actions={len(actions)}, ref_speed={len(ref_speed_ms)}"
-            )
-        self._throttle_pct = np.asarray(throttle_pct, dtype=np.float64)
-        self._brake_pct = np.asarray(brake_pct, dtype=np.float64)
-        self._actions = np.asarray(actions, dtype=np.int32)
-        self._ref_speed_ms = np.asarray(ref_speed_ms, dtype=np.float64)
-        self._num_segments = num_segments
-        self.params = params or DriverParams()
-
-    @property
-    def num_segments(self) -> int:
-        return self._num_segments
-
-    def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
-        seg_idx = state.segment_idx % self._num_segments
-        action_code = int(self._actions[seg_idx])
-
-        if action_code == 1:  # THROTTLE
-            throttle = float(self._throttle_pct[seg_idx]) * self.params.throttle_scale
-            throttle = min(throttle, self.params.max_throttle)
-            throttle = max(0.0, min(1.0, throttle))
-            return ControlCommand(ControlAction.THROTTLE, throttle_pct=throttle, brake_pct=0.0)
-
-        elif action_code == 2:  # BRAKE
-            brake = float(self._brake_pct[seg_idx]) * self.params.brake_scale
-            brake = min(brake, self.params.max_brake)
-            brake = max(0.0, min(1.0, brake))
-            return ControlCommand(ControlAction.BRAKE, throttle_pct=0.0, brake_pct=brake)
-
-        else:  # COAST (0)
-            return ControlCommand(
-                ControlAction.COAST,
-                throttle_pct=max(0.0, min(1.0, self.params.coast_throttle)),
-                brake_pct=0.0,
-            )
-
-    def with_params(self, **kwargs) -> PedalProfileStrategy:
-        """Return a new strategy with modified DriverParams.
-
-        Shares the underlying profile arrays (numpy views).
-        Only the DriverParams are replaced.
-
-        Args:
-            **kwargs: Fields of DriverParams to override.
-
-        Returns:
-            New PedalProfileStrategy with updated params.
-        """
-        new_params = replace(self.params, **kwargs)
-        return PedalProfileStrategy(
-            throttle_pct=self._throttle_pct,
-            brake_pct=self._brake_pct,
-            actions=self._actions,
-            ref_speed_ms=self._ref_speed_ms,
-            num_segments=self._num_segments,
-            params=new_params,
-        )
-
-    @classmethod
-    def from_telemetry(
-        cls,
-        aim_df: pd.DataFrame,
-        track: Track,
-        *,
-        laps: list[int] | None = None,
-        throttle_threshold: float = 5.0,
-        brake_threshold: float = 2.0,
-        name: str = "pedal_profile",
-    ) -> PedalProfileStrategy:
-        """Calibrate from AiM telemetry.
-
-        Samples raw throttle position and brake pressure at each track
-        segment midpoint, classifies actions per-lap, then aggregates
-        across representative laps using majority vote for action and
-        median for pedal/brake values.
-
-        Args:
-            aim_df: AiM telemetry DataFrame.
-            track: Track geometry with segments.
-            laps: Which lap indices to use (None = auto-select).
-            throttle_threshold: Throttle % above which = THROTTLE.
-            brake_threshold: Brake pressure (bar) above which = BRAKE.
-            name: Strategy name.
-
-        Returns:
-            Calibrated PedalProfileStrategy.
-        """
-        from fsae_sim.analysis.telemetry_analysis import _detect_lap_boundaries_safe
-
-        num_segments = track.num_segments
-        lap_boundaries = _detect_lap_boundaries_safe(aim_df)
-
-        # Select representative laps
-        if lap_boundaries and len(lap_boundaries) >= 2:
-            if laps is not None:
-                selected = [lap_boundaries[i] for i in laps if i < len(lap_boundaries)]
-            else:
-                selected = []
-                median_dist = float(np.median([d for _, _, d in lap_boundaries]))
-                for i, (s, e, d) in enumerate(lap_boundaries):
-                    if i == 0:
-                        continue
-                    if abs(d - median_dist) > median_dist * 0.15:
-                        continue
-                    selected.append((s, e, d))
-            if not selected:
-                selected = lap_boundaries
-        else:
-            # Single-pass fallback: treat whole dataset as one lap
-            total_dist = aim_df["Distance on GPS Speed"].values
-            selected = [(0, len(aim_df), float(total_dist[-1] - total_dist[0]))]
-
-        # Brake normalization across all moving data
-        speed_all = aim_df["GPS Speed"].values
-        moving = speed_all > 5.0
-        brake_all = np.maximum(
-            aim_df["FBrakePressure"].values,
-            aim_df["RBrakePressure"].values,
-        )
-        nonzero_brake = brake_all[moving & (brake_all > 0)]
-        brake_norm = float(np.percentile(nonzero_brake, 99)) if len(nonzero_brake) > 0 else 1.0
-        brake_norm = max(brake_norm, 1.0)
-
-        # Use LVCU Torque Req for throttle intensity when available.
-        # AiM "Throttle Pos" and the LVCU firmware use different sensor
-        # calibration scales (~1.6x ratio), so raw pedal % doesn't map
-        # correctly through our LVCU model.  LVCU Torque Req IS the real
-        # commanded torque — using it / inverter_limit captures the exact
-        # driver torque demand as a fraction of ceiling.
-        has_torque = "LVCU Torque Req" in aim_df.columns
-        _INVERTER_TORQUE_LIMIT = 85.0
-
-        # Per-lap, per-segment extraction.  Store raw torque/brake/pedal
-        # values for ALL laps including zeros.  Use Throttle Pos for
-        # action classification (it's in pedal-travel units matching
-        # the threshold) and LVCU Torque Req for torque intensity (it's
-        # the actual commanded torque).  Classify AFTER aggregation to
-        # avoid majority-vote bias.
-        throttle_matrix = []  # torque fraction (LVCU Torque Req / 85)
-        pedal_matrix = []     # raw Throttle Pos (0-1) for classification
-        brake_matrix = []
-        speed_matrix = []
-
-        for start_idx, end_idx, _ in selected:
-            lap_df = aim_df.iloc[start_idx:end_idx]
-            lap_dist_raw = lap_df["Distance on GPS Speed"].values
-            lap_d = lap_dist_raw - lap_dist_raw[0]
-            lap_throttle_raw = lap_df["Throttle Pos"].values
-            lap_speed = lap_df["GPS Speed"].values
-            lap_brake = np.maximum(
-                lap_df["FBrakePressure"].values,
-                lap_df["RBrakePressure"].values,
-            )
-            if has_torque:
-                lap_torque = lap_df["LVCU Torque Req"].values
-            else:
-                lap_torque = None
-
-            lap_throttles = np.zeros(num_segments)
-            lap_pedals = np.zeros(num_segments)
-            lap_brakes = np.zeros(num_segments)
-            lap_speeds = np.zeros(num_segments)
-
-            for seg in track.segments:
-                mid = seg.distance_start_m + seg.length_m / 2.0
-                half_bin = seg.length_m / 2.0
-
-                mask = (lap_d >= mid - half_bin) & (lap_d < mid + half_bin)
-                if not np.any(mask):
-                    nearest_idx = np.argmin(np.abs(lap_d - mid))
-                    mask = np.zeros(len(lap_d), dtype=bool)
-                    mask[nearest_idx] = True
-
-                seg_pedal = float(np.median(lap_throttle_raw[mask]))
-                seg_brake = float(np.median(lap_brake[mask]))
-                seg_speed = float(np.mean(lap_speed[mask]))
-
-                # Torque fraction for intensity
-                if lap_torque is not None:
-                    seg_torque = float(np.median(np.clip(lap_torque[mask], 0, None)))
-                    lap_throttles[seg.index] = float(np.clip(
-                        seg_torque / _INVERTER_TORQUE_LIMIT, 0.0, 1.0,
-                    ))
-                else:
-                    lap_throttles[seg.index] = float(np.clip(seg_pedal / 100.0, 0.0, 1.0))
-
-                # Raw pedal for classification
-                lap_pedals[seg.index] = seg_pedal
-
-                lap_brakes[seg.index] = float(np.clip(
-                    max(0.0, seg_brake) / brake_norm, 0.0, 1.0,
-                ))
-                lap_speeds[seg.index] = seg_speed / 3.6  # km/h -> m/s
-
-            throttle_matrix.append(lap_throttles)
-            pedal_matrix.append(lap_pedals)
-            brake_matrix.append(lap_brakes)
-            speed_matrix.append(lap_speeds)
-
-        # Aggregate: median across ALL laps then classify action.
-        throttle_arr = np.array(throttle_matrix)
-        pedal_arr = np.array(pedal_matrix)
-        brake_arr = np.array(brake_matrix)
-        speed_arr = np.array(speed_matrix)
-
-        final_throttle = np.median(throttle_arr, axis=0)
-        final_pedal = np.median(pedal_arr, axis=0)
-        final_brake = np.median(brake_arr, axis=0)
-        final_speed = np.mean(speed_arr, axis=0)
-
-        # Classify action using pedal/brake in their native units
-        final_actions = np.zeros(num_segments, dtype=int)
-        brake_threshold_norm = brake_threshold / brake_norm
-        for i in range(num_segments):
-            if final_brake[i] > brake_threshold_norm:
-                final_actions[i] = 2  # BRAKE
-                final_throttle[i] = 0.0
-            elif final_pedal[i] > throttle_threshold:
-                final_actions[i] = 1  # THROTTLE
-                final_brake[i] = 0.0
-            else:
-                final_actions[i] = 0  # COAST
-                final_throttle[i] = 0.0
-                final_brake[i] = 0.0
-
-        return cls(
-            throttle_pct=final_throttle,
-            brake_pct=final_brake,
-            actions=final_actions,
-            ref_speed_ms=final_speed,
-            num_segments=num_segments,
-        )

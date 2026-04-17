@@ -181,10 +181,14 @@ def _detect_lap_boundaries_safe(
     """Detect lap boundaries, returning empty list on failure."""
     if "GPS Latitude" not in aim_df.columns:
         return []
+    # NF-13: catch only the narrow "no boundary crossings detected" / "missing
+    # expected column" failure modes. A true loader/parse failure must surface
+    # loudly — silent empty-list returns produce "calibrated from no laps"
+    # results that look fine and are silently wrong.
     try:
         from fsae_sim.analysis.validation import detect_lap_boundaries
         return detect_lap_boundaries(aim_df)
-    except Exception:
+    except (KeyError, IndexError):
         return []
 
 
@@ -292,10 +296,21 @@ def _extract_per_lap_then_aggregate(
                 # Use torque-based intensity if available — this is the
                 # effective torque fraction after LVCU processing.
                 if lap_torque is not None:
-                    seg_torque = float(np.median(np.clip(lap_torque[mask], 0, None)))
-                    lap_intensities[seg.index] = float(np.clip(
-                        seg_torque / _INVERTER_TORQUE_LIMIT, 0.0, 1.0,
-                    ))
+                    # NF-25: LVCU Torque Req has sensor dropouts (NaN).
+                    # `np.median` propagates NaN; drop non-finite samples
+                    # before reducing. Fallback to throttle-based intensity
+                    # if no finite torque samples remain.
+                    raw_torque = np.clip(lap_torque[mask], 0, None)
+                    finite = raw_torque[np.isfinite(raw_torque)]
+                    if finite.size:
+                        seg_torque = float(np.median(finite))
+                        lap_intensities[seg.index] = float(np.clip(
+                            seg_torque / _INVERTER_TORQUE_LIMIT, 0.0, 1.0,
+                        ))
+                    else:
+                        lap_intensities[seg.index] = float(np.clip(
+                            seg_throttle / 100.0, 0.0, 1.0,
+                        ))
                 else:
                     lap_intensities[seg.index] = float(np.clip(seg_throttle / 100.0, 0.0, 1.0))
             else:
@@ -329,12 +344,17 @@ def _extract_per_lap_then_aggregate(
         counts = np.bincount(action_col, minlength=3)
         winner = int(np.argmax(counts))
 
-        # Median intensity across laps where the winning action was chosen
+        # Median intensity across laps where the winning action was chosen.
+        # NF-25: guard against NaN propagation from upstream dropouts.
         winner_mask = action_col == winner
         if np.any(winner_mask):
-            med_intensity = float(np.median(intensity_matrix[:, i][winner_mask]))
+            intensities_for_winner = intensity_matrix[:, i][winner_mask]
+            finite = intensities_for_winner[np.isfinite(intensities_for_winner)]
+            med_intensity = float(np.median(finite)) if finite.size else 0.0
         else:
-            med_intensity = float(np.median(intensity_matrix[:, i]))
+            col = intensity_matrix[:, i]
+            finite = col[np.isfinite(col)]
+            med_intensity = float(np.median(finite)) if finite.size else 0.0
 
         med_throttle = float(np.median(throttle_matrix[:, i]))
         med_brake = float(np.median(brake_matrix[:, i]))
@@ -492,10 +512,13 @@ def collapse_to_zones(
 
         prev_was_curved = is_curved
 
-        # Compute observed mean speed for this zone
+        # S10: use 95th percentile of per-segment speeds as the zone's
+        # observed peak — mean-of-means washes out the corner-exit peak
+        # that downstream speed-cap logic needs. Robust to single-sample
+        # outliers (vs np.max) while still tracking the true peak.
         if "mean_speed_kmh" in segment_actions.columns:
             zone_speeds = segment_actions["mean_speed_kmh"].values[z_start:z_end + 1]
-            max_speed_kmh = float(np.mean(zone_speeds))
+            max_speed_kmh = float(np.percentile(zone_speeds, 95))
             max_speed_ms = max_speed_kmh / 3.6
         else:
             max_speed_ms = 0.0
