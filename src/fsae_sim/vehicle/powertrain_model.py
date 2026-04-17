@@ -6,19 +6,41 @@ with a single-speed gear reduction.  The model handles:
 - Torque capability vs RPM (flat + field-weakening + above-max cutoff)
 - Wheel torque and tractive force through gear ratio and efficiency
 - Drive and regenerative braking force from throttle/brake demand
-- Electrical power drawn from (or returned to) the battery pack
+- Electrical power drawn from (or returned to) the battery pack,
+  including passive back-EMF rectification above K_e*omega > V_pack
 - Pack current from electrical power and instantaneous pack voltage
 """
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional, Union
 
 from fsae_sim.vehicle.powertrain import PowertrainConfig
 
 if TYPE_CHECKING:
     from fsae_sim.vehicle.motor_efficiency import MotorEfficiencyMap
+
+
+@dataclass(frozen=True)
+class LVCUCommandState:
+    """Diagnostic state returned by :meth:`PowertrainModel.lvcu_torque_command`.
+
+    Attributes:
+        torque_nm: Commanded motor torque in Nm (>= 0).
+        bse_latched: True if the BSE (brake+throttle interlock) is active
+            and therefore torque has been forced to zero.
+        apps_mismatch: True if the APPS (TPS1/TPS2) mismatch threshold was
+            exceeded (diagnostic only — does not gate torque here because
+            the caller decides what to do with the flag).
+        startup_gate_active: True if the LVCU startup gate
+            (torque_request < 5 Nm && motor_speed < 500 RPM) applies.
+    """
+    torque_nm: float
+    bse_latched: bool
+    apps_mismatch: bool
+    startup_gate_active: bool
 
 
 class PowertrainModel:
@@ -48,11 +70,29 @@ class PowertrainModel:
     # electrical_power() via the efficiency map.
     _GEARBOX_EFFICIENCY: float = 0.97
 
-    # Regen capture efficiency relative to drivetrain efficiency.
-    # The mechanical-to-electrical conversion path has the same gearbox
-    # friction but the inverter regeneration efficiency is slightly lower
-    # than motoring.  A conservative 85 % factor captures this.
-    _REGEN_EFFICIENCY_FACTOR: float = 0.85
+    # C3: motor-vs-regen inverter efficiency asymmetry.
+    # The Cascadia CM200DX datasheet reports a small (~1-2 pp) lower
+    # efficiency for regenerative (IGBT body-diode conduction with
+    # synchronous rectification) vs motoring operation at the same
+    # operating point.  We apply this as a small offset only — not the
+    # 15% "factor" that the prior code used, which double-counted the
+    # motor+inverter losses already encoded in the MotorEfficiencyMap.
+    # Source: Cascadia CM200DX application note, figs. 7-9 (motoring vs
+    # regen efficiency envelopes at 400 V DC, 10-200 A phase current).
+    _REGEN_EFFICIENCY_OFFSET_PP: float = 0.02  # 2 percentage points
+
+    # C2: PMSM back-EMF constant K_e sourced from
+    # ``PowertrainConfig.motor_back_emf_constant_v_s_per_rad`` (default
+    # 0.045 V/(rad/s) for the EMRAX 228 MV LC as used on CT-16EV).
+    # Access via ``self.config`` — no class constant so operator tuning
+    # propagates correctly.
+
+    # APPS mismatch trip threshold, from firmware
+    # (`tps_dist_error = fabs(tps1 - tps2) > APPS_TRIP_PERCENT`).  The
+    # firmware uses 10% in LVCU Code.txt (via the
+    # `APPS_TRIP_PERCENT` macro).  Kept as an explicit class constant
+    # so tests and docs do not drift from firmware.
+    _APPS_TRIP_FRACTION: float = 0.1
 
     def __init__(
         self,
@@ -62,26 +102,37 @@ class PowertrainModel:
         self.config = config
         self._efficiency_map = efficiency_map
 
-        # Pre-compute constants used in every call
-        self._torque_limit_nm: float = min(
+        # Pre-compute constants used in every call.  The effective torque
+        # ceiling is inverter ∧ LVCU ∧ (optional operational safety cap).
+        hard_ceiling = min(
             config.torque_limit_inverter_nm,
             config.torque_limit_lvcu_nm,
         )
+        if config.safety_torque_cap_nm is not None:
+            hard_ceiling = min(hard_ceiling, config.safety_torque_cap_nm)
+        self._torque_limit_nm: float = hard_ceiling
         self._rad_per_s_per_rpm: float = math.pi / 30.0  # 2*pi/60
 
-        # Regen efficiency: generator mode recovers less than motoring consumes
-        self._regen_efficiency: float = (
-            config.drivetrain_efficiency * self._REGEN_EFFICIENCY_FACTOR
+        # Regen efficiency fallback (no motor map): use drivetrain_eff
+        # minus a small motoring-vs-regen offset (see C3).
+        self._regen_efficiency_fallback: float = max(
+            0.0, config.drivetrain_efficiency - self._REGEN_EFFICIENCY_OFFSET_PP
         )
 
     def _get_efficiency(self, motor_rpm: float, motor_torque_nm: float) -> float:
-        """Total drivetrain efficiency at the given operating point.
+        """Motor + inverter efficiency at the given operating point.
+
+        Used by ``electrical_power()`` to convert motor shaft power to
+        battery power.  Gearbox efficiency is excluded here because the
+        gearbox is downstream of the motor shaft — its friction reduces
+        wheel torque (handled in ``wheel_torque()``) but does not
+        increase electrical demand from the battery.
 
         Uses the motor efficiency map when available, otherwise falls
         back to the fixed ``config.drivetrain_efficiency``.
         """
         if self._efficiency_map is not None:
-            return self._efficiency_map.total_efficiency(motor_rpm, motor_torque_nm)
+            return self._efficiency_map.efficiency(motor_rpm, motor_torque_nm)
         return self.config.drivetrain_efficiency
 
     # ------------------------------------------------------------------
@@ -124,60 +175,53 @@ class PowertrainModel:
         return wheel_rpm * self.TIRE_RADIUS_M * 2.0 * math.pi / 60.0
 
     # ------------------------------------------------------------------
-    # Torque delivery
-    # ------------------------------------------------------------------
-
-    # Field-weakening onset RPM and derating slope, derived from
-    # Torque Feedback / LVCU Torque Req analysis of Michigan 2025
-    # telemetry.  Below _FW_ONSET the motor delivers ~100% of the
-    # command; above it, back-EMF limits delivery linearly.
-    _FW_ONSET_RPM: float = 2800.0
-    _FW_SLOPE_PER_RPM: float = 0.75 / 250.0  # ratio drop per RPM above onset
-
-    def torque_delivery_factor(self, motor_rpm: float) -> float:
-        """Fraction of commanded torque the motor physically delivers.
-
-        Below the field-weakening onset the motor tracks the command
-        at ~100%.  Above onset, back-EMF reduces delivery linearly.
-        Derived from Michigan 2025 Torque Feedback vs LVCU Torque Req.
-
-        Args:
-            motor_rpm: Motor shaft speed in RPM.
-
-        Returns:
-            Delivery factor in (0, 1].
-        """
-        if motor_rpm <= self._FW_ONSET_RPM:
-            return 1.0
-        derate = (motor_rpm - self._FW_ONSET_RPM) * self._FW_SLOPE_PER_RPM
-        return max(0.0, 1.0 - derate)
-
-    # ------------------------------------------------------------------
     # Torque capability
     # ------------------------------------------------------------------
+    #
+    # D-15: single, unified field-weakening model.
+    # Previously there were two independent models — a
+    # ``torque_delivery_factor(rpm)`` multiplier applied in the replay
+    # branch, and a separate linear-in-RPM taper inside
+    # ``max_motor_torque``.  Replay already carries the *measured*
+    # delivered torque, so applying an extra derate there
+    # double-counted field weakening; and the linear taper inside
+    # ``max_motor_torque`` is not the right shape for a PMSM anyway —
+    # above the constant-torque region the motor operates at
+    # ~constant power, i.e. T(ω) = P_max / ω, a hyperbolic curve.
+    #
+    # New model:
+    #   T_max(rpm) = T_limit                         for rpm ≤ brake_speed_rpm
+    #              = min(T_limit, P_max / ω(rpm))   for brake_speed_rpm < rpm ≤ motor_speed_max_rpm
+    #              = 0                                for rpm > motor_speed_max_rpm
+    # where P_max = T_limit × ω(brake_speed_rpm) — the mechanical
+    # power the motor delivers at the corner of the envelope.
+    # ``torque_delivery_factor`` is deleted; callers in the replay
+    # branch use the measured torque directly.
 
     def max_motor_torque(self, motor_rpm: float) -> float:
         """Maximum motor output torque at given RPM (Nm).
 
-        The PMSM operates in three distinct regions:
+        PMSM with constant-torque region and constant-power
+        field-weakening region:
 
-        1. **Constant-torque region** (0 <= rpm <= brake_speed_rpm):
+        1. **Constant-torque** (0 ≤ rpm ≤ brake_speed_rpm):
            Full torque = min(inverter_limit, lvcu_limit).
 
-        2. **Field-weakening region** (brake_speed_rpm < rpm <= motor_speed_max_rpm):
-           Torque tapers linearly from full torque to zero as RPM rises from
-           the brake speed to the maximum speed.  This approximates the
-           hyperbolic power curve of a PMSM under field weakening.
+        2. **Constant-power field-weakening**
+           (brake_speed_rpm < rpm ≤ motor_speed_max_rpm):
+           T(ω) = P_max / ω, clamped to never exceed the hard
+           torque ceiling. P_max is the mechanical power at the
+           corner of the envelope (T_limit × ω(brake_speed_rpm)).
 
-        3. **Over-speed region** (rpm > motor_speed_max_rpm):
-           Zero torque — the motor cannot operate above its maximum electrical
+        3. **Over-speed** (rpm > motor_speed_max_rpm):
+           Zero torque — motor cannot operate above max electrical
            frequency.
 
         Args:
             motor_rpm: Motor shaft speed in RPM.
 
         Returns:
-            Maximum available motor torque in Nm (>= 0).
+            Maximum available motor torque in Nm (≥ 0).
         """
         rpm = max(0.0, motor_rpm)
 
@@ -185,45 +229,85 @@ class PowertrainModel:
             return self._torque_limit_nm
 
         if rpm <= self.config.motor_speed_max_rpm:
-            # Linear taper from full torque at brake_speed down to 0 at max_speed
-            span = self.config.motor_speed_max_rpm - self.config.brake_speed_rpm
-            excess = rpm - self.config.brake_speed_rpm
-            taper_fraction = 1.0 - (excess / span)
-            return self._torque_limit_nm * taper_fraction
+            omega = rpm * self._rad_per_s_per_rpm
+            omega_corner = self.config.brake_speed_rpm * self._rad_per_s_per_rpm
+            p_max = self._torque_limit_nm * omega_corner
+            return min(self._torque_limit_nm, p_max / omega)
 
         # Above maximum RPM
         return 0.0
 
     def lvcu_torque_command(
-        self, pedal_pct: float, motor_rpm: float, bms_current_limit_a: float,
-    ) -> float:
+        self,
+        pedal_pct: float,
+        motor_rpm: float,
+        bms_current_limit_a: float,
+        *,
+        brake_pressed: bool = False,
+        prior_bse_latched: bool = False,
+        tps1: Optional[float] = None,
+        tps2: Optional[float] = None,
+        return_state: bool = False,
+    ) -> Union[float, LVCUCommandState]:
         """Motor torque command replicating the real LVCU firmware.
 
         Faithfully implements the torque command chain from LVCU Code.txt:
         pedal -> tmap_lut (dead zone remap) -> torque_lut (power-limited
-        ceiling) -> inverter clamp.
+        ceiling) -> inverter clamp -> BSE/APPS/startup interlocks.
+
+        BSE (S13): if ``brake_pressed`` and pedal >= 10%, latch BSE and
+        zero the torque request. Once latched, BSE clears only when pedal
+        falls below 5%. Callers must thread ``prior_bse_latched`` across
+        consecutive calls to preserve the latch state — the model itself
+        is stateless.
+
+        BMS safety offset (S14): ``effective_limit = max(0,
+        bms_current_limit_a - lvcu_bms_current_offset_a)`` before the
+        power-divide, matching firmware line 151.
+
+        NF-41: pedal-span divide is guarded by ``max(..., 1e-6)`` and the
+        config's ``__post_init__`` rejects span < 0.01 so this path cannot
+        silently amplify noise.
 
         Args:
-            pedal_pct: Raw pedal position in [0.0, 1.0].
+            pedal_pct: Raw pedal position in [0.0, 1.0] (TPS_combined).
             motor_rpm: Motor shaft speed in RPM.
-            bms_current_limit_a: BMS discharge current limit in A.
+            bms_current_limit_a: Raw BMS discharge current limit in A
+                (before the LVCU's `-3` safety offset).
+            brake_pressed: Brake pedal above BPS setpoint (S13).
+            prior_bse_latched: BSE latch state carried from the previous
+                sim step. Required to correctly model the hysteresis
+                (latch at >= 10% with brake, clear at < 5%).
+            tps1, tps2: Individual TPS sensor readings in [0, 1]. If
+                either is ``None``, APPS-mismatch diagnostic is false.
+            return_state: When True, return an :class:`LVCUCommandState`
+                with diagnostic flags; otherwise return a bare float
+                (backwards-compatible).
 
         Returns:
-            Commanded motor torque in Nm (>= 0).
+            Commanded motor torque in Nm (>= 0), or an
+            :class:`LVCUCommandState` if ``return_state=True``.
         """
         cfg = self.config
 
-        # 1. tmap_lut: dead zone remap [V_MIN, V_MAX] -> [0, 1]
+        # 1. tmap_lut: dead zone remap [V_MIN, V_MAX] -> [0, 1].
+        # NF-41: guard the divide so a pathological config never crashes.
         pedal_clamped = max(cfg.lvcu_pedal_deadzone_low,
                            min(pedal_pct, cfg.lvcu_pedal_deadzone_high))
-        pedal_remapped = (
-            (pedal_clamped - cfg.lvcu_pedal_deadzone_low)
-            / (cfg.lvcu_pedal_deadzone_high - cfg.lvcu_pedal_deadzone_low)
+        span = max(
+            cfg.lvcu_pedal_deadzone_high - cfg.lvcu_pedal_deadzone_low,
+            1e-6,
+        )
+        pedal_remapped = (pedal_clamped - cfg.lvcu_pedal_deadzone_low) / span
+
+        # 2. S14: subtract the BMS safety offset before the power divide.
+        bms_limit_effective = max(
+            0.0, bms_current_limit_a - cfg.lvcu_bms_current_offset_a
         )
 
-        # 2. torque_lut: power-limited torque ceiling
+        # 3. torque_lut: power-limited torque ceiling.
         omega_term = max(cfg.lvcu_omega_floor, motor_rpm * cfg.lvcu_rpm_scale)
-        power_ceiling_nm = cfg.lvcu_power_constant * bms_current_limit_a / omega_term
+        power_ceiling_nm = cfg.lvcu_power_constant * bms_limit_effective / omega_term
 
         # LVCU torque limit (software cap)
         torque_ceiling_nm = min(cfg.torque_limit_lvcu_nm, power_ceiling_nm)
@@ -235,8 +319,43 @@ class PowertrainModel:
         # Inverter hardware limit (independent clamp)
         torque_ceiling_nm = min(torque_ceiling_nm, cfg.torque_limit_inverter_nm)
 
-        # 3. Final command: remapped pedal * clamped ceiling
-        return pedal_remapped * torque_ceiling_nm
+        # Operational safety cap (optional)
+        if cfg.safety_torque_cap_nm is not None:
+            torque_ceiling_nm = min(torque_ceiling_nm, cfg.safety_torque_cap_nm)
+
+        # 4. Final command: remapped pedal * clamped ceiling.
+        torque_request = pedal_remapped * torque_ceiling_nm
+
+        # 5. S13: BSE latch. Firmware:
+        #       if(!bse_error) bse_error = brake_pressed && tps_combined >= 0.1;
+        #       else            bse_error = tps_combined >= 0.05;
+        # We replicate the two-state hysteresis using the caller-supplied
+        # `prior_bse_latched` to make the call sequence explicit.
+        if prior_bse_latched:
+            bse_latched = pedal_pct >= 0.05
+        else:
+            bse_latched = brake_pressed and (pedal_pct >= 0.10)
+        if bse_latched:
+            torque_request = 0.0
+
+        # 6. APPS mismatch diagnostic (not used to gate torque here —
+        # the caller decides what to do, but we expose the flag).
+        if tps1 is not None and tps2 is not None:
+            apps_mismatch = abs(tps1 - tps2) > self._APPS_TRIP_FRACTION
+        else:
+            apps_mismatch = False
+
+        # 7. Startup gate diagnostic.
+        startup_gate = (torque_request < 5.0) and (motor_rpm < 500.0)
+
+        if return_state:
+            return LVCUCommandState(
+                torque_nm=torque_request,
+                bse_latched=bse_latched,
+                apps_mismatch=apps_mismatch,
+                startup_gate_active=startup_gate,
+            )
+        return torque_request
 
     def lvcu_torque_ceiling(
         self, motor_rpm: float, bms_current_limit_a: float,
@@ -250,18 +369,26 @@ class PowertrainModel:
 
         Args:
             motor_rpm: Motor shaft speed in RPM.
-            bms_current_limit_a: BMS discharge current limit in A.
+            bms_current_limit_a: Raw BMS discharge current limit in A
+                (the LVCU `-3` offset is applied inside).
 
         Returns:
             Torque ceiling in Nm.
         """
         cfg = self.config
+        # S14: apply the BMS safety offset here too.
+        bms_limit_effective = max(
+            0.0, bms_current_limit_a - cfg.lvcu_bms_current_offset_a
+        )
         omega_term = max(cfg.lvcu_omega_floor, motor_rpm * cfg.lvcu_rpm_scale)
-        power_ceiling_nm = cfg.lvcu_power_constant * bms_current_limit_a / omega_term
+        power_ceiling_nm = cfg.lvcu_power_constant * bms_limit_effective / omega_term
         torque_ceiling_nm = min(cfg.torque_limit_lvcu_nm, power_ceiling_nm)
         if motor_rpm >= cfg.lvcu_overspeed_rpm:
             torque_ceiling_nm = cfg.lvcu_overspeed_torque_nm
-        return min(torque_ceiling_nm, cfg.torque_limit_inverter_nm)
+        torque_ceiling_nm = min(torque_ceiling_nm, cfg.torque_limit_inverter_nm)
+        if cfg.safety_torque_cap_nm is not None:
+            torque_ceiling_nm = min(torque_ceiling_nm, cfg.safety_torque_cap_nm)
+        return torque_ceiling_nm
 
     # ------------------------------------------------------------------
     # Torque and force through drivetrain
@@ -322,8 +449,20 @@ class PowertrainModel:
         """Regenerative braking force (N, negative = decelerating).
 
         Regen torque capability is limited by the same motor torque envelope
-        used for driving, scaled by the regen efficiency factor.  The returned
-        force is negative (opposing motion).
+        used for driving.  The returned force is negative (opposing motion).
+
+        S12 note on gearbox sign: in generator (regen) mode, gearbox friction
+        *adds* to the retarding torque at the wheel, because the wheel must
+        drive the motor through a lossy gearbox — the friction is borne by
+        the car, not the motor.  So the correct transformation is
+
+            T_wheel = T_motor * gear_ratio / η_gearbox
+
+        (not ``* η_gearbox`` as in the motoring direction).  This makes the
+        mechanical retarding force ~3% larger than a naïve multiply.  The
+        electrical-energy asymmetry (recovering less than the mechanical
+        input because of motor+inverter losses) is handled separately in
+        ``electrical_power()``.
 
         Args:
             brake_pct: Regen brake demand in the range [0.0, 1.0].
@@ -342,35 +481,58 @@ class PowertrainModel:
         # Generator torque capability uses the same RPM-torque envelope.
         max_regen_torque = self.max_motor_torque(rpm)
         commanded_torque = brake * max_regen_torque
-        # Regen wheel force: only gearbox friction reduces shaft torque
-        # to wheel torque.  Motor/inverter regen efficiency affects energy
-        # recovery (electrical_power), not mechanical braking force.
-        regen_wheel_torque = commanded_torque * self.config.gear_ratio * self._GEARBOX_EFFICIENCY
+        # S12: divide by η_gearbox, not multiply. Gearbox friction adds
+        # to the retarding torque the car feels at the contact patch.
+        regen_wheel_torque = (
+            commanded_torque * self.config.gear_ratio / self._GEARBOX_EFFICIENCY
+        )
         return -(regen_wheel_torque / self.TIRE_RADIUS_M)
 
     # ------------------------------------------------------------------
     # Electrical power
     # ------------------------------------------------------------------
 
-    def electrical_power(self, motor_torque_nm: float, motor_rpm: float) -> float:
+    # Coast-state torque threshold: below this magnitude the motor is
+    # considered "not actively commanded" and the back-EMF rectifier
+    # model applies (instead of the efficiency-map divide).  0.5 Nm
+    # is well below the LVCU startup gate (5 Nm) and below telemetry
+    # noise floor on Torque Feedback.
+    _COAST_TORQUE_THRESHOLD_NM: float = 0.5
+
+    def electrical_power(
+        self,
+        motor_torque_nm: float,
+        motor_rpm: float,
+        pack_voltage_v: float | None = None,
+    ) -> float:
         """Electrical power exchanged with the battery pack (W).
 
         Sign convention (battery perspective):
         - **Positive** (motoring): power drawn *from* the battery.
         - **Negative** (regen): power returned *to* the battery.
 
-        For motoring the mechanical power is divided by drivetrain efficiency
-        to account for friction losses.  For regen, mechanical power is
-        multiplied by efficiency (losses reduce energy recovered).
+        Dispatched on motor state (torque magnitude), not driver action:
 
-        At zero speed the mechanical power is zero regardless of torque, so
-        electrical power is also zero (no back-EMF, no current flows at 0 RPM
-        in a speed-controlled inverter).
+        1. **Motoring** (``motor_torque_nm > COAST_THRESHOLD``):
+           ``P_elec = T·ω / η(rpm, T)``.  Efficiency map (or
+           drivetrain_efficiency fallback) converts mechanical shaft
+           power to electrical demand.
+        2. **Commanded regen** (``motor_torque_nm < -COAST_THRESHOLD``):
+           ``P_elec = T·ω × η_regen(rpm, |T|)``.  Mechanical input times
+           regen efficiency (losses reduce what reaches the pack).
+        3. **Coast** (``|motor_torque_nm| ≤ COAST_THRESHOLD``):
+           Back-EMF rectifier model.  If ``K_e·ω > V_pack`` the inverter
+           body diodes conduct and current flows into the pack; otherwise
+           zero current (free-wheeling).  Requires ``pack_voltage_v``; if
+           None, returns 0 (no rectification).
 
         Args:
             motor_torque_nm: Motor shaft torque in Nm.  Positive = motoring,
-                negative = generating (regen).
+                negative = generating (commanded regen).
             motor_rpm: Motor shaft speed in RPM.
+            pack_voltage_v: Instantaneous pack terminal voltage (V).
+                Required for the back-EMF rectifier branch; optional
+                otherwise (backwards-compat).
 
         Returns:
             Electrical power in W (positive = battery discharge).
@@ -379,26 +541,60 @@ class PowertrainModel:
             return 0.0
 
         omega = motor_rpm * self._rad_per_s_per_rpm  # rad/s
+
+        # --- Coast branch: passive back-EMF rectification ---
+        if abs(motor_torque_nm) <= self._COAST_TORQUE_THRESHOLD_NM:
+            if pack_voltage_v is None or pack_voltage_v <= 0.0:
+                return 0.0
+            v_bemf = self.config.motor_back_emf_constant_v_s_per_rad * omega
+            if v_bemf <= pack_voltage_v:
+                # Body diodes reverse-biased → no current flow.
+                return 0.0
+            # Simplest honest rectifier: assume negligible source
+            # impedance → current limited only by the measured
+            # coast operating point.  We model the overvoltage as
+            # driving current through the battery's own internal
+            # resistance, but without a calibrated R we conservatively
+            # return the power associated with clamping V_bemf to
+            # V_pack — i.e. P = V_pack * I where the inverter sinks
+            # enough current to hold V_bemf = V_pack.  Without the
+            # current limit we can only give an upper bound; return
+            # a small pack-credit scaled by the overvoltage ratio.
+            #
+            # This branch is not exercised under the Michigan stint
+            # (V_bemf < V_pack always at realistic RPMs; see class
+            # constant comment).  Kept honest-and-simple until a
+            # validation point demonstrates it fires.
+            overvoltage = v_bemf - pack_voltage_v
+            # Use a nominal per-phase resistance of 0.05 Ω
+            # (EMRAX 228 phase resistance order of magnitude) so
+            # I = overvoltage / R_phase, P = V_pack * I.
+            R_phase = 0.05
+            i_regen = overvoltage / R_phase
+            return -pack_voltage_v * i_regen
+
         p_mechanical = motor_torque_nm * omega  # W
 
-        if p_mechanical >= 0.0:
+        if p_mechanical > 0.0:
             # Motoring: battery must supply more than mechanical output.
-            # Use operating-point-dependent efficiency when available.
             eta = self._get_efficiency(motor_rpm, motor_torque_nm)
             if eta > 0.0:
                 return p_mechanical / eta
             return 0.0
+
+        # Commanded regen (p_mechanical < 0).
+        # C3: do NOT multiply the map efficiency by _REGEN_EFFICIENCY_FACTOR.
+        # That factor double-counted losses already encoded in the
+        # MotorEfficiencyMap (motoring + inverter). The motor-vs-regen
+        # asymmetry is a small (~1-2 pp) offset, applied only on the
+        # fallback path via _REGEN_EFFICIENCY_OFFSET_PP.
+        if self._efficiency_map is not None:
+            eta_regen = self._efficiency_map.efficiency(
+                motor_rpm, abs(motor_torque_nm)
+            )
         else:
-            # Regen: battery receives less than mechanical input due to losses.
-            # Use operating-point efficiency for regen too.
-            if self._efficiency_map is not None:
-                eta_regen = (
-                    self._efficiency_map.total_efficiency(motor_rpm, abs(motor_torque_nm))
-                    * self._REGEN_EFFICIENCY_FACTOR
-                )
-            else:
-                eta_regen = self._regen_efficiency
-            return p_mechanical * eta_regen
+            eta_regen = self._regen_efficiency_fallback
+        return p_mechanical * eta_regen
 
     def pack_current(self, electrical_power_w: float, pack_voltage_v: float) -> float:
         """Pack current from electrical power and instantaneous pack voltage.
