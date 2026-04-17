@@ -37,6 +37,8 @@ class VehicleDynamics:
     GRAVITY_M_S2: float = 9.81
     # Lateral grip limit for FSAE on dry asphalt (Hoosier R25B / LC0)
     _LEGACY_MAX_LATERAL_G: float = 1.3
+    # Single-owner stall floor shared with sim/engine.py _MIN_SPEED_MS.
+    _MIN_AVG_SPEED_MS: float = 0.5
 
     def __init__(
         self,
@@ -45,11 +47,20 @@ class VehicleDynamics:
         load_transfer: "LoadTransferModel | None" = None,
         cornering_solver: "CorneringSolver | None" = None,
         powertrain_config: "PowertrainConfig | None" = None,
+        cornering_stiffness_scale: float = 1.0,
     ) -> None:
         self.vehicle = vehicle
         self.tire_model = tire_model
         self.load_transfer = load_transfer
         self.cornering_solver = cornering_solver
+        # C1: scalar applied to Pacejka-derived slip angle so the TTC-on-an-8"-
+        # wheel data can be bridged to real-world 10"-wheel stiffness without
+        # a downstream fudge factor.  Default 1.0 preserves raw tire model.
+        if cornering_stiffness_scale <= 0.0:
+            raise ValueError(
+                f"cornering_stiffness_scale must be > 0; got {cornering_stiffness_scale}"
+            )
+        self.cornering_stiffness_scale: float = cornering_stiffness_scale
 
         # Effective mass: bare mass + rotational inertia of spinning components
         if powertrain_config is not None:
@@ -101,10 +112,15 @@ class VehicleDynamics:
         """Grade resistance (N).  Positive grade = uphill = positive force opposing motion.
 
         ``grade`` is rise/run (dimensionless).
+
+        Returns ``m_effective * g * sin(atan(grade))`` so that dividing by
+        ``m_effective`` in :meth:`acceleration` reproduces the textbook
+        ``a = g * sin(theta)`` identity and energy is conserved on a closed
+        loop (NF-19).  With no powertrain config, ``m_effective == mass_kg``
+        and the result is identical to the bare-mass formulation.
         """
-        # sin(atan(grade)) for small grades ≈ grade, but exact is better
         angle = math.atan(grade)
-        return self.vehicle.mass_kg * self.GRAVITY_M_S2 * math.sin(angle)
+        return self.m_effective * self.GRAVITY_M_S2 * math.sin(angle)
 
     def cornering_drag(self, speed_ms: float, curvature: float) -> float:
         """Drag force (N) from tire slip angles during cornering.
@@ -232,13 +248,18 @@ class VehicleDynamics:
                 continue
             # This tire's share of lateral force, proportional to load
             f_lat_tire = f_lat_total * (fz / total_load)
-            # Find slip angle that produces this lateral force
-            alpha = self._find_slip_angle(f_lat_tire, fz)
-            # Drag component: lateral force projected onto velocity direction
-            fy_actual = abs(
-                self.tire_model.lateral_force(alpha, fz)
-            )
-            total_drag += fy_actual * math.sin(alpha)
+            # Find slip angle that produces this lateral force on the raw
+            # Pacejka model.  Cornering-stiffness scaling (TTC-donor vs
+            # real-world) applies at the tire model level: more stiffness
+            # means the same Fy is produced at a smaller slip angle.
+            alpha_raw = self._find_slip_angle(f_lat_tire, fz)
+            alpha = alpha_raw / self.cornering_stiffness_scale
+            # Drag component: lateral force projected onto velocity direction.
+            # Fy is held at the demanded magnitude (the tire is assumed to
+            # produce f_lat_tire regardless of the effective stiffness);
+            # only the slip angle — and thus the sin(alpha) drag arm —
+            # changes with the stiffness scale.
+            total_drag += f_lat_tire * math.sin(alpha)
 
         return total_drag
 
@@ -269,12 +290,18 @@ class VehicleDynamics:
 
     def max_cornering_speed(
         self, curvature: float, grip_factor: float = 1.0,
+        longitudinal_g: float = 0.0,
     ) -> float:
         """Maximum speed (m/s) through a corner of given curvature.
 
         When a ``CorneringSolver`` is available, delegates to it for a
         physics-based result that accounts for load transfer, tire model,
-        and roll-induced camber.
+        and roll-induced camber.  ``longitudinal_g`` is forwarded to the
+        solver for friction-ellipse coupling.  When ``longitudinal_g`` is
+        0.0 (the default, pure cornering), a fixed-point iteration
+        estimates the cornering-drag-induced longitudinal load and feeds
+        it back into the solver so the reported speed is sustainable in
+        the presence of tire-sourced cornering drag (audit C6).
 
         Otherwise falls back to the legacy analytical formula that uses
         ``_LEGACY_MAX_LATERAL_G`` with a downforce correction.
@@ -287,9 +314,33 @@ class VehicleDynamics:
 
         # Delegate to physics-based solver when available
         if self.cornering_solver is not None:
-            return self.cornering_solver.max_cornering_speed(
+            if longitudinal_g != 0.0:
+                return self.cornering_solver.max_cornering_speed(
+                    kappa, mu_scale=grip_factor, longitudinal_g=longitudinal_g,
+                )
+            v = self.cornering_solver.max_cornering_speed(
                 kappa, mu_scale=grip_factor,
             )
+            # Fixed-point iterate (C6): estimate the longitudinal load
+            # imposed by cornering drag at the current candidate speed,
+            # feed it back into the solver, and repeat until converged.
+            # Requires tire + load-transfer models so cornering_drag is
+            # physically computable.
+            if self.tire_model is None or self.load_transfer is None:
+                return v
+            for _ in range(5):
+                drag = self.cornering_drag(v, kappa)
+                long_g = drag / (self.vehicle.mass_kg * self.GRAVITY_M_S2)
+                if long_g < 1e-3:
+                    break
+                v_next = self.cornering_solver.max_cornering_speed(
+                    kappa, mu_scale=grip_factor, longitudinal_g=long_g,
+                )
+                if abs(v_next - v) < 0.05:
+                    v = v_next
+                    break
+                v = v_next
+            return v
 
         # Legacy analytical formula
         mu = self._LEGACY_MAX_LATERAL_G * grip_factor
@@ -305,7 +356,12 @@ class VehicleDynamics:
         # v^2 * (m*kappa - 0.5*rho*ClA*mu) = m*g*mu
         rho = self.AIR_DENSITY_KG_M3
         denom = m * kappa - 0.5 * rho * cl_a * mu
-        if denom <= 0:
+        # NF-36: a tiny positive ``denom`` produces absurd 1/eps speeds that
+        # propagate silently into the envelope.  Require ``denom`` to be at
+        # least 0.1% of the lateral-force coefficient ``m*kappa`` so the
+        # resulting speed stays well-conditioned.
+        denom_floor = max(1e-3 * m * kappa, 1e-9)
+        if denom <= denom_floor:
             # Downforce dominates: effectively unlimited speed for this curvature
             return float("inf")
         v_sq = m * g * mu / denom
@@ -318,38 +374,62 @@ class VehicleDynamics:
     def max_traction_force(self, speed_ms: float) -> float:
         """Maximum drive force (N) from rear tires.
 
-        When tire and load-transfer models are available, returns the
-        sum of peak longitudinal force from the two rear tires under
-        mild acceleration load transfer (0.3 g forward).
+        When tire and load-transfer models are available, iterates
+        ``a -> tire_loads -> F_x -> a`` to a fixed point (NF-6): the load
+        transfer that creates rear downforce is itself driven by the
+        longitudinal acceleration the rear tires can sustain, so a single
+        guess of 0.3 g is self-referential.
 
         In legacy mode (no tire/load-transfer models), returns infinity
         so that the powertrain limit is the only constraint.
         """
         if self.tire_model is None or self.load_transfer is None:
             return float("inf")
-        _, _, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, 0.3)
-        return (
-            self.tire_model.peak_longitudinal_force(rl)
-            + self.tire_model.peak_longitudinal_force(rr)
-        )
+        mg = self.vehicle.mass_kg * self.GRAVITY_M_S2
+        a_g = 0.3  # initial guess
+        f_last = 0.0
+        for _ in range(6):
+            _, _, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, a_g)
+            f_x = (
+                self.tire_model.peak_longitudinal_force(rl)
+                + self.tire_model.peak_longitudinal_force(rr)
+            )
+            a_next = f_x / mg
+            if abs(a_next - a_g) < 0.005:
+                return f_x
+            a_g = a_next
+            f_last = f_x
+        return f_last
 
     def max_braking_force(self, speed_ms: float) -> float:
         """Maximum braking force (N) from all four tires.
 
-        When tire and load-transfer models are available, returns the
-        sum of peak longitudinal force from all four tires under hard
-        braking load transfer (-1.0 g).
+        When tire and load-transfer models are available, iterates
+        ``a -> tire_loads -> F_x -> a`` to a fixed point (NF-6).  The
+        hardcoded -1.0 g assumption in the previous implementation
+        under-predicted cap at mild brake and over-predicted at hard
+        brake.
 
         In legacy mode (no tire/load-transfer models), returns infinity
         so that there is no tire-limited braking constraint.
         """
         if self.tire_model is None or self.load_transfer is None:
             return float("inf")
-        fl, fr, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, -1.0)
-        return sum(
-            self.tire_model.peak_longitudinal_force(f)
-            for f in [fl, fr, rl, rr]
-        )
+        mg = self.vehicle.mass_kg * self.GRAVITY_M_S2
+        a_g = -1.0  # initial guess
+        f_last = 0.0
+        for _ in range(6):
+            fl, fr, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, a_g)
+            f_x = sum(
+                self.tire_model.peak_longitudinal_force(f)
+                for f in (fl, fr, rl, rr)
+            )
+            a_next = -f_x / mg
+            if abs(a_next - a_g) < 0.005:
+                return f_x
+            a_g = a_next
+            f_last = f_x
+        return f_last
 
     # ------------------------------------------------------------------
     # Longitudinal acceleration
@@ -397,11 +477,14 @@ class VehicleDynamics:
         # Clamp to cornering limit
         exit_speed = min(exit_speed, corner_speed_limit_ms)
 
-        # Segment time: use average speed for the segment
+        # Segment time: use average speed for the segment.
+        # Floor at 0.5 m/s so this stays consistent with the engine's
+        # _MIN_SPEED_MS and the invariant
+        # ``segment_time * avg_speed == segment_length`` holds with a single
+        # owner of the stall floor (audit C9).
         avg_speed = (entry_speed_ms + exit_speed) / 2.0
-        if avg_speed < 0.1:
-            # Near-zero speed: avoid division by zero, use small speed
-            avg_speed = 0.1
+        if avg_speed < self._MIN_AVG_SPEED_MS:
+            avg_speed = self._MIN_AVG_SPEED_MS
         segment_time = segment_length_m / avg_speed
 
         return exit_speed, segment_time
