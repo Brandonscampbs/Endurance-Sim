@@ -516,7 +516,6 @@ class DriverParams:
 
     throttle_scale: float = 1.0
     brake_scale: float = 1.0
-    coast_throttle: float = 0.0
     max_throttle: float = 1.0
     max_brake: float = 1.0
 
@@ -580,10 +579,13 @@ class PedalProfileStrategy(DriverStrategy):
             return ControlCommand(ControlAction.BRAKE, throttle_pct=0.0, brake_pct=brake)
 
         else:  # COAST (0)
+            # D-03: coast_throttle was a dead knob — the engine's coast
+            # path uses the back-EMF-aware electrical_power model (D-17)
+            # which depends on motor state, not on any driver "throttle"
+            # during COAST. throttle_pct is forced to 0.0 so no downstream
+            # caller can accidentally depend on it.
             return ControlCommand(
-                ControlAction.COAST,
-                throttle_pct=max(0.0, min(1.0, self.params.coast_throttle)),
-                brake_pct=0.0,
+                ControlAction.COAST, throttle_pct=0.0, brake_pct=0.0,
             )
 
     def with_params(self, **kwargs) -> PedalProfileStrategy:
