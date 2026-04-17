@@ -223,3 +223,25 @@ class TestThresholdBrakingStrategy:
 
     def test_name(self, dynamics):
         assert ThresholdBrakingStrategy(dynamics).name == "threshold_braking"
+
+
+class TestControlCommandMetadata:
+    """D-27: ControlCommand supports an optional metadata dict."""
+
+    def test_default_metadata_is_none(self):
+        from fsae_sim.driver.strategy import ControlAction, ControlCommand
+        cmd = ControlCommand(ControlAction.COAST)
+        assert cmd.metadata is None
+
+    def test_metadata_roundtrip(self):
+        from fsae_sim.driver.strategy import ControlAction, ControlCommand
+        meta = {"max_speed_ms": 12.5}
+        cmd = ControlCommand(
+            ControlAction.THROTTLE,
+            throttle_pct=0.8,
+            brake_pct=0.0,
+            metadata=meta,
+        )
+        assert cmd.metadata is not None
+        assert cmd.metadata["max_speed_ms"] == 12.5
+        assert cmd.throttle_pct == 0.8

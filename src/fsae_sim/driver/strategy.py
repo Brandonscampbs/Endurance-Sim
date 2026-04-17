@@ -1,7 +1,8 @@
 """Driver strategy and simulation state definitions."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import Optional
 
 from fsae_sim.track.track import Segment
 
@@ -32,6 +33,11 @@ class ControlCommand:
     action: ControlAction
     throttle_pct: float = 0.0  # 0 to 1
     brake_pct: float = 0.0  # 0 to 1 — brake-PRESSURE fraction, not regen-torque
+    # D-27: optional extensibility hook for zone-level metadata such as
+    # ``max_speed_ms`` (D-09), without forcing every strategy/consumer to
+    # update dataclass signatures. Default is None so existing call sites
+    # and serialization behavior are unchanged.
+    metadata: Optional[dict] = None
 
 
 @dataclass
