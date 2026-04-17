@@ -313,12 +313,25 @@ class CalibratedStrategy(DriverStrategy):
         idx = state.segment_idx % self._num_segments
         action, intensity, max_speed_ms = self._segment_actions[idx]
 
+        # D-09: pass the zone's observed peak speed through metadata so
+        # the engine can cap exit_speed. Only populated when a real cap
+        # is available (>0) to leave straight-line zones unconstrained.
+        meta: dict | None = None
+        if max_speed_ms > 0.0:
+            meta = {"max_speed_ms": float(max_speed_ms)}
+
         if action == ControlAction.THROTTLE:
-            return ControlCommand(action, throttle_pct=intensity, brake_pct=0.0)
+            return ControlCommand(
+                action, throttle_pct=intensity, brake_pct=0.0, metadata=meta,
+            )
         elif action == ControlAction.BRAKE:
-            return ControlCommand(action, throttle_pct=0.0, brake_pct=intensity)
+            return ControlCommand(
+                action, throttle_pct=0.0, brake_pct=intensity, metadata=meta,
+            )
         else:
-            return ControlCommand(ControlAction.COAST, throttle_pct=0.0, brake_pct=0.0)
+            return ControlCommand(
+                ControlAction.COAST, throttle_pct=0.0, brake_pct=0.0, metadata=meta,
+            )
 
     def zone_for_segment(self, segment_idx: int) -> DriverZone:
         """Return the zone containing the given segment index."""

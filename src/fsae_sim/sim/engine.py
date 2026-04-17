@@ -94,7 +94,9 @@ class SimulationEngine:
 
         # Load motor efficiency map if available.
         # NF-3: resolve path relative to the package, not the caller's CWD,
-        # so sims run from any directory (tests, webapp, notebooks).
+        # so sims run from any directory (tests, webapp, notebooks).  If
+        # the map is missing, fall back to the constant drivetrain_efficiency
+        # — but warn once so silent accuracy loss is visible to callers.
         motor_map = None
         if _HAS_MOTOR_MAP:
             repo_root = Path(__file__).resolve().parents[3]
@@ -105,6 +107,23 @@ class SimulationEngine:
             )
             if motor_map_path.exists():
                 motor_map = MotorEfficiencyMap(motor_map_path)
+            else:
+                import warnings
+                warnings.warn(
+                    f"MotorEfficiencyMap CSV not found at {motor_map_path}; "
+                    "falling back to constant drivetrain_efficiency. Motor/"
+                    "inverter efficiency will not track operating point.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        else:
+            import warnings
+            warnings.warn(
+                "fsae_sim.vehicle.motor_efficiency not importable; falling "
+                "back to constant drivetrain_efficiency.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         self.powertrain = PowertrainModel(vehicle.powertrain, efficiency_map=motor_map)
 
@@ -210,6 +229,16 @@ class SimulationEngine:
                 # 2. Speed limit from pre-computed envelope
                 corner_limit = float(v_max[seg_idx])
 
+                # 2a. Entry-speed clamp.  If the previous segment exited
+                # above this segment's envelope (driver over-accelerated
+                # relative to the envelope's forward-pass assumptions),
+                # physically the tires cannot sustain a corner at that
+                # speed — clamp down.  Without this, resolve_exit_speed
+                # clamps the *exit* but average = (entry+exit)/2 can
+                # exceed the corner limit.
+                if speed > corner_limit:
+                    speed = corner_limit
+
                 # 2b. BMS current limit for LVCU torque command
                 bms_current_limit = self.battery_model.max_discharge_current(temp, soc)
                 motor_rpm = self.powertrain.motor_rpm_from_speed(speed)
@@ -260,6 +289,17 @@ class SimulationEngine:
                     speed, segment.length_m, net_force, corner_limit,
                 )
                 exit_speed = max(exit_speed, self._MIN_SPEED_MS)
+
+                # D-09: zone-level speed cap.  If the driver strategy
+                # attached ``max_speed_ms`` via metadata (observed peak
+                # speed for the current zone), clamp exit speed to it
+                # so the sim never carries more speed through a zone
+                # than the real driver demonstrated.  Strategies without
+                # metadata are unaffected (metadata defaults to None).
+                if cmd.metadata is not None and "max_speed_ms" in cmd.metadata:
+                    zone_cap = float(cmd.metadata["max_speed_ms"])
+                    if zone_cap > 0.0:
+                        exit_speed = min(exit_speed, zone_cap)
 
                 avg_speed = (speed + exit_speed) / 2.0
                 motor_rpm = self.powertrain.motor_rpm_from_speed(avg_speed)

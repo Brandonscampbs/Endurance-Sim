@@ -82,17 +82,6 @@ def make_minimal_config() -> VehicleConfig:
 class TestEnvelopeIntegration:
     """Engine should use speed envelope for synthetic strategies."""
 
-    @pytest.mark.xfail(
-        reason=(
-            "Engine does not fully enforce the envelope speed cap at corner "
-            "entry (~1 m/s over at the tightest segment). Pre-existing bug, "
-            "not introduced by R2 merges or the driver-model campaign; "
-            "tracked in docs/SIMULATOR_ISSUES.md as an engine issue. "
-            "Related to D-20 (strategies honoring envelope) but scoped "
-            "there as a separate engine fix."
-        ),
-        strict=False,
-    )
     def test_synthetic_strategy_uses_envelope(self):
         """With envelope, corner entry speed should be lower than corner speed limit."""
         track = make_simple_track()
@@ -126,3 +115,40 @@ class TestEnvelopeIntegration:
                     f"Speed {row['speed_ms']:.2f} exceeded envelope limit "
                     f"{row['corner_speed_limit_ms']:.2f} at segment {int(row['segment_idx'])}"
                 )
+
+
+class TestZoneMaxSpeedCap:
+    """D-09: engine honors ``ControlCommand.metadata['max_speed_ms']``."""
+
+    def test_metadata_caps_exit_speed(self):
+        """Strategy with zone cap of 10 m/s should never let speed exceed it."""
+        from fsae_sim.driver.strategy import ControlAction, ControlCommand
+
+        track = make_simple_track()
+        config = make_minimal_config()
+
+        class CappedStrategy(DriverStrategy):
+            name = "capped"
+
+            def decide(self, state, upcoming):
+                return ControlCommand(
+                    action=ControlAction.THROTTLE,
+                    throttle_pct=1.0,
+                    brake_pct=0.0,
+                    metadata={"max_speed_ms": 10.0},
+                )
+
+        batt = MagicMock(spec=BatteryModel)
+        batt.pack_voltage.return_value = 400.0
+        batt.max_discharge_current.return_value = 100.0
+        batt.step.return_value = (90.0, 26.0, 395.0)
+
+        engine = SimulationEngine(config, track, CappedStrategy(), batt)
+        result = engine.run(num_laps=1, initial_soc_pct=95.0)
+
+        # Every recorded state must respect the 10 m/s cap (with a tiny
+        # epsilon for the (entry+exit)/2 rounding in avg_speed reporting).
+        assert (result.states["speed_ms"] <= 10.0 + 1e-6).all(), (
+            f"D-09 regression: speeds exceeded zone cap "
+            f"(max={result.states['speed_ms'].max():.3f} > 10.0)"
+        )
