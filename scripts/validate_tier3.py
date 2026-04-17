@@ -84,6 +84,21 @@ def main():
     )
     print(report.summary())
     print(f"  Laps completed: {result.laps_completed}/{num_laps}")
+    # C8: show both discharge and regen so energy accounting is honest.
+    print(
+        f"  Telemetry energy: "
+        f"discharge={report.telem_discharge_j / 3.6e6:.3f} kWh, "
+        f"regen={report.telem_regen_j / 3.6e6:.3f} kWh, "
+        f"net={report.telem_net_j / 3.6e6:.3f} kWh"
+    )
+    if report.stints:
+        for i, sr in enumerate(report.stints, start=1):
+            print(
+                f"  Stint {i}: "
+                f"discharge={sr.telem_discharge_j / 3.6e6:.3f} kWh, "
+                f"regen={sr.telem_regen_j / 3.6e6:.3f} kWh, "
+                f"net={sr.telem_net_j / 3.6e6:.3f} kWh"
+            )
 
     # ── 2. Corner Speed Comparison ──
     print("\n2. CORNER SPEED PREDICTION -- Pacejka vs Legacy")

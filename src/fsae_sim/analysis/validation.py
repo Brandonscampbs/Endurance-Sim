@@ -30,8 +30,24 @@ class ValidationMetric:
 
 @dataclass
 class ValidationReport:
-    """Summary of all validation metrics."""
+    """Summary of all validation metrics.
+
+    Telemetry energy accounting uses two separate integrators (C8):
+    - ``telem_discharge_j``: integral of V*I where I > 0 (pack sourcing energy)
+    - ``telem_regen_j``: integral of V*|I| where I < 0 (regen back into pack)
+    - ``telem_net_j``: discharge minus regen (net electrical energy out)
+
+    The pre-fix implementation summed only ``power > 0``, silently dropping
+    regen. Three counters keep the accounting honest.
+
+    ``stints`` optionally carries per-stint sub-reports when the input
+    telemetry frame has a ``stint`` column (C16).
+    """
     metrics: list[ValidationMetric]
+    telem_discharge_j: float = 0.0
+    telem_regen_j: float = 0.0
+    telem_net_j: float = 0.0
+    stints: list["ValidationReport"] | None = None
 
     @property
     def all_passed(self) -> bool:
@@ -211,13 +227,50 @@ def validate_full_endurance(
     """Compare full-endurance simulation against complete AiM recording.
 
     Uses the final state of the AiM data as the reference for the full run.
-    """
-    metrics = []
 
-    # --- Total driving time (excluding driver change / stopped periods) ---
+    Stint-aware (C16): if ``aim_df`` contains a ``stint`` column, per-stint
+    sub-reports are attached under ``ValidationReport.stints`` and the overall
+    report aggregates only the driving stints.
+
+    NF-45: on the cleaned-data path (stint column present, already trimmed),
+    the legacy ``speed > 5 km/h`` cutoff is skipped so genuine low-speed
+    hairpin samples are not dropped. Stint boundaries already exclude the
+    driver-change stationary period.
+    """
+    # --- Stint-aware segmentation (C16) ---
+    stints = None
+    if "stint" in aim_df.columns:
+        stint_ids = sorted(int(s) for s in pd.unique(aim_df["stint"]) if pd.notna(s))
+        if len(stint_ids) > 1:
+            stints = []
+            for sid in stint_ids:
+                sub = aim_df[aim_df["stint"] == sid].reset_index(drop=True)
+                # Per-stint report: no recursion into stints (already segmented)
+                sub_no_stint = sub.drop(columns=["stint"])
+                stints.append(
+                    validate_full_endurance(
+                        sim_states, sub_no_stint,
+                        sim_total_time_s, sim_final_soc,
+                        sim_total_energy_kwh, sim_laps,
+                        target_pct=target_pct,
+                    )
+                )
+
+    # NF-45: On cleaned data (stint column signals this), treat every sample
+    # as driving — pre/post/DC periods are already removed. Otherwise fall
+    # back to the >5 km/h heuristic for raw recordings.
+    is_cleaned = "stint" in aim_df.columns
     speed = aim_df["GPS Speed"].values
     dt_arr = np.diff(aim_df["Time"].values, prepend=aim_df["Time"].values[0])
-    telem_driving_time = float(np.sum(dt_arr[speed > 5]))
+    if is_cleaned:
+        moving_mask = np.ones(len(aim_df), dtype=bool)
+    else:
+        moving_mask = speed > 5
+
+    metrics = []
+
+    # --- Total driving time ---
+    telem_driving_time = float(np.sum(dt_arr[moving_mask]))
     metrics.append(_metric("Driving time", "s", telem_driving_time, sim_total_time_s, target_pct))
 
     # --- Total distance ---
@@ -238,7 +291,7 @@ def validate_full_endurance(
     metrics.append(_metric("Final cell temp", "C", telem_temp_end, sim_temp_end, 15.0))
 
     # --- Mean pack voltage ---
-    moving = aim_df["GPS Speed"].values > 5
+    moving = moving_mask
     telem_v = float(aim_df["Pack Voltage"][moving].mean())
     sim_v = float(sim_states["pack_voltage_v"].mean())
     metrics.append(_metric("Mean pack voltage", "V", telem_v, sim_v, target_pct))
@@ -253,16 +306,33 @@ def validate_full_endurance(
     sim_i = float(np.mean(np.abs(sim_states["pack_current_a"].values)))
     metrics.append(_metric("Mean |pack current|", "A", telem_i, sim_i, 20.0))
 
-    # --- Energy consumed ---
-    # Telemetry: integrate V*I over time
-    telem_power = aim_df["Pack Voltage"].values * aim_df["Pack Current"].values
+    # --- Two-counter energy accounting (C8) ---
+    # Discharge: current > 0 (pack sourcing). Regen: current < 0 (pack sinking).
+    # The old single-counter "power > 0" filter silently discarded regen.
+    voltage = aim_df["Pack Voltage"].values
+    current = aim_df["Pack Current"].values
     dt = np.diff(aim_df["Time"].values, prepend=aim_df["Time"].values[0])
-    telem_energy_j = float(np.sum(telem_power[telem_power > 0] * dt[telem_power > 0]))
-    telem_energy_kwh = telem_energy_j / 3.6e6
+    discharge_mask = current > 0
+    regen_mask = current < 0
+    telem_discharge_j = float(
+        np.sum(voltage[discharge_mask] * current[discharge_mask] * dt[discharge_mask])
+    )
+    telem_regen_j = float(
+        np.sum(voltage[regen_mask] * (-current[regen_mask]) * dt[regen_mask])
+    )
+    telem_net_j = telem_discharge_j - telem_regen_j
+
+    telem_energy_kwh = telem_net_j / 3.6e6
     if telem_energy_kwh > 0.1:
         metrics.append(_metric("Energy consumed", "kWh", telem_energy_kwh, sim_total_energy_kwh, 15.0))
 
-    return ValidationReport(metrics=metrics)
+    return ValidationReport(
+        metrics=metrics,
+        telem_discharge_j=telem_discharge_j,
+        telem_regen_j=telem_regen_j,
+        telem_net_j=telem_net_j,
+        stints=stints,
+    )
 
 
 def _metric(

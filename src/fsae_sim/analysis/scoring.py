@@ -65,10 +65,15 @@ class FSAEScoreResult:
     """CO2 equivalent (energy_kwh * CO2_PER_KWH_EV)."""
 
     your_avg_lap_s: float
-    """Average lap time."""
+    """Average lap time (corrected — includes penalties + driver change)."""
 
     your_co2_per_lap: float
     """CO2 per lap."""
+
+    raw_avg_lap_s: float = 0.0
+    """Raw average lap time (driving only, no penalties). Used for efficiency
+    eligibility check per FSAE rules (D.13.4): raw pace is what the car is
+    actually capable of; endurance time score uses corrected time."""
 
 
 class FSAEScoring:
@@ -116,6 +121,9 @@ class FSAEScoring:
         cone_penalties: int = 0,
         off_course_penalties: int = 0,
         total_distance_km: float | None = None,
+        driver_change_time_s: float = 0.0,
+        driver_change_completed: bool | None = None,
+        track_km_per_lap: float | None = None,
     ) -> FSAEScoreResult:
         """Compute combined Endurance + Efficiency score.
 
@@ -127,18 +135,37 @@ class FSAEScoring:
             off_course_penalties: Number of off-course incidents.
             total_distance_km: Total distance driven (km). If provided,
                 used for CO2/100km eligibility check.
+            driver_change_time_s: Seconds of driver-change stopped time
+                added to the corrected endurance time (NF-43). Per FSAE
+                D.12.13, the corrected endurance time includes the DC.
+            driver_change_completed: Whether the driver change was actually
+                completed (NF-44). The 3-point DC bonus in the laps score
+                only applies when True. Defaults to ``laps_completed > 11``
+                to preserve backward compatibility with the "completing
+                lap 12 means DC happened" assumption.
+            track_km_per_lap: Track length per lap in km (NF-59). Used to
+                compute EFmin from the 20.02 kg CO2/100km eligibility cap.
+                If None, EFmin defaults to 0 (conservative, gives full range).
         """
         f = self.field
 
-        # Corrected time with penalties
+        if driver_change_completed is None:
+            # Backward-compat: completing lap 12 implied DC was done.
+            driver_change_completed = laps_completed > 11
+
+        # S11: raw vs corrected time. Efficiency uses raw pace (what the car
+        # is capable of); endurance time score uses corrected (with penalties
+        # and driver change).
+        raw_time = float(total_time_s)
         corrected_time = (
-            total_time_s
+            raw_time
+            + float(driver_change_time_s)
             + cone_penalties * self.CONE_PENALTY_S
             + off_course_penalties * self.OFF_COURSE_PENALTY_S
         )
 
         # --- Endurance laps score (D.12.13.3) ---
-        laps_score = self._laps_score(laps_completed)
+        laps_score = self._laps_score(laps_completed, driver_change_completed)
 
         # --- Endurance time score (D.12.13.2) ---
         tmax = self.ENDURANCE_TIME_MAX_FACTOR * f.endurance_tmin_s
@@ -154,20 +181,25 @@ class FSAEScoring:
 
         # --- Efficiency (D.13.4) ---
         co2_yours = total_energy_kwh * self.CO2_PER_KWH_EV
+        # S11: your_avg_lap_s is the corrected average (shown to users,
+        # matches FSAE results sheets); raw_avg_lap_s is used internally for
+        # efficiency pace checks where raw driving pace is what matters.
         avg_lap_s = corrected_time / laps_completed if laps_completed > 0 else 0.0
+        raw_avg_lap_s = raw_time / laps_completed if laps_completed > 0 else 0.0
         co2_per_lap = co2_yours / laps_completed if laps_completed > 0 else 0.0
 
         efficiency_factor = 0.0
         efficiency_score = 0.0
 
-        # Eligibility: must have completed driver change (>11 laps)
-        eligible = laps_completed > 11
+        # Eligibility: must have completed driver change (NF-44 semantics)
+        eligible = driver_change_completed and laps_completed > 0
 
-        # Eligibility: average lap time < 1.45 * fastest avg lap time
+        # Eligibility: average lap pace (raw) < 1.45 * fastest avg lap pace.
+        # S11: compare raw pace; the 1.45x envelope is about the car's pace,
+        # not penalty-inflated time.
         if eligible and laps_completed > 0:
             tmin_avg = f.endurance_tmin_s / f.efficiency_tmin_laps
-            your_avg = corrected_time / laps_completed
-            if your_avg >= self.ENDURANCE_TIME_MAX_FACTOR * tmin_avg:
+            if raw_avg_lap_s >= self.ENDURANCE_TIME_MAX_FACTOR * tmin_avg:
                 eligible = False
 
         # Eligibility: CO2/100km cap
@@ -177,9 +209,9 @@ class FSAEScoring:
                 eligible = False
 
         if eligible and laps_completed > 0:
-            # Efficiency factor (D.13.4.4)
+            # Efficiency factor (D.13.4.4): uses raw pace
             tmin_avg = f.endurance_tmin_s / f.efficiency_tmin_laps
-            your_avg = corrected_time / laps_completed
+            your_avg = raw_avg_lap_s
             co2min_per_lap = f.efficiency_co2min_kg_per_lap
 
             if co2_per_lap > 0:
@@ -211,7 +243,19 @@ class FSAEScoring:
             # The spec says EFmin uses 20.02 kg/100km and Tyour=1.45*Tmin.
             # We need track distance to convert. If not provided, estimate
             # from laps and a reasonable per-lap distance.
-            efmin = 0.0  # Conservative: makes full range available
+            # NF-59: compute EFmin from CO2max = 20.02 kg/100km when track
+            # length is known. Per D.13.4.6:
+            #   EFmin = (Tmin_avg / Tmax_avg) * (CO2min_per_lap / CO2max_per_lap)
+            if track_km_per_lap is not None and track_km_per_lap > 0:
+                co2max_per_lap = (
+                    self.EV_CO2_MAX_PER_100KM / 100.0 * track_km_per_lap
+                )
+                efmin = (
+                    efmin_time_ratio * (co2min_per_lap / co2max_per_lap)
+                    if co2max_per_lap > 0 else 0.0
+                )
+            else:
+                efmin = 0.0  # Conservative: makes full range available
 
             if efmax > efmin:
                 efficiency_score = 100.0 * (efficiency_factor - efmin) / (efmax - efmin)
@@ -233,6 +277,7 @@ class FSAEScoring:
             your_co2_kg=co2_yours,
             your_avg_lap_s=avg_lap_s,
             your_co2_per_lap=co2_per_lap,
+            raw_avg_lap_s=raw_avg_lap_s,
         )
 
     def score_sim_result(
@@ -241,6 +286,8 @@ class FSAEScoring:
         track_distance_km: float,
         cone_penalties: int = 0,
         off_course_penalties: int = 0,
+        driver_change_time_s: float = 0.0,
+        driver_change_completed: bool | None = None,
     ) -> FSAEScoreResult:
         """Score a SimResult directly.
 
@@ -259,26 +306,26 @@ class FSAEScoring:
             cone_penalties=cone_penalties,
             off_course_penalties=off_course_penalties,
             total_distance_km=total_dist_km,
+            driver_change_time_s=driver_change_time_s,
+            driver_change_completed=driver_change_completed,
+            track_km_per_lap=track_distance_km,
         )
 
     @staticmethod
-    def _laps_score(laps_completed: int) -> float:
+    def _laps_score(laps_completed: int, driver_change_completed: bool = True) -> float:
         """Compute laps score per D.12.13.3.
 
-        - 1 point per lap for laps 1-11
-        - 3 points for completing driver change (lap 12)
-        - 1 point per lap for laps 13-22
+        - 1 point per lap for all completed laps
+        - +3 point bonus when the driver change is completed (NF-44)
         - Max 25 points
+
+        The 3-point DC bonus is gated on ``driver_change_completed`` rather
+        than on a lap count, so sims that don't yet model the DC can be
+        scored honestly.
         """
         if laps_completed <= 0:
             return 0.0
-        if laps_completed <= 11:
-            return float(laps_completed)
-        # Laps 1-11 = 11 pts
-        # Lap 12 = 1 pt (lap) + 3 pts (driver change bonus) = 4 pts
-        # Laps 13-22 = 1 pt each
-        score = 11.0 + 1.0 + 3.0  # through lap 12
-        # Remaining laps after 12
-        extra = min(laps_completed - 12, 10)
-        score += extra
+        score = float(laps_completed)
+        if driver_change_completed:
+            score += 3.0
         return min(score, 25.0)

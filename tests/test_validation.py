@@ -266,3 +266,161 @@ class TestFullEndurance:
     def test_print_full_endurance_report(self, full_report):
         """Print the full endurance validation (always passes for visibility)."""
         print("\n" + full_report.summary())
+
+
+# ---------------------------------------------------------------------------
+# Two-counter energy accounting (C8): discharge, regen, net
+# ---------------------------------------------------------------------------
+
+class TestTwoCounterEnergyAccounting:
+    """ValidationReport should expose telemetry discharge/regen/net energy separately.
+
+    The old implementation only integrated `power > 0`, which silently threw
+    away regen. A two-counter approach keeps discharge and regen honest and
+    lets us report a proper net.
+    """
+
+    def _make_df(self):
+        import pandas as pd
+
+        # 10 samples at 0.1s spacing, simple V*I pattern
+        # First 5 samples: V=400, I=50 (discharge). Next 5: V=400, I=-20 (regen)
+        time = np.arange(10) * 0.1
+        voltage = np.full(10, 400.0)
+        current = np.concatenate([np.full(5, 50.0), np.full(5, -20.0)])
+        return pd.DataFrame({
+            "Time": time,
+            "GPS Speed": np.full(10, 50.0),
+            "Distance on GPS Speed": time * (50.0 / 3.6),
+            "State of Charge": np.linspace(100.0, 95.0, 10),
+            "Pack Voltage": voltage,
+            "Pack Current": current,
+            "Pack Temp": np.full(10, 30.0),
+        })
+
+    def test_discharge_energy_reported(self):
+        df = self._make_df()
+        import pandas as pd
+        sim_states = pd.DataFrame({
+            "distance_m": [0.0, 100.0],
+            "speed_ms": [10.0, 10.0],
+            "speed_kmh": [36.0, 36.0],
+            "segment_time_s": [0.5, 0.4],
+            "soc_pct": [100.0, 95.0],
+            "pack_voltage_v": [400.0, 400.0],
+            "pack_current_a": [30.0, 30.0],
+            "cell_temp_c": [30.0, 30.0],
+        })
+        rep = validate_full_endurance(
+            sim_states, df,
+            sim_total_time_s=0.9, sim_final_soc=95.0,
+            sim_total_energy_kwh=0.001, sim_laps=1,
+        )
+        assert hasattr(rep, "telem_discharge_j")
+        assert hasattr(rep, "telem_regen_j")
+        assert hasattr(rep, "telem_net_j")
+        # Discharge: 4 intervals * 400V * 50A * 0.1s = 8000 J
+        # (first sample has dt=0 by the prepend convention)
+        assert rep.telem_discharge_j == pytest.approx(8000.0, rel=0.1)
+        # Regen: 5 intervals * 400V * 20A * 0.1s = 4000 J
+        # (includes the 1st regen sample since prior sample is discharge, not self)
+        assert rep.telem_regen_j == pytest.approx(4000.0, rel=0.1)
+        # Net: discharge - regen
+        assert rep.telem_net_j == pytest.approx(rep.telem_discharge_j - rep.telem_regen_j, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Stint-aware validation (C16)
+# ---------------------------------------------------------------------------
+
+class TestStintAwareValidation:
+    """If aim_df has a `stint` column, validate_full_endurance must segment on it."""
+
+    def test_uses_stint_column_when_present(self):
+        import pandas as pd
+        # Build a tiny two-stint frame
+        n1, n2 = 20, 20
+        n = n1 + n2
+        time = np.arange(n) * 0.1
+        stint = np.concatenate([np.full(n1, 1), np.full(n2, 2)])
+        df = pd.DataFrame({
+            "Time": time,
+            "GPS Speed": np.full(n, 50.0),
+            "Distance on GPS Speed": np.linspace(0, 1000, n),
+            "State of Charge": np.linspace(100.0, 90.0, n),
+            "Pack Voltage": np.full(n, 400.0),
+            "Pack Current": np.full(n, 30.0),
+            "Pack Temp": np.linspace(30.0, 35.0, n),
+            "stint": stint,
+        })
+        sim_states = pd.DataFrame({
+            "distance_m": [0.0, 500.0, 1000.0],
+            "speed_ms": [13.89, 13.89, 13.89],
+            "speed_kmh": [50.0, 50.0, 50.0],
+            "segment_time_s": [1.0, 1.0, 1.0],
+            "soc_pct": [100.0, 95.0, 90.0],
+            "pack_voltage_v": [400.0, 400.0, 400.0],
+            "pack_current_a": [30.0, 30.0, 30.0],
+            "cell_temp_c": [30.0, 32.0, 35.0],
+        })
+        rep = validate_full_endurance(
+            sim_states, df,
+            sim_total_time_s=3.0, sim_final_soc=90.0,
+            sim_total_energy_kwh=0.001, sim_laps=2,
+        )
+        # Stint-aware report should expose per-stint breakdown
+        assert hasattr(rep, "stints")
+        assert len(rep.stints) == 2
+
+
+# ---------------------------------------------------------------------------
+# NF-45: remove speed > 5 km/h filter on cleaned data path
+# ---------------------------------------------------------------------------
+
+class TestNF45SpeedFilter:
+    """On cleaned data (already stint-segmented), the speed>5 filter must be a no-op.
+
+    The filter incorrectly drops genuine low-speed hairpin samples on the raw
+    path too. The correct root-cause fix is stint-aware segmentation, not a
+    speed cutoff.
+    """
+
+    def test_driving_time_includes_low_speed_moving_samples(self):
+        import pandas as pd
+
+        # Build cleaned-style frame: all samples are "driving" even if slow
+        n = 30
+        time = np.arange(n) * 0.1
+        # Mostly 50 km/h, but a 5-sample section at 3 km/h (a hairpin)
+        speed = np.full(n, 50.0)
+        speed[10:15] = 3.0
+        df = pd.DataFrame({
+            "Time": time,
+            "GPS Speed": speed,
+            "Distance on GPS Speed": np.linspace(0, 1000, n),
+            "State of Charge": np.linspace(100.0, 90.0, n),
+            "Pack Voltage": np.full(n, 400.0),
+            "Pack Current": np.full(n, 30.0),
+            "Pack Temp": np.full(n, 30.0),
+            # presence of "stint" column means this is cleaned data
+            "stint": np.ones(n, dtype=int),
+        })
+        sim_states = pd.DataFrame({
+            "distance_m": [0.0, 1000.0],
+            "speed_ms": [13.89, 13.89],
+            "speed_kmh": [50.0, 50.0],
+            "segment_time_s": [1.5, 1.4],
+            "soc_pct": [100.0, 90.0],
+            "pack_voltage_v": [400.0, 400.0],
+            "pack_current_a": [30.0, 30.0],
+            "cell_temp_c": [30.0, 30.0],
+        })
+        rep = validate_full_endurance(
+            sim_states, df,
+            sim_total_time_s=2.9, sim_final_soc=90.0,
+            sim_total_energy_kwh=0.001, sim_laps=1,
+        )
+        # Driving time metric: full span (~2.9s), not 2.4s with the cutoff
+        dt_metric = [m for m in rep.metrics if m.name == "Driving time"][0]
+        # Full span = (n-1) * 0.1 = 2.9s; with cutoff would lose 5*0.1=0.5s
+        assert dt_metric.telemetry_value == pytest.approx(2.9, abs=0.15)
