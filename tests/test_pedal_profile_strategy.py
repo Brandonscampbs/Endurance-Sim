@@ -311,6 +311,65 @@ class TestFromTelemetry:
         strategy = PedalProfileStrategy.from_telemetry(aim_df, track)
         assert np.all(strategy._ref_speed_ms > 0.0)
 
+    def test_d08_brake_normalization_is_data_independent(self):
+        """D-08: brake_pct for the same physical brake pressure should
+        be identical whether calibrated on a 3-lap subset or the full
+        recording. Previously the 99th-percentile-of-data-at-hand
+        normalization drifted with the subset."""
+        from fsae_sim.driver.strategies import PedalProfileStrategy
+
+        n_laps = 6
+        n_samples_per_lap = 200
+        lap_distance = 800.0
+        track = make_track(n_segments=10, length_m=lap_distance / 10)
+
+        rows = []
+        for lap in range(n_laps):
+            dist_per_lap = np.linspace(
+                0.0, lap_distance, n_samples_per_lap, endpoint=False,
+            )
+            for i, d in enumerate(dist_per_lap):
+                frac = i / n_samples_per_lap
+                if frac < 0.5:
+                    lat = 42.0 - 0.001 + frac * 2 * 0.002
+                else:
+                    lat = 42.0 + 0.001 - (frac - 0.5) * 2 * 0.002
+                # Half the lap: throttle; other half: constant 30 bar brake.
+                if frac < 0.5:
+                    throttle = 60.0
+                    brake = 0.0
+                else:
+                    throttle = 0.0
+                    brake = 30.0
+                rows.append({
+                    "Distance on GPS Speed": lap * lap_distance + d,
+                    "GPS Speed": 40.0,
+                    "Throttle Pos": throttle,
+                    "LVCU Torque Req": throttle * 85.0 / 100.0,
+                    "FBrakePressure": 0.0,
+                    "RBrakePressure": brake,
+                    "GPS Latitude": lat,
+                    "GPS Longitude": -83.5,
+                    "GPS LatAcc": 0.0,
+                    "GPS Slope": 0.0,
+                })
+        aim_df = pd.DataFrame(rows)
+
+        strat_full = PedalProfileStrategy.from_telemetry(aim_df, track)
+        strat_subset = PedalProfileStrategy.from_telemetry(
+            aim_df, track, laps=[0, 1, 2],
+        )
+        # brake_pct for the brake segments must be identical — both
+        # calibrations see the same physical 30 bar.
+        brake_mask_full = strat_full._actions == 2
+        brake_mask_subset = strat_subset._actions == 2
+        assert np.any(brake_mask_full) and np.any(brake_mask_subset)
+        np.testing.assert_allclose(
+            strat_full._brake_pct[brake_mask_full],
+            strat_subset._brake_pct[brake_mask_subset],
+            rtol=1e-9,
+        )
+
     def test_d04_calibration_respects_lap_subset(self):
         """D-04: `from_telemetry(..., laps=[0..4])` must produce different
         per-segment arrays than `laps=[5..9]` when the two subsets differ

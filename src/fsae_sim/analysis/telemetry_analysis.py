@@ -131,6 +131,7 @@ def extract_per_segment_actions(
     laps: list[int] | None = None,
     throttle_threshold: float = 5.0,
     brake_threshold: float = 2.0,
+    brake_max_pressure_bar: float | None = None,
 ) -> pd.DataFrame:
     """Sample telemetry at each segment midpoint and classify actions.
 
@@ -165,6 +166,7 @@ def extract_per_segment_actions(
             laps=laps,
             throttle_threshold=throttle_threshold,
             brake_threshold=brake_threshold,
+            brake_max_pressure_bar=brake_max_pressure_bar,
         )
     else:
         # Fallback for synthetic/simple data: single-pass
@@ -172,6 +174,7 @@ def extract_per_segment_actions(
             aim_df, track,
             throttle_threshold=throttle_threshold,
             brake_threshold=brake_threshold,
+            brake_max_pressure_bar=brake_max_pressure_bar,
         )
 
 
@@ -200,6 +203,7 @@ def _extract_per_lap_then_aggregate(
     laps: list[int] | None = None,
     throttle_threshold: float = 5.0,
     brake_threshold: float = 2.0,
+    brake_max_pressure_bar: float | None = None,
 ) -> pd.DataFrame:
     """Classify per-lap, then aggregate across laps with majority vote.
 
@@ -236,14 +240,14 @@ def _extract_per_lap_then_aggregate(
     if not selected:
         selected = lap_boundaries
 
-    # Compute brake normalization across all moving data
-    speed_all = aim_df["GPS Speed"].values
-    moving = speed_all > 5.0
-    front_brake_all = aim_df["FBrakePressure"].values
-    rear_brake_all = aim_df["RBrakePressure"].values
-    brake_all = np.maximum(front_brake_all, rear_brake_all)
-    nonzero_brake = brake_all[moving & (brake_all > 0)]
-    brake_norm = float(np.percentile(nonzero_brake, 99)) if len(nonzero_brake) > 0 else 1.0
+    # D-08: brake normalization is now data-independent. Prefer the
+    # DSS-derived `brake_max_pressure_bar` passed in by the caller;
+    # fall back to a 60 bar FSAE-typical constant. The old 99th-percentile
+    # approach made `brake_pct` depend on which laps were in `aim_df`.
+    if brake_max_pressure_bar is not None:
+        brake_norm = float(brake_max_pressure_bar)
+    else:
+        brake_norm = 60.0
     brake_norm = max(brake_norm, 1.0)
 
     # Per-lap, per-segment classification
@@ -401,6 +405,7 @@ def _extract_single_pass(
     *,
     throttle_threshold: float = 5.0,
     brake_threshold: float = 2.0,
+    brake_max_pressure_bar: float | None = None,
 ) -> pd.DataFrame:
     """Single-pass extraction for synthetic data without lap boundaries."""
     lap_dist = track.total_distance_m
@@ -414,8 +419,11 @@ def _extract_single_pass(
 
     telem_lap_dist = dist % lap_dist
 
-    nonzero_brake = brake_pressure[brake_pressure > 0]
-    brake_norm = float(np.percentile(nonzero_brake, 99)) if len(nonzero_brake) > 0 else 1.0
+    # D-08: data-independent brake normalization (see _extract_per_lap_then_aggregate).
+    if brake_max_pressure_bar is not None:
+        brake_norm = float(brake_max_pressure_bar)
+    else:
+        brake_norm = 60.0
     brake_norm = max(brake_norm, 1.0)
 
     rows = []

@@ -399,6 +399,7 @@ class CalibratedStrategy(DriverStrategy):
         distance_col: str = "Distance on GPS Speed",
         throttle_threshold: float = 5.0,
         brake_threshold: float = 2.0,
+        brake_max_pressure_bar: float | None = None,
         merge_tolerance: float = 0.15,
         name: str = "calibrated",
     ) -> CalibratedStrategy:
@@ -443,6 +444,7 @@ class CalibratedStrategy(DriverStrategy):
             laps=effective_laps,
             throttle_threshold=throttle_threshold,
             brake_threshold=brake_threshold,
+            brake_max_pressure_bar=brake_max_pressure_bar,
         )
         zones = collapse_to_zones(seg_actions, track, merge_tolerance=merge_tolerance)
 
@@ -601,6 +603,7 @@ class PedalProfileStrategy(DriverStrategy):
         laps: list[int] | None = None,
         throttle_threshold: float = 5.0,
         brake_threshold: float = 2.0,
+        brake_max_pressure_bar: float | None = None,
         name: str = "pedal_profile",
     ) -> PedalProfileStrategy:
         """Calibrate from AiM telemetry.
@@ -630,14 +633,12 @@ class PedalProfileStrategy(DriverStrategy):
             total_dist = aim_df["Distance on GPS Speed"].values
             selected = [(0, len(aim_df), float(total_dist[-1] - total_dist[0]))]
 
-        speed_all = aim_df["GPS Speed"].values
-        moving = speed_all > 5.0
-        brake_all = np.maximum(
-            aim_df["FBrakePressure"].values,
-            aim_df["RBrakePressure"].values,
-        )
-        nonzero_brake = brake_all[moving & (brake_all > 0)]
-        brake_norm = float(np.percentile(nonzero_brake, 99)) if len(nonzero_brake) > 0 else 1.0
+        # D-08: brake normalization is now data-independent (DSS-derived
+        # max pressure, not 99th percentile of the data at hand).
+        if brake_max_pressure_bar is not None:
+            brake_norm = float(brake_max_pressure_bar)
+        else:
+            brake_norm = 60.0
         brake_norm = max(brake_norm, 1.0)
 
         has_torque = "LVCU Torque Req" in aim_df.columns

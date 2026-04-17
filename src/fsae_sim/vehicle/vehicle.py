@@ -20,6 +20,12 @@ class VehicleParams:
     downforce_coefficient: float = 0.0  # Cl * A (m²), 0 = no downforce
     rotor_inertia_kg_m2: float = 0.06  # EMRAX 228 default
     wheel_inertia_kg_m2: float = 0.3   # per wheel (10" Hoosier + aluminum rim)
+    # D-08: brake system peak pressure (bar). Data-independent so that
+    # recalibration on a short subset produces the same normalized brake_pct
+    # as recalibration on the full endurance. Default is a conservative
+    # FSAE-typical max; override in configs/ct16ev.yaml when the DSS Brake
+    # System sheet provides a measured value.
+    brake_max_pressure_bar: float = 60.0
 
 
 @dataclass(frozen=True)
