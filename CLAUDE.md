@@ -2,15 +2,14 @@
 
 ## What This Repo Is
 
-FSAE EV endurance simulation for UConn Formula SAE Electric (car CT-16EV).
+FSAE EV endurance simulation
 
-**Core mission: build the most accurate FSAE EV endurance simulator possible, and expose it through a three-page webapp.** The three pages are:
+**Core mission: build FSAE EV endurance simulator, and view it through a three-page webapp.** The three pages are:
 
 1. **Verification** — how close is the baseline simulator to reality? (compare sim vs Michigan 2025 telemetry, per-channel residuals, energy budget reconciliation).
 2. **Visualization** — a 3D playback of the car so physics bugs become visible.
 3. **Simulate** — a what-if tool with three knobs only: **max motor RPM, max motor torque, SOC discharge map**. Run one sim with those overrides, see how endurance changes.
 
-**Out of scope for this repo.** Parameter sweeps, Pareto optimization, multi-run comparison, driver-strategy search, coaching output. Those will live in a separate repo that imports this one as a library. Do not add sweep runners, sweep-results pages, or sweep storage schemas here.
 
 The repo starts with real telemetry and battery simulation data from Michigan 2025.
 
@@ -18,17 +17,16 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 
 ### Real-Car-Data-And-Stats/
 - **DSS spreadsheet** (`301_Univ_of_Connecticut-DSS-2025-05-05_1957.xlsx`): **Primary source of truth** for vehicle parameters. Contains measured mass, dimensions, suspension geometry, aero coefficients, motor/inverter specs, accumulator details, drivetrain ratios, and brake system data. Always use DSS values over estimates.
-- **AiM telemetry** (`2025 Endurance Data.csv`): 20Hz CSV export from AiM Evo 5 data logger. Full Michigan endurance (~22 km, 21 laps, 1859s including driver change). Key channels: GPS Speed, GPS Lat/Lon, GPS LatAcc/LonAcc, RPM, Torque Feedback, Pack Voltage/Current, State of Charge, Pack Temp, Throttle Pos, Brake Pressure, LVCU Torque Req. Binary logs (`.xrk`, `.xrz`, `.drk`, `.rrk`) require AiM Race Studio.
+- **AiM telemetry** (`CleanedEndurance.csv`): 20Hz CSV export from AiM Evo 5 data logger. Full Michigan endurance (~22 km, 21 laps, 1859s including driver change). Key channels: GPS Speed, GPS Lat/Lon, GPS LatAcc/LonAcc, RPM, Torque Feedback, Pack Voltage/Current, State of Charge, Pack Temp, Throttle Pos, Brake Pressure, LVCU Torque Req. Binary logs (`.xrk`, `.xrz`, `.drk`, `.rrk`) require AiM Race Studio.
 - **Endurance Tune2.txt**: BMS discharge limits, SOC taper, cell voltage bounds, inverter/motor parameter settings.
 - **About-Energy-Volt-Simulations/**: Voltt battery simulation export (110S4P, Molicel P45B). Two CSVs -- `_cell.csv` (single-cell level) and `_pack.csv` (pack-scaled). Used for battery model calibration (OCV-SOC curve, internal resistance).
 - **LVCU Code.txt**: LVCU firmware source — the torque command chain (`PowertrainModel.lvcu_torque_command()` and related methods) is a faithful translation of this file. Source of truth for `lvcu_power_constant`, `lvcu_rpm_scale`, `lvcu_omega_floor`, and pedal deadzone parameters in `PowertrainConfig`.
 - **emrax228_hv_cc_motor_map_long.csv**: EMRAX 228 motor efficiency map (speed_rpm, torque_Nm, efficiency_pct). Loaded by `MotorEfficiencyMap` for 2D operating-point-dependent motor+inverter efficiency. Falls back to constant `drivetrain_efficiency` if missing.
 - **Tire Models from TTC/**: PAC02 .tir files for Hoosier LC0 16x7.5-10 at multiple pressures (Round 8 TTC data). Primary: `Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir`. Longitudinal (Fx) coefficients transplanted from R25B donor data via `scripts/transplant_fx_coefficients.py`.
-- **CleanedEndurance.csv**: Cleaned AiM telemetry produced by `scripts/clean_endurance_data.py` (removes pre-start, driver change, post-finish). Uses `LFspeed` column (left-front wheel speed) instead of GPS Speed. UTF-8 encoding (source AiM CSV is Latin-1; the cleaning script transcodes).
 
 ### Known Issues (MUST READ)
 
-**`docs/SIMULATOR_ISSUES.md`** is the concise tracker for open physics gaps and code issues. **Read it before trusting simulation results or starting new physics work.**
+**`docs/SIMULATOR_ISSUES.md`** is the concise tracker for open and closed physics gaps and code issues.
 
 ### Key Vehicle Parameters (from DSS + Endurance Tune)
 | Parameter | Value | Source |
@@ -55,7 +53,7 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 
 ## Project State
 
-Baseline sim is validated against Michigan 2025 telemetry (~2% energy error, 8/8 metrics pass). Webapp shell has all three pages; Verification and Visualization are functional; Simulate is a stub pending a backend run endpoint. Current work: close remaining physics gaps (see `docs/SIMULATOR_ISSUES.md`) and implement the Simulate page.
+Baseline sim is validated against Michigan 2025 telemetry. Webapp shell has all three pages; Verification and Visualization are functional; Simulate is a stub pending a backend run endpoint. Current work: close remaining physics gaps and implement the Simulate page.
 
 ## Architecture Guidance
 
@@ -70,17 +68,14 @@ Baseline sim is validated against Michigan 2025 telemetry (~2% energy error, 8/8
 
 ## Installed VoltAgent Subagent Packages
 
-Marketplace: `VoltAgent/awesome-claude-code-subagents`
-
 | Package | Version | Contents |
-|---|---|---|
 | `voltagent-lang` | 1.0.3 | Language specialists (includes `python-pro`) |
 | `voltagent-infra` | 1.0.1 | Infrastructure/DevOps (Docker, CI/CD) |
 | `voltagent-data-ai` | 1.0.2 | Data engineering, ML, analytics |
 
 ## Subagents and When to Use Them
 
-**Always use `model: "opus"` when deploying agents.** All Agent tool calls must specify the Opus 4.6 model to ensure maximum capability and reasoning quality. This applies to implementer, spec reviewer, and code-quality reviewer subagents alike — do not downgrade to Haiku or Sonnet for mechanical tasks.
+**Always use `model: "opus"` when deploying agents.** All Agent tool calls must specify the Opus 4.7 model.
 
 Subagent types are namespaced by the installed plugin. Use the fully-qualified name in `subagent_type` (e.g. `voltagent-lang:python-pro`, not bare `python-pro`).
 

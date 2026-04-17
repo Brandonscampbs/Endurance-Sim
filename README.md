@@ -113,4 +113,3 @@ pytest -v
 - **Motor map:** `emrax228_hv_cc_motor_map_long.csv` — 2D efficiency lookup.
 - **Tires:** `Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir` (PAC2002, Fx transplanted from R25B donor).
 
-See `docs/SIMULATOR_ISSUES.md` for known physics/code gaps.

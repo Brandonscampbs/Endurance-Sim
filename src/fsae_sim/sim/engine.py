@@ -8,6 +8,7 @@ endurance simulation.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -108,7 +109,6 @@ class SimulationEngine:
             if motor_map_path.exists():
                 motor_map = MotorEfficiencyMap(motor_map_path)
             else:
-                import warnings
                 warnings.warn(
                     f"MotorEfficiencyMap CSV not found at {motor_map_path}; "
                     "falling back to constant drivetrain_efficiency. Motor/"
@@ -117,7 +117,6 @@ class SimulationEngine:
                     stacklevel=2,
                 )
         else:
-            import warnings
             warnings.warn(
                 "fsae_sim.vehicle.motor_efficiency not importable; falling "
                 "back to constant drivetrain_efficiency.",
@@ -194,7 +193,6 @@ class SimulationEngine:
         # warn so the implicit bump is visible in logs.
         if rolling_start:
             if initial_speed_ms < self._MIN_SPEED_MS:
-                import warnings
                 warnings.warn(
                     f"rolling_start=True: clamping initial_speed_ms="
                     f"{initial_speed_ms:.3f} up to _MIN_SPEED_MS="
@@ -425,8 +423,7 @@ class SimulationEngine:
                     and pack_current > bms_current_limit + 1.0
                     and not getattr(self, "_replay_bms_warned", False)
                 ):
-                    import warnings as _w
-                    _w.warn(
+                    warnings.warn(
                         f"Replay pack_current={pack_current:.1f} A exceeds "
                         f"sim BMS ceiling={bms_current_limit:.1f} A. Replay "
                         "preserves telemetry ground truth; investigate if "
