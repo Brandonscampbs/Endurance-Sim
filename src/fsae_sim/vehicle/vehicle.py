@@ -64,6 +64,10 @@ class VehicleConfig:
     battery: BatteryConfig
     tire: TireConfig | None = None
     suspension: SuspensionConfig | None = None
+    # Dynamics backend selector: "legacy" uses fsae_sim.vehicle.dynamics.VehicleDynamics
+    # (existing AI-authored chassis); "dynamics6dof" uses the fastest-lap-ported
+    # FastestLapDynamicsBackend. Default is "legacy" so existing YAMLs keep working.
+    dynamics_backend: str = "legacy"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "VehicleConfig":
@@ -85,6 +89,7 @@ class VehicleConfig:
                 battery=BatteryConfig.from_dict(data["battery"]),
                 tire=TireConfig(**tire_data) if tire_data is not None else None,
                 suspension=SuspensionConfig(**suspension_data) if suspension_data is not None else None,
+                dynamics_backend=data.get("dynamics_backend", "legacy"),
             )
         except TypeError as e:
             raise ValueError(f"{path}: {e}") from e

@@ -129,7 +129,19 @@ class SimulationEngine:
         tire_cfg = getattr(vehicle, "tire", None)
         susp_cfg = getattr(vehicle, "suspension", None)
 
-        if _HAS_TIRE_MODELS and tire_cfg is not None and susp_cfg is not None:
+        backend = getattr(vehicle, "dynamics_backend", "legacy")
+
+        if backend == "dynamics6dof":
+            # Use the fastest-lap-ported backbone. Requires tire + suspension
+            # configs (same as the legacy physics path).
+            if tire_cfg is None or susp_cfg is None:
+                raise ValueError(
+                    "dynamics_backend='dynamics6dof' requires tire and suspension "
+                    "configs to be present in the YAML."
+                )
+            from fsae_sim.dynamics6dof.backend import FastestLapDynamicsBackend
+            self.dynamics = FastestLapDynamicsBackend.from_vehicle_config(vehicle)
+        elif _HAS_TIRE_MODELS and tire_cfg is not None and susp_cfg is not None:
             tire_model = PacejkaTireModel(tire_cfg.tir_file)
             if tire_cfg.grip_scale != 1.0:
                 tire_model.apply_grip_scale(tire_cfg.grip_scale)
