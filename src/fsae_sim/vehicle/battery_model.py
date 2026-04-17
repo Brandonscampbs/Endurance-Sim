@@ -267,10 +267,8 @@ class BatteryModel:
             )
         # D-04: make the train/test leak explicit. Fitting pack OCV and
         # resistance on the same AiM recording used for validation is a
-        # circular comparison; `scripts/validate_tier3.py` deliberately
-        # does NOT call this. When callers opt in (e.g. sweep scripts that
-        # train on stint 1 and validate on stint 2), they must pass
-        # `holdout_laps`.
+        # circular comparison. Callers that want to opt in (train on one
+        # stint, validate on another) must pass `holdout_laps`.
         import warnings
         warnings.warn(
             "calibrate_pack_from_telemetry fits pack OCV/R on AiM telemetry "
