@@ -469,8 +469,11 @@ class PowertrainModel:
     def regen_force(self, brake_pct: float, vehicle_speed_ms: float) -> float:
         """Regenerative braking force (N, negative = decelerating).
 
-        Regen torque capability is limited by the same motor torque envelope
-        used for driving.  The returned force is negative (opposing motion).
+        Regen torque capability is limited by the motor torque envelope
+        (same hyperbolic shape as motoring), *derated* by the regen
+        efficiency factor because the generator side of the Cascadia
+        CM200DX cannot sustain quite the same current envelope as
+        motoring. The returned force is negative (opposing motion).
 
         S12 note on gearbox sign: in generator (regen) mode, gearbox friction
         *adds* to the retarding torque at the wheel, because the wheel must
@@ -480,10 +483,14 @@ class PowertrainModel:
             T_wheel = T_motor * gear_ratio / η_gearbox
 
         (not ``* η_gearbox`` as in the motoring direction).  This makes the
-        mechanical retarding force ~3% larger than a naïve multiply.  The
-        electrical-energy asymmetry (recovering less than the mechanical
-        input because of motor+inverter losses) is handled separately in
-        ``electrical_power()``.
+        mechanical retarding force ~3 % larger than a naïve multiply.
+        The electrical-energy asymmetry (recovering less than the
+        mechanical input because of motor+inverter losses) is handled
+        separately in ``electrical_power()``.
+
+        D-22: the max regen torque envelope is now explicitly derated by
+        ``_REGEN_EFFICIENCY_FACTOR`` — previously the docstring claimed
+        that happened but the code used the full motoring envelope.
 
         Args:
             brake_pct: Regen brake demand in the range [0.0, 1.0].
@@ -499,8 +506,8 @@ class PowertrainModel:
             return 0.0
 
         rpm = self.motor_rpm_from_speed(speed)
-        # Generator torque capability uses the same RPM-torque envelope.
-        max_regen_torque = self.max_motor_torque(rpm)
+        # D-22: derate the generator envelope.
+        max_regen_torque = self.max_motor_torque(rpm) * self._REGEN_EFFICIENCY_FACTOR
         commanded_torque = brake * max_regen_torque
         # S12: divide by η_gearbox, not multiply. Gearbox friction adds
         # to the retarding torque the car feels at the contact patch.
