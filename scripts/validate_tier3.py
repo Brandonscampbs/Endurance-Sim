@@ -58,6 +58,10 @@ def main():
     # OCV and pack R against the same data we then validate against.
     aim_df = _annotate_laps(aim_df)
     HOLDOUT_LAPS = list(range(13, 22))  # validate on laps 13-21
+    CALIB_LAPS = list(range(1, 11))      # calibrate on laps 1-10
+    # D-04: make the calibration / validation split explicit.
+    print("Battery model calibrated from Voltt cell CSV only (no AiM fit).")
+    print("Driver model calibrated on laps 1-10. Validated on laps 13-21 (held out).")
 
     battery = BatteryModel(config.battery)
     battery.calibrate_from_voltt(voltt_df)

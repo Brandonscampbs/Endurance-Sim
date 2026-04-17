@@ -261,6 +261,19 @@ class BatteryModel:
                 "calibrate_pack_from_telemetry has already been called on "
                 "this model. Create a new BatteryModel instance instead."
             )
+        # D-04: make the train/test leak explicit. Fitting pack OCV and
+        # resistance on the same AiM recording used for validation is a
+        # circular comparison; `scripts/validate_tier3.py` deliberately
+        # does NOT call this. When callers opt in (e.g. sweep scripts that
+        # train on stint 1 and validate on stint 2), they must pass
+        # `holdout_laps`.
+        import warnings
+        warnings.warn(
+            "calibrate_pack_from_telemetry fits pack OCV/R on AiM telemetry "
+            "— do not use for validation against the same data. Pass "
+            "`holdout_laps=` or rely on `calibrate_from_voltt` alone.",
+            stacklevel=2,
+        )
         self._pack_telemetry_calibrated = True
 
         # Apply holdout filter.  We look for a 'lap' column; if absent,

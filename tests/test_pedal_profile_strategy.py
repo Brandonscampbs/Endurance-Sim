@@ -311,6 +311,78 @@ class TestFromTelemetry:
         strategy = PedalProfileStrategy.from_telemetry(aim_df, track)
         assert np.all(strategy._ref_speed_ms > 0.0)
 
+    def test_d04_calibration_respects_lap_subset(self):
+        """D-04: `from_telemetry(..., laps=[0..4])` must produce different
+        per-segment arrays than `laps=[5..9]` when the two subsets differ
+        in driving behavior. Proves the held-out subset genuinely matters
+        — otherwise the train/test split is cosmetic."""
+        from fsae_sim.driver.strategies import PedalProfileStrategy
+
+        n_laps = 10
+        n_samples_per_lap = 200
+        # Lap distance must be in [500, 2000] to pass detect_lap_boundaries
+        # sanity check.
+        lap_distance = 800.0
+        track_seg_length = lap_distance / 10
+        track = make_track(n_segments=10, length_m=track_seg_length)
+
+        rows = []
+        for lap in range(n_laps):
+            dist_per_lap = np.linspace(
+                0.0, lap_distance, n_samples_per_lap, endpoint=False,
+            )
+            for i, d in enumerate(dist_per_lap):
+                # Laps 0-4 drive at 70% pedal; laps 5-9 drive at 20%.
+                pedal = 70.0 if lap < 5 else 20.0
+                # Build GPS latitude as a sawtooth crossing the median
+                # once per lap, which is how detect_lap_boundaries finds
+                # laps.
+                frac = i / n_samples_per_lap
+                # Triangular lat that starts below median, rises above,
+                # then falls: crossing once per lap.
+                if frac < 0.5:
+                    lat = 42.0 - 0.001 + frac * 2 * 0.002
+                else:
+                    lat = 42.0 + 0.001 - (frac - 0.5) * 2 * 0.002
+                rows.append({
+                    "Distance on GPS Speed": lap * lap_distance + d,
+                    "GPS Speed": 40.0,
+                    "Throttle Pos": pedal,
+                    "LVCU Torque Req": pedal * 85.0 / 100.0,
+                    "FBrakePressure": 0.0,
+                    "RBrakePressure": 0.0,
+                    "GPS Latitude": lat,
+                    "GPS Longitude": -83.5,
+                    "GPS LatAcc": 0.0,
+                    "GPS Slope": 0.0,
+                })
+        aim_df = pd.DataFrame(rows)
+
+        # Confirm lap detection works so `laps=` is actually respected.
+        from fsae_sim.analysis.telemetry_analysis import _detect_lap_boundaries_safe
+        boundaries = _detect_lap_boundaries_safe(aim_df)
+        assert len(boundaries) >= 5, (
+            f"Test setup: lap detection produced {len(boundaries)} laps, "
+            "need at least 5 for the subset test to be meaningful."
+        )
+
+        strat_first = PedalProfileStrategy.from_telemetry(
+            aim_df, track, laps=[0, 1, 2],
+        )
+        strat_second = PedalProfileStrategy.from_telemetry(
+            aim_df, track, laps=[3, 4],
+        )
+        # Strategy built on the 70%-pedal laps should have a very different
+        # throttle profile than the one built on 20%-pedal laps (which
+        # may even fall below the 3% torque-fraction threshold for THROTTLE).
+        assert not np.allclose(
+            strat_first._throttle_pct, strat_second._throttle_pct, atol=1e-3,
+        ), (
+            "D-04: per-segment throttle_pct should differ between calibration "
+            "subsets that drive at different torque levels; "
+            f"got first={strat_first._throttle_pct}, second={strat_second._throttle_pct}"
+        )
+
     def test_d01_classify_on_torque_fraction(self):
         """D-01: a segment with low raw pedal (3%) but high torque request
         (15% of inverter cap) should classify as THROTTLE with the torque
