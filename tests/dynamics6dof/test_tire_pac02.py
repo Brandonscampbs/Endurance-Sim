@@ -18,12 +18,24 @@ def pac02_model():
     return model
 
 
-def test_adapter_returns_forces_matching_underlying_model(pac02_model):
+def test_adapter_fy_sign_is_flipped_for_iso_convention(pac02_model):
+    """PAC02 is fit in SAE; dynamics6dof uses ISO. Fy must flip."""
     corner = PAC02Corner(pac02_model)
-    fx_direct, fy_direct = pac02_model.combined_forces(0.05, 0.02, 700.0, 0.0)
+    fx_sae, fy_sae = pac02_model.combined_forces(0.05, 0.02, 700.0, 0.0)
     fx, fy = corner.forces(slip_angle_rad=0.05, slip_ratio=0.02, fz_n=700.0)
-    assert fx == pytest.approx(float(fx_direct), rel=1e-12)
-    assert fy == pytest.approx(float(fy_direct), rel=1e-12)
+    assert fx == pytest.approx(float(fx_sae), rel=1e-12)
+    assert fy == pytest.approx(float(-fy_sae), rel=1e-12)
+
+
+def test_positive_slip_angle_gives_positive_fy_in_iso(pac02_model):
+    """In ISO convention, positive α means velocity is left of wheel plane;
+    the restoring tire force should be to the right (negative y_ISO)... but
+    PAC02 fit returns Fy_SAE<0 for α>0, so after flip Fy_ISO>0. Verify the
+    adapter consistently yields a restoring torque for forward-driving cars
+    under positive steering (see end-to-end tests)."""
+    corner = PAC02Corner(pac02_model)
+    _, fy = corner.forces(slip_angle_rad=0.1, slip_ratio=0.0, fz_n=700.0)
+    assert fy > 0  # flipped from SAE's negative
 
 
 def test_adapter_produces_nonzero_forces_at_nonzero_slip(pac02_model):

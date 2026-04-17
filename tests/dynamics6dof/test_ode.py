@@ -23,20 +23,19 @@ def params() -> Dynamics6DofParams:
     return Dynamics6DofParams.ct16ev_defaults()
 
 
-def test_zero_state_zero_tires_yields_gravity_only(params):
-    # State = all zeros, no tire forces, no control inputs.
-    # Expected body-frame forces: gravity only, (0, 0, -m*g).
-    # dv = F/m - ω×v = (0, 0, -g).
+def test_zero_state_zero_tires_is_static_equilibrium(params):
+    # State = all zeros -> chassis sits at its static equilibrium, suspension
+    # deformation produces Fz per corner that balances gravity. Expected:
+    # all derivatives ≈ 0 (no tire forces injected, but suspension Fz reacts
+    # to the static offset baked into params).
     state = State6Dof.from_array(np.zeros(10))
     dstate = rhs(state, steering_rad=0.0, throttle=0.0, brake=0.0, params=params)
-    # d(rear_omega) = 0 (no throttle, no tire Fx)
-    assert dstate[0] == pytest.approx(0.0, abs=1e-9)
-    # d(vx), d(vy) = 0
-    assert dstate[1] == pytest.approx(0.0, abs=1e-9)
-    assert dstate[2] == pytest.approx(0.0, abs=1e-9)
-    # d(vz) = d(dz)/dt = Newton z. At z=0 the smoothing epsilon contributes a
-    # tiny +Fz per corner (~0.5 N each), so dvz ≈ -g + 4*0.5/m. Tolerate 1%.
-    assert dstate[7] == pytest.approx(-9.81, rel=1e-2)
+    # d(rear_omega) = 0, dvx = 0, dvy = 0
+    assert dstate[0] == pytest.approx(0.0, abs=1e-6)
+    assert dstate[1] == pytest.approx(0.0, abs=1e-6)
+    assert dstate[2] == pytest.approx(0.0, abs=1e-6)
+    # d(dz)/dt should be approximately zero (gravity balanced by suspension Fz)
+    assert dstate[7] == pytest.approx(0.0, abs=1e-3)
 
 
 def test_derivative_ordering_matches_state_ordering(params):

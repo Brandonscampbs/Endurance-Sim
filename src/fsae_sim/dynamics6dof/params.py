@@ -50,6 +50,26 @@ class Dynamics6DofParams:
     rear_axle_inertia_kgm2: float
     final_drive: float
 
+    @property
+    def static_sym_displ_front_m(self) -> float:
+        """Axle-level symmetric suspension displacement that produces front
+        static Fz at z=0. Derived from the series-spring balance:
+
+            k_tire * w_static = weight_front_per_corner
+            w_static = k_chassis/(k_chassis + k_tire) * displ_sym
+            => displ_sym = weight_front_per_corner * (k_chassis + k_tire)
+                           / (k_tire * k_chassis)
+        """
+        w_front_per_corner = 0.5 * self.mass_kg * GRAVITY * self.weight_dist_front
+        return w_front_per_corner * (self.k_chassis_front_npm + self.k_tire_radial_npm) \
+            / (self.k_tire_radial_npm * self.k_chassis_front_npm)
+
+    @property
+    def static_sym_displ_rear_m(self) -> float:
+        w_rear_per_corner = 0.5 * self.mass_kg * GRAVITY * (1.0 - self.weight_dist_front)
+        return w_rear_per_corner * (self.k_chassis_rear_npm + self.k_tire_radial_npm) \
+            / (self.k_tire_radial_npm * self.k_chassis_rear_npm)
+
     @classmethod
     def ct16ev_defaults(cls) -> "Dynamics6DofParams":
         # CT-16EV baseline. Values from DSS where available, otherwise estimates

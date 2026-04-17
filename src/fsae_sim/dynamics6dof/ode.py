@@ -77,9 +77,13 @@ def rhs(
     positions = corner_positions(p)
     v_corners = corner_velocities(v_body, omega, p)
 
-    # Per-axle suspension deformation ---------------------------------------
+    # Per-axle suspension deformation. `state.z` is measured as a DEVIATION
+    # from the per-axle static equilibrium, so we add the static offset before
+    # passing to the axle solver. This keeps the equilibrium at z=0 (useful
+    # for the outer sim) while the suspension module stays pure-geometric.
     wl_f, wr_f, dwl_f, dwr_f = axle_tire_deformation(
-        z=state.z, phi=state.phi, dz=state.dz, dphi=state.dphi,
+        z=state.z + p.static_sym_displ_front_m,
+        phi=state.phi, dz=state.dz, dphi=state.dphi,
         track_m=p.track_front_m,
         k_chassis=p.k_chassis_front_npm,
         k_antiroll=p.k_antiroll_front_npm,
@@ -87,7 +91,8 @@ def rhs(
         steering_rad=steering_rad, beta_left=0.0, beta_right=0.0,
     )
     wl_r, wr_r, dwl_r, dwr_r = axle_tire_deformation(
-        z=state.z, phi=state.phi, dz=state.dz, dphi=state.dphi,
+        z=state.z + p.static_sym_displ_rear_m,
+        phi=state.phi, dz=state.dz, dphi=state.dphi,
         track_m=p.track_rear_m,
         k_chassis=p.k_chassis_rear_npm,
         k_antiroll=p.k_antiroll_rear_npm,
