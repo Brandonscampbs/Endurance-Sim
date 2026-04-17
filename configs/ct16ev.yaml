@@ -16,7 +16,10 @@ powertrain:
   motor_speed_max_rpm: 2900  # Inverter setting (EMRAX 228 capable of 6500)
   brake_speed_rpm: 2400  # Inverter field-weakening onset
   torque_limit_inverter_nm: 85.0  # IQ=170A setting
-  torque_limit_lvcu_nm: 150.0
+  # C17: LVCU firmware default is 2200/10 = 220 Nm (LVCU Code.txt:109).
+  # Prior value 150 Nm was a Michigan 2025 operational cap, not firmware.
+  # Inverter 85 Nm still binds — this is the correct upstream firmware value.
+  torque_limit_lvcu_nm: 220.0
   iq_limit_a: 170.0
   id_limit_a: 30.0
   gear_ratio: 3.6363  # DSS: 40/11 teeth
