@@ -24,6 +24,14 @@ class BatteryConfig:
     discharge_limits: tuple[DischargeLimitPoint, ...]
     cell_capacity_ah: float = 4.5  # Molicel P45B default; P50B = 5.0
     pack_structural_thermal_mass_kj_per_k: float = 7.5  # ≈25% of cell thermal mass (busbars, plates, enclosure)
+    # Passive cooling: Newton's law h·(T_cell − T_ambient).
+    # CT-16EV (2025) has no active cooling — enclosure is effectively
+    # adiabatic on endurance-lap timescales.  Default is 0 (no cooling)
+    # to match the real car; override in the config when the 2026 car
+    # gets a cooling system.  With h > 0 the model has a proper
+    # equilibrium instead of ramping until the BMS kills power.
+    thermal_conductance_w_per_k: float = 0.0
+    ambient_temperature_c: float = 25.0
 
     @property
     def pack_voltage_min_v(self) -> float:
@@ -60,5 +68,13 @@ class BatteryConfig:
         if "pack_structural_thermal_mass_kj_per_k" in data:
             kwargs["pack_structural_thermal_mass_kj_per_k"] = float(
                 data["pack_structural_thermal_mass_kj_per_k"]
+            )
+        if "thermal_conductance_w_per_k" in data:
+            kwargs["thermal_conductance_w_per_k"] = float(
+                data["thermal_conductance_w_per_k"]
+            )
+        if "ambient_temperature_c" in data:
+            kwargs["ambient_temperature_c"] = float(
+                data["ambient_temperature_c"]
             )
         return cls(**kwargs)

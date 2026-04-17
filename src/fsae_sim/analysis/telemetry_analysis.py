@@ -370,11 +370,19 @@ def _extract_per_lap_then_aggregate(
         lap_brakes = np.zeros(num_segments)
         lap_speeds = np.zeros(num_segments)
 
+        last_idx = len(track.segments) - 1
         for seg in track.segments:
             mid = seg.distance_start_m + seg.length_m / 2.0
             half_bin = seg.length_m / 2.0
 
-            mask = (lap_d >= mid - half_bin) & (lap_d < mid + half_bin)
+            # Final segment uses an inclusive upper bound so the very
+            # last telemetry sample (d == lap_length) isn't dropped into
+            # an empty window (previously fell back to the nearest-sample
+            # heuristic instead of being binned with its segment).
+            if seg.index == last_idx:
+                mask = (lap_d >= mid - half_bin) & (lap_d <= mid + half_bin)
+            else:
+                mask = (lap_d >= mid - half_bin) & (lap_d < mid + half_bin)
             if not np.any(mask):
                 nearest_idx = np.argmin(np.abs(lap_d - mid))
                 mask = np.zeros(len(lap_d), dtype=bool)
@@ -511,11 +519,17 @@ def _extract_single_pass(
     brake_norm = max(brake_norm, 1.0)
 
     rows = []
+    last_idx = len(track.segments) - 1
     for seg in track.segments:
         mid = seg.distance_start_m + seg.length_m / 2.0
         half_bin = seg.length_m / 2.0
 
-        mask = (telem_lap_dist >= mid - half_bin) & (telem_lap_dist < mid + half_bin)
+        # Inclusive upper bound on the final segment so the lap-end
+        # sample lands in its segment window.
+        if seg.index == last_idx:
+            mask = (telem_lap_dist >= mid - half_bin) & (telem_lap_dist <= mid + half_bin)
+        else:
+            mask = (telem_lap_dist >= mid - half_bin) & (telem_lap_dist < mid + half_bin)
         if not np.any(mask):
             nearest_idx = np.argmin(np.abs(telem_lap_dist - mid))
             mask = np.zeros(len(dist), dtype=bool)

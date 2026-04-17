@@ -406,8 +406,28 @@ class SimulationEngine:
                 else:
                     pack_current = 0.0
 
-                # BMS current limit is now enforced upstream via
-                # lvcu_torque_command — no after-the-fact clamp needed.
+                # BMS current limit is enforced upstream in
+                # lvcu_torque_command for non-replay paths.  Replay
+                # bypasses that (it uses measured V*I) — preserve the
+                # telemetry ground truth rather than double-clamping,
+                # but warn once if replay ever exceeds the sim's BMS
+                # ceiling so a calibration mismatch is visible.
+                if (
+                    is_replay
+                    and getattr(self.strategy, "has_electrical_power", False)
+                    and pack_current > bms_current_limit + 1.0
+                    and not getattr(self, "_replay_bms_warned", False)
+                ):
+                    import warnings as _w
+                    _w.warn(
+                        f"Replay pack_current={pack_current:.1f} A exceeds "
+                        f"sim BMS ceiling={bms_current_limit:.1f} A. Replay "
+                        "preserves telemetry ground truth; investigate if "
+                        "A/B calibrated-vs-replay comparisons diverge.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    self._replay_bms_warned = True
 
                 # 8. Step battery state
                 new_soc, new_temp, new_voltage = self.battery_model.step(

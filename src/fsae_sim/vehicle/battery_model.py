@@ -609,13 +609,20 @@ class BatteryModel:
         # Pack voltage at updated SOC
         v_pack = self.pack_voltage(new_soc, pack_current_a, time_s=time_s)
 
-        # Thermal model: lumped I^2*R heating, no active cooling (2025 car).
-        # S15: thermal mass includes structural components via config.
+        # Thermal model: lumped I^2*R heating plus passive cooling.
+        # S15: thermal mass includes structural components.
+        # Newton cooling h·A·(T − T_ambient) prevents unbounded drift
+        # during sustained discharge — without it the model has no
+        # equilibrium and every long sim crosses the BMS kill temp.
         r_cell = self.internal_resistance(new_soc)
         num_cells = self.config.series * self.config.parallel
-        total_heat_w = cell_current ** 2 * r_cell * num_cells
+        heat_in_w = cell_current ** 2 * r_cell * num_cells
+        heat_out_w = self.config.thermal_conductance_w_per_k * (
+            temp_c - self.config.ambient_temperature_c
+        )
+        net_heat_w = heat_in_w - heat_out_w
         thermal_mass = self.thermal_mass_j_per_k
-        dtemp = (total_heat_w * dt_s) / thermal_mass if thermal_mass > 0 else 0.0
+        dtemp = (net_heat_w * dt_s) / thermal_mass if thermal_mass > 0 else 0.0
         new_temp = temp_c + dtemp
 
         return new_soc, new_temp, v_pack

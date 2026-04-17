@@ -79,9 +79,16 @@ class VehicleDynamics:
         self.cornering_solver = cornering_solver
         self.cornering_stiffness_scale = float(cornering_stiffness_scale)
 
-        # Effective mass: bare mass + rotational inertia of spinning components
+        # Effective mass: bare mass + rotational inertia of spinning components.
+        # Use the loaded tire radius at static weight (roughly mg/4 per tire)
+        # rather than the unloaded radius — loaded radius is ~2-3% smaller
+        # and the rotational-inertia contribution scales as 1/r^2.
         if powertrain_config is not None:
-            tire_radius = 0.2042  # m, Hoosier 16x7.5-10 UNLOADED_RADIUS from .tir
+            if tire_model is not None:
+                static_load_per_tire = vehicle.mass_kg * GRAVITY_M_S2 / 4.0
+                tire_radius = tire_model.loaded_radius(static_load_per_tire)
+            else:
+                tire_radius = 0.2042  # Hoosier 16x7.5-10 UNLOADED_RADIUS fallback
             G = powertrain_config.gear_ratio
             eta = powertrain_config.drivetrain_efficiency
             j_eff = (

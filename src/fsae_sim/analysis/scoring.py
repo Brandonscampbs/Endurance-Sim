@@ -244,18 +244,27 @@ class FSAEScoring:
             # We need track distance to convert. If not provided, estimate
             # from laps and a reasonable per-lap distance.
             # NF-59: compute EFmin from CO2max = 20.02 kg/100km when track
-            # length is known. Per D.13.4.6:
+            # length is known.  Per D.13.4.6:
             #   EFmin = (Tmin_avg / Tmax_avg) * (CO2min_per_lap / CO2max_per_lap)
-            if track_km_per_lap is not None and track_km_per_lap > 0:
+            # Fallback #9: if track_km_per_lap isn't passed explicitly,
+            # estimate it from total_distance_km / laps_completed so
+            # EFmin is still computed rather than silently zeroed
+            # (efmin=0 inflated efficiency_score because the full 0..efmax
+            # range was available, making every car look good).
+            km_per_lap = track_km_per_lap
+            if (km_per_lap is None or km_per_lap <= 0) and total_distance_km is not None:
+                if laps_completed > 0:
+                    km_per_lap = total_distance_km / laps_completed
+            if km_per_lap is not None and km_per_lap > 0:
                 co2max_per_lap = (
-                    self.EV_CO2_MAX_PER_100KM / 100.0 * track_km_per_lap
+                    self.EV_CO2_MAX_PER_100KM / 100.0 * km_per_lap
                 )
                 efmin = (
                     efmin_time_ratio * (co2min_per_lap / co2max_per_lap)
                     if co2max_per_lap > 0 else 0.0
                 )
             else:
-                efmin = 0.0  # Conservative: makes full range available
+                efmin = 0.0
 
             if efmax > efmin:
                 efficiency_score = 100.0 * (efficiency_factor - efmin) / (efmax - efmin)

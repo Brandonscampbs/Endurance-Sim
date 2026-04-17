@@ -341,10 +341,14 @@ class PowertrainModel:
         if bse_latched:
             torque_request = 0.0
 
-        # 6. APPS mismatch diagnostic (not used to gate torque here —
-        # the caller decides what to do, but we expose the flag).
+        # 6. APPS mismatch — gate torque to zero per firmware.
+        # LVCU Code.txt trips torque when |tps1 − tps2| > APPS_TRIP_PERCENT.
+        # Previously this was "caller decides" and no caller acted, so the
+        # fault behaviour was silently missing from sim.
         if tps1 is not None and tps2 is not None:
             apps_mismatch = abs(tps1 - tps2) > self._APPS_TRIP_FRACTION
+            if apps_mismatch:
+                torque_request = 0.0
         else:
             apps_mismatch = False
 

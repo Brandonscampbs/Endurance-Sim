@@ -176,10 +176,15 @@ class SpeedEnvelope:
                 if abs(seg.curvature) < 1e-6:
                     continue  # only correct at corners
 
-                # Estimate longitudinal_g from speed change across this segment
+                # Estimate longitudinal_g from the speed change BETWEEN the
+                # previous segment's exit and this segment's exit.  dv^2
+                # accumulated across the PREVIOUS segment's length
+                # (v_fwd[i] came from forward-integrating over segments[i-1]),
+                # so divide by that segment's length, not the current one.
                 if i > 0:
                     dv_sq = v_fwd[i] ** 2 - v_fwd[i - 1] ** 2
-                    a_long = dv_sq / (2.0 * seg.length_m)
+                    prev_length = segments[i - 1].length_m
+                    a_long = dv_sq / (2.0 * prev_length) if prev_length > 0 else 0.0
                     long_g = a_long / 9.81
                 else:
                     long_g = 0.0
