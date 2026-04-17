@@ -355,10 +355,15 @@ class CalibratedStrategy(DriverStrategy):
         zones: list[DriverZone],
         num_segments: int,
         name: str = "calibrated",
+        params: "DriverParams | None" = None,
     ) -> None:
         self.name = name
         self._zones = list(zones)
         self._num_segments = num_segments
+        # D-28: shared DriverParams surface with PedalProfileStrategy.
+        # Defaults to an identity (all 1.0) so existing behavior is
+        # unchanged. Applied in ``decide`` to zone intensity.
+        self._params: DriverParams | None = params
 
         # D-02: per-segment intensity override has been removed entirely.
         # Zones are the unit of control: `decide()`, `to_driver_brief()`,
@@ -398,13 +403,24 @@ class CalibratedStrategy(DriverStrategy):
         if max_speed_ms > 0.0:
             meta = {"max_speed_ms": float(max_speed_ms)}
 
+        # D-28: apply optional DriverParams scale/cap.  Multiplier
+        # applies to intensity, cap clamps the post-multiplier value.
+        p = self._params
         if action == ControlAction.THROTTLE:
+            value = intensity
+            if p is not None:
+                value = min(value * p.throttle_scale, p.max_throttle)
+            value = max(0.0, min(1.0, value))
             return ControlCommand(
-                action, throttle_pct=intensity, brake_pct=0.0, metadata=meta,
+                action, throttle_pct=value, brake_pct=0.0, metadata=meta,
             )
         elif action == ControlAction.BRAKE:
+            value = intensity
+            if p is not None:
+                value = min(value * p.brake_scale, p.max_brake)
+            value = max(0.0, min(1.0, value))
             return ControlCommand(
-                action, throttle_pct=0.0, brake_pct=intensity, metadata=meta,
+                action, throttle_pct=0.0, brake_pct=value, metadata=meta,
             )
         else:
             return ControlCommand(
@@ -479,7 +495,24 @@ class CalibratedStrategy(DriverStrategy):
                 ))
             else:
                 new_zones.append(z)
-        return CalibratedStrategy(new_zones, self._num_segments, name=self.name)
+        return CalibratedStrategy(
+            new_zones, self._num_segments, name=self.name, params=self._params,
+        )
+
+    def with_params(self, params: "DriverParams") -> CalibratedStrategy:
+        """D-28: return a new strategy with ``DriverParams`` applied at decide.
+
+        Shares the underlying zone list — only the params attribute is
+        replaced.  Multiplier/cap semantics match ``PedalProfileStrategy``
+        so both strategies now expose a single sweep surface.
+        """
+        return CalibratedStrategy(
+            self._zones, self._num_segments, name=self.name, params=params,
+        )
+
+    @property
+    def params(self) -> "DriverParams | None":
+        return self._params
 
     @classmethod
     def from_telemetry(

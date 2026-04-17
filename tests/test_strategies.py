@@ -351,3 +351,42 @@ class TestEnvelopeAwareStrategies:
         assert strat_env.decide(state, upcoming).action == ControlAction.BRAKE
         # Raw strategy sees inf corner speed on straights ⇒ no brake.
         assert strat_raw.decide(state, upcoming).action != ControlAction.BRAKE
+
+
+class TestCalibratedStrategyWithParams:
+    """D-28: CalibratedStrategy.with_params applies DriverParams multipliers."""
+
+    def _zones(self):
+        from fsae_sim.analysis.telemetry_analysis import DriverZone
+        return [
+            DriverZone(
+                zone_id=0, segment_start=0, segment_end=9,
+                action=ControlAction.THROTTLE, intensity=0.8,
+                distance_start_m=0.0, distance_end_m=500.0, label="all",
+            ),
+        ]
+
+    def test_throttle_scale_halves_intensity(self):
+        from fsae_sim.driver.strategies import CalibratedStrategy, DriverParams
+        from fsae_sim.driver.strategy import SimState
+
+        baseline = CalibratedStrategy(self._zones(), num_segments=10)
+        scaled = baseline.with_params(DriverParams(throttle_scale=0.5))
+
+        state = SimState(0, 0.0, 10.0, 0.9, 400, 0, 25, 0, 3)
+        base_cmd = baseline.decide(state, [])
+        scaled_cmd = scaled.decide(state, [])
+
+        assert base_cmd.throttle_pct == pytest.approx(0.8)
+        assert scaled_cmd.throttle_pct == pytest.approx(0.4)
+
+    def test_max_throttle_caps_value(self):
+        from fsae_sim.driver.strategies import CalibratedStrategy, DriverParams
+        from fsae_sim.driver.strategy import SimState
+
+        baseline = CalibratedStrategy(self._zones(), num_segments=10)
+        capped = baseline.with_params(DriverParams(max_throttle=0.3))
+
+        state = SimState(0, 0.0, 10.0, 0.9, 400, 0, 25, 0, 3)
+        cmd = capped.decide(state, [])
+        assert cmd.throttle_pct == pytest.approx(0.3)
