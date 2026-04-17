@@ -14,8 +14,8 @@ export default function SimulatePage() {
       </div>
 
       <div className="bg-amber-900/20 border border-amber-700/40 rounded px-4 py-3 text-sm text-amber-200">
-        <strong>Stub page.</strong> The three-knob form is wired; backend run endpoint is not yet
-        implemented. See <code className="bg-amber-900/40 px-1 rounded">docs/WEBAPP_REFOCUS_PLAN_2026-04-16.md</code>.
+        <strong>Stub page.</strong> The three-knob form is wired; the backend run endpoint is not
+        yet implemented.
       </div>
 
       <section className="bg-gray-900 border border-gray-800 rounded-lg p-5 space-y-5">
