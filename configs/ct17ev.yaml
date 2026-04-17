@@ -20,6 +20,17 @@ powertrain:
   id_limit_a: 30.0
   gear_ratio: 3.6363  # 40/11 teeth
   drivetrain_efficiency: 0.92
+  # NF-31: LVCU power constant scaled for CT-17EV 100S pack.
+  # Firmware default (420.0) was calibrated for 110S (~410V nominal).
+  # With 100S pack (~370V nominal), torque-per-amp at the same ω scales
+  # with pack voltage → scale by 370/410 ≈ 0.9024.
+  lvcu_power_constant: 379.02   # 420.0 * (370/410)
+  lvcu_rpm_scale: 0.1076
+  lvcu_omega_floor: 23.04
+  lvcu_pedal_deadzone_low: 0.1
+  lvcu_pedal_deadzone_high: 0.9
+  lvcu_overspeed_rpm: 6000.0
+  lvcu_overspeed_torque_nm: 30.0
 
 battery:
   cell_type: "P50B"
