@@ -25,7 +25,7 @@ def load_aim_csv(path: str | Path) -> tuple[dict[str, str], pd.DataFrame]:
     path = Path(path)
     metadata: dict[str, str] = {}
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="latin-1") as f:
         lines = f.readlines()
 
     idx = 0
@@ -114,6 +114,11 @@ def load_cleaned_csv(path: str | Path) -> tuple[dict[str, str], pd.DataFrame]:
     path = Path(path)
     df = pd.read_csv(path, skiprows=[1], encoding="latin-1")
 
+    required_columns = ("Time", "LFspeed", "GPS Latitude", "GPS Longitude")
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"{path}: missing required column {col}")
+
     # Convert all columns to numeric
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -145,5 +150,14 @@ def load_voltt_csv(path: str | Path) -> pd.DataFrame:
         df: DataFrame with numeric columns.
     """
     path = Path(path)
-    df = pd.read_csv(path, comment="#")
+    df = pd.read_csv(path, comment="#", encoding="utf-8")
+
+    if len(df) == 0:
+        raise ValueError(f"{path}: file contains no data rows")
+
+    required_columns = ("SOC [%]", "OCV [V]", "Voltage [V]", "Current [A]")
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"{path}: missing required column {col}")
+
     return df
