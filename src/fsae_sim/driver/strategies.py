@@ -663,7 +663,17 @@ class PedalProfileStrategy(DriverStrategy):
         for start_idx, end_idx, _ in selected:
             lap_df = aim_df.iloc[start_idx:end_idx]
             lap_dist_raw = lap_df["Distance on GPS Speed"].values
-            lap_d = lap_dist_raw - lap_dist_raw[0]
+            # D-07: rescale each lap onto the track total distance so
+            # segment-midpoint lookups land at the correct physical
+            # location across all laps (see telemetry_analysis.py for
+            # rationale).
+            lap_span = float(lap_dist_raw[-1] - lap_dist_raw[0])
+            if lap_span > 0.0:
+                lap_d = (lap_dist_raw - lap_dist_raw[0]) * (
+                    track.total_distance_m / lap_span
+                )
+            else:
+                lap_d = lap_dist_raw - lap_dist_raw[0]
             lap_throttle_raw = lap_df["Throttle Pos"].values
             lap_speed = lap_df["GPS Speed"].values
             lap_brake = np.maximum(

@@ -218,6 +218,71 @@ class TestDetectLaps:
 
 
 # ---------------------------------------------------------------------------
+# D-07: per-lap distance rescale
+# ---------------------------------------------------------------------------
+
+
+class TestD07PerLapDistanceRescale:
+    """Per-lap arc-length is rescaled to track.total_distance_m so that
+    segment-midpoint lookups land at the right physical location across
+    all laps, even when the GPS arc-length drifts lap-to-lap."""
+
+    def _build_two_lap_df(self, track: Track, lap2_scale: float) -> pd.DataFrame:
+        """Build a 2-lap df where lap 1 spans the true track distance and
+        lap 2 spans `lap2_scale * track.total_distance_m` (simulating GPS
+        drift). Throttle is 80% on lap 1 segment 0 and 20% on all other
+        segments; lap 2 has the *same physical layout* (throttle 80% at
+        the front of the lap)."""
+        rows = []
+        total = track.total_distance_m
+        n_per_lap = 200
+        for lap_idx in range(2):
+            lap_span = total if lap_idx == 0 else total * lap2_scale
+            lap_offset = total if lap_idx == 1 else 0.0  # raw distance is cumulative
+            for i in range(n_per_lap):
+                frac = i / n_per_lap
+                dist_in_lap = frac * lap_span
+                phys_frac = frac  # physical position along the track
+                # Throttle high on first segment only, low elsewhere.
+                if phys_frac < 1.0 / track.num_segments:
+                    throttle = 80.0
+                else:
+                    throttle = 20.0
+                rows.append({
+                    "Distance on GPS Speed": lap_offset + dist_in_lap,
+                    "GPS Speed": 40.0,
+                    "Throttle Pos": throttle,
+                    "LVCU Torque Req": 0.6 * 85.0 if throttle > 50.0 else 0.1 * 85.0,
+                    "FBrakePressure": 0.0,
+                    "RBrakePressure": 0.0,
+                    "GPS Latitude": 42.0 + frac * 0.001,
+                    "GPS Longitude": -83.5,
+                    "GPS LatAcc": 0.0,
+                    "GPS Slope": 0.0,
+                })
+        return pd.DataFrame(rows)
+
+    def test_rescale_routes_samples_to_correct_segment(self):
+        """Without rescale, lap 2 with 0.8x arc-length leaves the last 20%
+        of segments empty for that lap. After rescale, segment 0 still
+        gets 80% throttle samples from both laps."""
+        track = make_track(n_segments=5, length_m=100.0)  # 500m total
+        df = self._build_two_lap_df(track, lap2_scale=0.8)
+
+        result = extract_per_segment_actions(df, track)
+        # Segment 0 is the high-throttle segment across both laps.
+        seg0 = result.iloc[0]
+        assert seg0["action"] == ControlAction.THROTTLE, (
+            f"segment 0 should be THROTTLE, got {seg0['action']!r}"
+        )
+        # And the far segment (4) should be low-throttle, routed there
+        # by the rescale.
+        seg_last = result.iloc[-1]
+        assert seg_last["action"] != ControlAction.THROTTLE or \
+            seg_last["intensity"] < 0.3
+
+
+# ---------------------------------------------------------------------------
 # DriverZone dataclass
 # ---------------------------------------------------------------------------
 

@@ -256,7 +256,20 @@ def _extract_per_lap_then_aggregate(
     for start_idx, end_idx, _ in selected:
         lap_df = aim_df.iloc[start_idx:end_idx]
         lap_dist_raw = lap_df["Distance on GPS Speed"].values
-        lap_d = lap_dist_raw - lap_dist_raw[0]
+        # D-07: rescale each lap's arc-length onto the track total distance.
+        # The AiM "Distance on GPS Speed" channel accumulates with some
+        # drift across laps (GPS noise, slight route variation). A raw
+        # offset `lap_dist_raw - lap_dist_raw[0]` leaves each lap with a
+        # different terminal distance, so per-segment midpoint lookups land
+        # at physically wrong locations on later laps — medians wrap around
+        # and wash out the turn-1/turn-N contrast.
+        lap_span = float(lap_dist_raw[-1] - lap_dist_raw[0])
+        if lap_span > 0.0:
+            lap_d = (lap_dist_raw - lap_dist_raw[0]) * (
+                track.total_distance_m / lap_span
+            )
+        else:
+            lap_d = lap_dist_raw - lap_dist_raw[0]
         lap_throttle = lap_df["Throttle Pos"].values
         lap_speed = lap_df["GPS Speed"].values
         lap_fbr = lap_df["FBrakePressure"].values
