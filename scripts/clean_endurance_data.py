@@ -48,7 +48,7 @@ STINT2_END = 1845.0    # Last S/F crossing (predicted from GPS crossing interval
 
 def load_raw_data(path: Path) -> tuple[list[str], str, str, pd.DataFrame]:
     """Load the raw AiM CSV, returning metadata lines, header row, units row, and data."""
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="latin-1") as f:
         all_lines = f.readlines()
 
     metadata_lines = all_lines[:14]
@@ -74,9 +74,11 @@ def load_raw_data(path: Path) -> tuple[list[str], str, str, pd.DataFrame]:
         io.StringIO(data_text),
         header=None,
         names=columns,
-        dtype=float,
         na_values=[""],
     )
+    # Coerce numerics where possible; leave non-numeric strings (e.g. flags) intact
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="ignore")
 
     return metadata_lines, header_line, units_line, df
 
