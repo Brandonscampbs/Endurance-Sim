@@ -24,11 +24,11 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 - **LVCU Code.txt**: LVCU firmware source — the torque command chain (`PowertrainModel.lvcu_torque_command()` and related methods) is a faithful translation of this file. Source of truth for `lvcu_power_constant`, `lvcu_rpm_scale`, `lvcu_omega_floor`, and pedal deadzone parameters in `PowertrainConfig`.
 - **emrax228_hv_cc_motor_map_long.csv**: EMRAX 228 motor efficiency map (speed_rpm, torque_Nm, efficiency_pct). Loaded by `MotorEfficiencyMap` for 2D operating-point-dependent motor+inverter efficiency. Falls back to constant `drivetrain_efficiency` if missing.
 - **Tire Models from TTC/**: PAC02 .tir files for Hoosier LC0 16x7.5-10 at multiple pressures (Round 8 TTC data). Primary: `Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir`. Longitudinal (Fx) coefficients transplanted from R25B donor data via `scripts/transplant_fx_coefficients.py`.
-- **CleanedEndurance.csv**: Cleaned AiM telemetry produced by `scripts/clean_endurance_data.py` (removes pre-start, driver change, post-finish). Uses `LFspeed` column (left-front wheel speed) instead of GPS Speed. Latin-1 encoding.
+- **CleanedEndurance.csv**: Cleaned AiM telemetry produced by `scripts/clean_endurance_data.py` (removes pre-start, driver change, post-finish). Uses `LFspeed` column (left-front wheel speed) instead of GPS Speed. UTF-8 encoding (source AiM CSV is Latin-1; the cleaning script transcodes).
 
 ### Known Issues (MUST READ)
 
-**`docs/SIMULATOR_ISSUES.md`** is the authoritative tracker for all known physics bugs, approximations, and code issues (consolidated 2026-04-16 from former REMAINING_ISSUES / SIMULATOR_AUDIT / DRIVER_MODEL_ISSUES docs). **Read this before trusting simulation results or starting new physics work.**
+**`docs/SIMULATOR_ISSUES.md`** is the concise tracker for open physics gaps and code issues. **Read it before trusting simulation results or starting new physics work.**
 
 ### Key Vehicle Parameters (from DSS + Endurance Tune)
 | Parameter | Value | Source |
@@ -43,7 +43,7 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 | Motor peak / continuous | 230 Nm / 112 Nm | DSS (but inverter limits to 85 Nm) |
 | Inverter | Cascadia CM200DX | DSS |
 | Inverter torque limit | 85 Nm (IQ=170A setting) | Endurance Tune |
-| LVCU torque limit | 150 Nm | Endurance Tune |
+| LVCU torque limit | 220 Nm (firmware); 150 Nm was Michigan 2025 op cap | config / Endurance Tune |
 | Motor speed / brake speed | 2900 / 2400 RPM | Endurance Tune |
 | Pack | 110S4P Molicel P45B (5 segments x 22S x 4P) | DSS |
 | Pack energy | 7.128 kWh nominal | DSS |
@@ -53,28 +53,20 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 | Tires | Hoosier 16x7.5-10 LC0 (10" wheel) | DSS |
 | CG height | 279.4 mm | DSS |
 
-## Project Roadmap
+## Project State
 
-See `docs/WEBAPP_REFOCUS_PLAN_2026-04-16.md` for the full plan.
-
-1. **Baseline simulation + validation** (DONE) -- quasi-static lap sim with 4-wheel Pacejka tire model, validated against Michigan 2025 telemetry (~2% energy error, 8/8 metrics pass).
-2. **Verification page correctness + physics fixes** (IN PROGRESS) -- fix the per-lap metrics regression, swap GPS Speed → LFspeed, add per-channel residuals + RMS/R²/correlation, add energy budget reconciliation, expand channel coverage to RPM/torque/pack V&I/temp. Also close remaining open physics/code issues tracked in `docs/SIMULATOR_ISSUES.md`.
-3. **Visualization page physics + polish** (NEXT) -- fix force-arrow frame math (body vs world), Euler order for roll/pitch/yaw, orbit camera target binding, backend Fy sign-by-curvature. Add trajectory trail, scrubbable time-series strip, friction-circle per wheel, sector/lap markers on timeline.
-4. **Simulate page** (AFTER VISUALIZATION) -- backend endpoint accepting `{max_rpm, max_torque_nm, soc_discharge_map}`, runs one sim with those overrides against the baseline, returns summary + per-lap table + time series. Frontend: three-knob form, baseline-comparison delta cards, overlay chart.
-5. **Retire Dash dashboard + unify Docker** -- webapp/ + FastAPI as a single Docker image; delete `dashboard/`; update README.
-
-Deliberately **not** in this repo's roadmap: parameter sweeps, Pareto, multi-run comparison, coaching output. Those go to a separate repo.
+Baseline sim is validated against Michigan 2025 telemetry (~2% energy error, 8/8 metrics pass). Webapp shell has all three pages; Verification and Visualization are functional; Simulate is a stub pending a backend run endpoint. Current work: close remaining physics gaps (see `docs/SIMULATOR_ISSUES.md`) and implement the Simulate page.
 
 ## Architecture Guidance
 
 - **No bandaid fixes — root cause only**: Never apply superficial patches, fudge factors, or tuning hacks to make results match. Every fix must address the actual root cause. This is especially critical in simulation work: if the sim output is wrong, the physics model or inputs are wrong — find out why. Adding correction factors or clamping outputs to hide errors destroys the simulation's predictive value and makes every downstream result untrustworthy. A simulation that's honestly wrong is more useful than one that's been patched to look right.
 - **Modular by domain**: separate modules for battery model, drivetrain model, tire/vehicle dynamics, track representation, driver model, and lap simulation orchestration. Each module should be independently testable.
 - **Simulation correctness first**: validate every model against real data before adding complexity. Numerical accuracy matters more than abstraction elegance.
-- **Performance-aware**: sims should complete in seconds, not minutes, so the Simulate page feels interactive. Use NumPy/SciPy vectorized operations. Profile before optimizing. Leave room for a future sweep repo to reuse this core, so don't build structures that prevent vectorization later.
+- **Performance-aware**: sims should complete in seconds, not minutes, so the Simulate page feels interactive. Use NumPy/SciPy vectorized operations. Profile before optimizing. Prefer data structures that don't prevent future vectorization.
 - **Data pipelines are first-class**: loading, cleaning, and transforming telemetry and simulation CSVs should be reliable and repeatable. Use pandas for tabular data.
 - **Docker for reproducibility**: local dev environment should be containerized. Pin Python version and all dependencies.
 - **Testing**: use pytest. Validate models against known analytical solutions and recorded data. Property-based tests (hypothesis) for numerical edge cases.
-- **Web/visualization**: FastAPI backend if needed for dashboards or parameter sweep UIs. Matplotlib/Plotly for analysis plots.
+- **Web/visualization**: FastAPI backend for webapp endpoints. Matplotlib/Plotly for analysis plots.
 
 ## Installed VoltAgent Subagent Packages
 
@@ -88,26 +80,29 @@ Marketplace: `VoltAgent/awesome-claude-code-subagents`
 
 ## Subagents and When to Use Them
 
-**Always use `model: "opus"` when deploying agents.** All Agent tool calls must specify the Opus 4.6 model to ensure maximum capability and reasoning quality.
+**Always use `model: "opus"` when deploying agents.** All Agent tool calls must specify the Opus 4.6 model to ensure maximum capability and reasoning quality. This applies to implementer, spec reviewer, and code-quality reviewer subagents alike — do not downgrade to Haiku or Sonnet for mechanical tasks.
 
-### Core workflow (use frequently)
-- **`python-pro`** -- Default for all Python implementation. Use for module design, NumPy/SciPy patterns, packaging, type hints, and Pythonic idioms.
-- **`architect-reviewer`** -- Use when adding a new module, changing interfaces between modules, or before any structural refactor. Ask it to review proposed module boundaries and data flow.
-- **`code-reviewer`** -- Use after completing any feature branch or before merging. Focus on correctness, not style.
+Subagent types are namespaced by the installed plugin. Use the fully-qualified name in `subagent_type` (e.g. `voltagent-lang:python-pro`, not bare `python-pro`).
+
+### Implementation
+- **`voltagent-lang:python-pro`** — Default for all Python implementation. Module design, NumPy/SciPy patterns, packaging, type hints, Pythonic idioms.
+- **`voltagent-lang:fastapi-developer`** — Backend webapp endpoints (e.g., the Simulate-page run endpoint).
 
 ### Simulation and data work
-- **`data-scientist`** -- Use for model validation, statistical comparison of simulation vs. telemetry, regression analysis, and designing parameter sweep experiments.
-- **`data-analyst`** -- Use for exploratory analysis of telemetry CSVs, generating comparison plots, and summarizing results across simulation runs.
-- **`performance-engineer`** -- Use when simulation runtime matters: profiling hot loops, vectorization, memory layout, and parallelization of parameter sweeps.
+- **`voltagent-data-ai:data-scientist`** — Model validation, statistical comparison of simulation vs. telemetry, regression analysis.
+- **`voltagent-data-ai:data-analyst`** — Exploratory analysis of telemetry CSVs, comparison plots.
+- **`voltagent-data-ai:data-engineer`** — ETL for telemetry / battery-sim CSVs, pandas pipeline hygiene.
+- **`voltagent-data-ai:ml-engineer`** / **`voltagent-data-ai:machine-learning-engineer`** — Available if the driver-model work goes neural.
 
-### Quality and correctness
-- **`test-automator`** -- Use when setting up pytest infrastructure, fixtures for simulation data, or parameterized test suites for model validation.
-- **`qa-expert`** -- Use for test strategy decisions: what to test, coverage targets, and integration test design for multi-module simulations.
-- **`debugger`** -- Use when a simulation produces wrong results and you need to trace through numerical computations or state evolution.
+### Infrastructure
+- **`voltagent-infra:docker-expert`** — Container build/compose changes.
+- **`voltagent-infra:devops-engineer`** — CI/CD pipelines, reproducible environments.
+- **`voltagent-infra:sre-engineer`** — Reliability/observability for the webapp.
 
-### Infrastructure and API
-- **`fastapi-developer`** -- Use if/when building a web API for parameter sweep control, results dashboards, or simulation job management.
-- **Docker/infra agents (from voltagent-infra)** -- Use when setting up the dev container, CI pipeline, or reproducible simulation environments.
+### Review
+- **`superpowers:code-reviewer`** — Use after completing any feature branch or before merging. Focus on correctness, not style.
+
+If a subagent you want is missing (e.g., `architect-reviewer`, `performance-engineer`, `test-automator`, `qa-expert`, `debugger`), the matching VoltAgent package may not be installed — check the marketplace before relying on it in a workflow.
 
 ## Development Methodology
 
