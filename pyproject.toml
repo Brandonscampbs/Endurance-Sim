@@ -29,3 +29,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "oracle: requires fastest-lap DLL oracle (set FASTEST_LAP_ROOT or place at C:/Users/brand/AppData/Local/Temp/fl-w10/v0.5)",
+    "validation: long-running validation tests against telemetry",
+]
