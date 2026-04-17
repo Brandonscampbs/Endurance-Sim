@@ -51,8 +51,8 @@ def vehicle_config(ct16ev_config_path):
 @pytest.fixture
 def battery_model(vehicle_config, voltt_cell_path):
     df = load_voltt_csv(voltt_cell_path)
-    model = BatteryModel(vehicle_config.battery, cell_capacity_ah=4.5)
-    model.calibrate(df)
+    model = BatteryModel(vehicle_config.battery)
+    model.calibrate_from_voltt(df)
     return model
 
 
