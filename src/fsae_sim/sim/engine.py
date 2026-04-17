@@ -81,6 +81,17 @@ class SimulationEngine:
         self.strategy = strategy
         self.battery_model = battery_model
 
+        # Termination temperature comes from the config's discharge_limits:
+        # the hottest point where max_current_a == 0 (battery can no longer
+        # deliver power).  Avoids the earlier hardcoded 65 C.
+        zero_current_temps = [
+            dl.temp_c for dl in vehicle.battery.discharge_limits
+            if dl.max_current_a == 0.0
+        ]
+        self._termination_temp_c = (
+            max(zero_current_temps) if zero_current_temps else 65.0
+        )
+
         # Load motor efficiency map if available.
         # NF-3: resolve path relative to the package, not the caller's CWD,
         # so sims run from any directory (tests, webapp, notebooks).
@@ -366,7 +377,7 @@ class SimulationEngine:
                         records, time, total_energy_j, soc, laps_completed,
                         discharge_energy_j, regen_energy_j,
                     )
-                if temp >= 65.0:
+                if temp >= self._termination_temp_c:
                     return self._build_result(
                         records, time, total_energy_j, soc, laps_completed,
                         discharge_energy_j, regen_energy_j,
@@ -396,7 +407,7 @@ class SimulationEngine:
             track_name=self.track.name,
             states=states,
             total_time_s=total_time,
-            total_energy_kwh=total_energy_j / 3.6e6,
+            total_energy_kwh=(discharge_energy_j - regen_energy_j) / 3.6e6,
             final_soc=final_soc,
             laps_completed=laps_completed,
             discharge_energy_kwh=discharge_energy_j / 3.6e6,

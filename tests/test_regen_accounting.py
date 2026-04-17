@@ -73,9 +73,9 @@ class TestSimResultRegenFields:
 
     def test_simresult_has_discharge_regen_net_fields(self):
         fields = {f.name for f in SimResult.__dataclass_fields__.values()}
-        assert "total_discharge_kwh" in fields
-        assert "total_regen_kwh" in fields
-        assert "total_net_kwh" in fields
+        assert "discharge_energy_kwh" in fields
+        assert "regen_energy_kwh" in fields
+        assert "net_energy_kwh" in fields
 
     def test_net_equals_discharge_minus_regen(self, vehicle_config, battery):
         track = _make_simple_track()
@@ -84,8 +84,8 @@ class TestSimResultRegenFields:
         )
         result = engine.run(num_laps=2, initial_soc_pct=95.0, initial_temp_c=25.0)
         # The fundamental identity must hold exactly.
-        assert result.total_net_kwh == pytest.approx(
-            result.total_discharge_kwh - result.total_regen_kwh, abs=1e-9,
+        assert result.net_energy_kwh == pytest.approx(
+            result.discharge_energy_kwh - result.regen_energy_kwh, abs=1e-9,
         )
 
     def test_total_energy_kwh_reports_net(self, vehicle_config, battery):
@@ -95,7 +95,7 @@ class TestSimResultRegenFields:
         )
         result = engine.run(num_laps=2, initial_soc_pct=95.0, initial_temp_c=25.0)
         # Default total_energy_kwh is net.
-        assert result.total_energy_kwh == pytest.approx(result.total_net_kwh, abs=1e-9)
+        assert result.total_energy_kwh == pytest.approx(result.net_energy_kwh, abs=1e-9)
 
     def test_regen_is_strictly_positive_when_coasting(self, vehicle_config, battery):
         track = _make_simple_track()
@@ -103,13 +103,13 @@ class TestSimResultRegenFields:
             vehicle_config, track, MixedThrottleCoastStrategy(), battery,
         )
         result = engine.run(num_laps=2, initial_soc_pct=95.0, initial_temp_c=25.0)
-        assert result.total_regen_kwh > 0.0, (
+        assert result.regen_energy_kwh > 0.0, (
             "Alternating throttle/regen-brake must produce some regen"
         )
         # Gross is larger than net (i.e., regen is actually being tracked,
         # not silently zeroed).
-        assert (result.total_discharge_kwh + result.total_regen_kwh
-                > result.total_discharge_kwh)
+        assert (result.discharge_energy_kwh + result.regen_energy_kwh
+                > result.discharge_energy_kwh)
 
 
 class TestValidationRegenAccounting:

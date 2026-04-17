@@ -170,28 +170,33 @@ class PacejkaTireModel:
                 f"[{sec}] {key}={val!r}" for sec, key, val in skipped[:10]
             )
             warnings.warn(
-                f"PacejkaTireModel: {len(skipped)} non-numeric coefficient "
-                f"value(s) skipped while parsing {self.tir_path.name}: "
+                f"PacejkaTireModel: Skipped coefficients "
+                f"({len(skipped)} non-numeric value(s)) while parsing "
+                f"{self.tir_path.name}: "
                 f"{details}{' ...' if len(skipped) > 10 else ''}",
                 UserWarning,
                 stacklevel=2,
             )
 
-        # NF-4: assert required scalar parameters are positive.  A missing
-        # or zero value here would produce silent divide-by-zero or a
-        # zero-radius tire in downstream physics; fail loud instead.
-        assert self.fnomin > 0.0, (
-            f"PacejkaTireModel({self.tir_path.name}): "
-            f"FNOMIN must be > 0, got {self.fnomin}"
-        )
-        assert self.unloaded_radius > 0.0, (
-            f"PacejkaTireModel({self.tir_path.name}): "
-            f"UNLOADED_RADIUS must be > 0, got {self.unloaded_radius}"
-        )
-        assert self.vertical_stiffness > 0.0, (
-            f"PacejkaTireModel({self.tir_path.name}): "
-            f"VERTICAL_STIFFNESS must be > 0, got {self.vertical_stiffness}"
-        )
+        # NF-4: required scalar parameters must be positive.  A missing or
+        # zero value here would produce silent divide-by-zero or a
+        # zero-radius tire in downstream physics; fail loud with ValueError
+        # instead of AssertionError so callers can catch it explicitly.
+        if self.fnomin <= 0.0:
+            raise ValueError(
+                f"PacejkaTireModel({self.tir_path.name}): "
+                f"FNOMIN must be > 0, got {self.fnomin}"
+            )
+        if self.unloaded_radius <= 0.0:
+            raise ValueError(
+                f"PacejkaTireModel({self.tir_path.name}): "
+                f"UNLOADED_RADIUS must be > 0, got {self.unloaded_radius}"
+            )
+        if self.vertical_stiffness <= 0.0:
+            raise ValueError(
+                f"PacejkaTireModel({self.tir_path.name}): "
+                f"VERTICAL_STIFFNESS must be > 0, got {self.vertical_stiffness}"
+            )
 
     # ------------------------------------------------------------------
     # Helper: coefficient lookup with default

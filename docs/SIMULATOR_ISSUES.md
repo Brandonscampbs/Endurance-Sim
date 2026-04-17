@@ -248,6 +248,13 @@ remain OPEN with no further triage. Representative items:
 
 ---
 
+## Xfailed (deferred, not in current scope)
+
+- **Engine envelope enforcement** (`tests/test_engine_envelope.py::test_synthetic_strategy_uses_envelope`) — Engine exceeds envelope speed limit by ~1 m/s at the tightest corner. Pre-existing bug; present at both Agent 1's 788e89b state and current HEAD. Related to D-20 (driver strategies ignoring envelope) but needs an engine-side fix as well. Marked xfail during the 2026-04-16 reconciliation.
+- **Tire closed-form longitudinal peak regression** (`tests/test_tire_model.py::test_closed_form_peak_longitudinal_matches_optimizer`) — R2 Agent 3's closed-form Fx diverges from the optimizer baseline by 14–90 % at `Fz >= 1500 N`. Out of driver-model scope. Needs a tire-model audit to reconcile the closed-form derivation with the optimizer-fit baseline.
+
+---
+
 ## REFUTED
 
 - **#21** `_REGEN_EFFICIENCY_FACTOR` undefined — verified defined as class constant after D-17. [commit trail in f2804ea]

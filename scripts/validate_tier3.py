@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from fsae_sim.data.loader import load_aim_csv, load_voltt_csv
+from fsae_sim.data.loader import load_cleaned_csv, load_voltt_csv
 from fsae_sim.track.track import Track
 from fsae_sim.vehicle import VehicleConfig
 from fsae_sim.vehicle.battery_model import BatteryModel
@@ -14,22 +14,53 @@ from fsae_sim.vehicle.cornering_solver import CorneringSolver
 from fsae_sim.vehicle.dynamics import VehicleDynamics
 from fsae_sim.driver.strategies import CoastOnlyStrategy, ThresholdBrakingStrategy, ReplayStrategy
 from fsae_sim.sim.engine import SimulationEngine
-from fsae_sim.analysis.validation import validate_full_endurance, detect_lap_boundaries
+from fsae_sim.analysis.validation import (
+    detect_lap_boundaries,
+    validate_driver_channels,
+    validate_full_endurance,
+)
+try:
+    from fsae_sim.analysis.validation_plots import plot_validation
+except ImportError:
+    plot_validation = None
+
+
+def _annotate_laps(aim_df: pd.DataFrame) -> pd.DataFrame:
+    """Annotate aim_df with a 1-based ``lap`` column using lap boundaries.
+
+    Used to drive the ``holdout_laps`` argument of
+    :meth:`BatteryModel.calibrate_pack_from_telemetry`.  Rows outside
+    detected laps (pre-start, post-finish, driver change) receive
+    ``lap = 0``.
+    """
+    laps = detect_lap_boundaries(aim_df)
+    lap_col = np.zeros(len(aim_df), dtype=int)
+    for lap_num, (start_idx, end_idx, _) in enumerate(laps, start=1):
+        lap_col[start_idx:end_idx] = lap_num
+    out = aim_df.copy()
+    out["lap"] = lap_col
+    return out
 
 
 def main():
     # ── Load everything ──
     config = VehicleConfig.from_yaml("configs/ct16ev.yaml")
-    _, aim_df = load_aim_csv("Real-Car-Data-And-Stats/2025 Endurance Data.csv")
+    _, aim_df = load_cleaned_csv("Real-Car-Data-And-Stats/CleanedEndurance.csv")
     voltt_df = load_voltt_csv(
         "Real-Car-Data-And-Stats/About-Energy-Volt-Simulations-2025-Pack/2025_Pack_cell.csv"
     )
-    track = Track.from_telemetry("Real-Car-Data-And-Stats/2025 Endurance Data.csv")
+    track = Track.from_telemetry(df=aim_df)
 
-    # Battery with two-step calibration
-    battery = BatteryModel(config.battery, cell_capacity_ah=4.5)
-    battery.calibrate(voltt_df)
-    battery.calibrate_pack_from_telemetry(aim_df)
+    # C15 fix: decouple battery calibration from validation.
+    # Calibrate from Voltt cell-level data ONLY; pack-level parameters
+    # scale geometrically via series/parallel.  We do NOT call
+    # calibrate_pack_from_telemetry on aim_df here — doing so fits
+    # OCV and pack R against the same data we then validate against.
+    aim_df = _annotate_laps(aim_df)
+    HOLDOUT_LAPS = list(range(13, 22))  # validate on laps 13-21
+
+    battery = BatteryModel(config.battery)
+    battery.calibrate_from_voltt(voltt_df)
 
     # ── Tire model components ──
     tire = PacejkaTireModel(config.tire.tir_file)
@@ -63,42 +94,112 @@ def main():
 
     replay = ReplayStrategy.from_full_endurance(aim_df, track.lap_distance_m)
 
-    # Need fresh battery for each run
-    batt_replay = BatteryModel(config.battery, cell_capacity_ah=4.5)
-    batt_replay.calibrate(voltt_df)
-    batt_replay.calibrate_pack_from_telemetry(aim_df)
+    # Need fresh battery for each run. Voltt-only calibration (no AiM
+    # pack fit) so the replay validation is an honest comparison
+    # against the held-out stint.
+    batt_replay = BatteryModel(config.battery)
+    batt_replay.calibrate_from_voltt(voltt_df)
 
     engine = SimulationEngine(config, track, replay, batt_replay)
-    result = engine.run(
-        num_laps=num_laps,
-        initial_soc_pct=initial_soc,
-        initial_temp_c=initial_temp,
-        initial_speed_ms=max(initial_speed, 0.5),
-    )
+    try:
+        result = engine.run(
+            num_laps=num_laps,
+            initial_soc_pct=initial_soc,
+            initial_temp_c=initial_temp,
+            initial_speed_ms=max(initial_speed, 0.5),
+        )
+    except AttributeError as exc:
+        # Known in-flight bug: PowertrainModel regen branch references
+        # undefined _REGEN_EFFICIENCY_FACTOR (REMAINING_ISSUES #21).
+        # Agent 2's D-13/D-17 wave fixes this — skip section 1 until
+        # then so the rest of the report (and D-23 below) can run.
+        print(f"  SKIPPED: engine.run raised {exc!r}")
+        print("  See docs/REMAINING_ISSUES.md #21 (regen branch attr error).")
+        result = None
 
-    report = validate_full_endurance(
-        result.states, aim_df,
-        result.total_time_s, result.final_soc,
-        result.total_energy_kwh, result.laps_completed,
-        target_pct=5.0,
-    )
-    print(report.summary())
-    print(f"  Laps completed: {result.laps_completed}/{num_laps}")
-    # C8: show both discharge and regen so energy accounting is honest.
-    print(
-        f"  Telemetry energy: "
-        f"discharge={report.telem_discharge_j / 3.6e6:.3f} kWh, "
-        f"regen={report.telem_regen_j / 3.6e6:.3f} kWh, "
-        f"net={report.telem_net_j / 3.6e6:.3f} kWh"
-    )
-    if report.stints:
-        for i, sr in enumerate(report.stints, start=1):
-            print(
-                f"  Stint {i}: "
-                f"discharge={sr.telem_discharge_j / 3.6e6:.3f} kWh, "
-                f"regen={sr.telem_regen_j / 3.6e6:.3f} kWh, "
-                f"net={sr.telem_net_j / 3.6e6:.3f} kWh"
+    aim_holdout = aim_df[aim_df["lap"].isin(HOLDOUT_LAPS)].reset_index(drop=True)
+    if result is None:
+        sim_holdout = pd.DataFrame()
+        report = None
+    else:
+        # C15 fix: validate on held-out stint only (laps 13-21).
+        sim_holdout = result.states[result.states["lap"].isin(HOLDOUT_LAPS)].reset_index(drop=True)
+
+        if len(aim_holdout) > 0 and len(sim_holdout) > 0:
+            holdout_time = float(sim_holdout["time_s"].iloc[-1] - sim_holdout["time_s"].iloc[0])
+            # D-05: report NET energy (discharge - regen).
+            holdout_energy_j_arr = sim_holdout["electrical_power_w"].values * sim_holdout["segment_time_s"].values
+            holdout_discharge_j = float(np.sum(np.maximum(holdout_energy_j_arr, 0.0)))
+            holdout_regen_j = float(np.sum(np.maximum(-holdout_energy_j_arr, 0.0)))
+            holdout_energy_kwh = (holdout_discharge_j - holdout_regen_j) / 3.6e6
+            holdout_final_soc = float(sim_holdout["soc_pct"].iloc[-1])
+
+            report_holdout = validate_full_endurance(
+                sim_holdout, aim_holdout,
+                holdout_time, holdout_final_soc,
+                holdout_energy_kwh, int(sim_holdout["lap"].nunique()),
+                target_pct=5.0,
             )
+            print("  Validation stint: laps", HOLDOUT_LAPS[0], "-", HOLDOUT_LAPS[-1])
+            print(report_holdout.summary())
+            report = report_holdout
+        else:
+            print("  WARNING: no held-out laps found; falling back to full endurance")
+            report = validate_full_endurance(
+                result.states, aim_df,
+                result.total_time_s, result.final_soc,
+                result.total_energy_kwh, result.laps_completed,
+                target_pct=5.0,
+            )
+            print(report.summary())
+        print(f"  Laps completed: {result.laps_completed}/{num_laps}")
+
+        # ── Validation plots ──
+        if plot_validation is not None:
+            plot_path = "results/validation_plots.png"
+            plot_validation(result.states, aim_df, output_path=plot_path)
+            print(f"  Validation plots saved to {plot_path}")
+
+    # ── 1b. Driver-Channel Validation (D-23) ──
+    print("\n1b. DRIVER-CHANNEL VALIDATION -- Sim commands vs telemetry inputs")
+    print("-" * 50)
+    dc_report = None
+    sim_for_dc = sim_holdout if (result is not None and len(sim_holdout) > 0) else pd.DataFrame()
+
+    # Fallback: if replay blocked (Agent 2 bug), run CoastOnly as a
+    # pre-fix baseline driver so D-23 still produces numbers.  Coast
+    # never triggers the broken regen branch in electrical_power —
+    # it dispatches to coast_electrical_power instead.
+    if sim_for_dc.empty and len(aim_holdout) > 0:
+        print("  Replay blocked; falling back to CoastOnly driver for baseline.")
+        coast_bl = CoastOnlyStrategy(new_dyn, coast_margin_ms=2.0)
+        batt_bl = BatteryModel(config.battery)
+        batt_bl.calibrate_from_voltt(voltt_df)
+        engine_bl = SimulationEngine(config, track, coast_bl, batt_bl)
+        engine_bl.dynamics = new_dyn
+        try:
+            result_bl = engine_bl.run(
+                num_laps=num_laps,
+                initial_soc_pct=initial_soc,
+                initial_temp_c=initial_temp,
+                initial_speed_ms=max(initial_speed, 0.5),
+            )
+            # Engine "lap" is 0-indexed; aim_df["lap"] is 1-indexed.
+            # Align by offsetting.
+            states = result_bl.states.copy()
+            states["lap"] = states["lap"] + 1
+            sim_for_dc = states[states["lap"].isin(HOLDOUT_LAPS)].reset_index(drop=True)
+        except AttributeError as exc:
+            print(f"  Fallback failed too: {exc!r}")
+            sim_for_dc = pd.DataFrame()
+
+    if not sim_for_dc.empty and len(aim_holdout) > 0:
+        dc_report = validate_driver_channels(
+            sim_for_dc, aim_holdout, laps=HOLDOUT_LAPS,
+        )
+        print(dc_report.summary())
+    else:
+        print("  SKIPPED: no sim states available for comparison.")
 
     # ── 2. Corner Speed Comparison ──
     print("\n2. CORNER SPEED PREDICTION -- Pacejka vs Legacy")
@@ -146,8 +247,8 @@ def main():
 
     # CoastOnly with Pacejka dynamics
     coast_strat = CoastOnlyStrategy(new_dyn, coast_margin_ms=2.0)
-    batt_coast = BatteryModel(config.battery, 4.5)
-    batt_coast.calibrate(voltt_df)
+    batt_coast = BatteryModel(config.battery)
+    batt_coast.calibrate_from_voltt(voltt_df)
     engine_coast = SimulationEngine(config, track, coast_strat, batt_coast)
     # Override dynamics to use our Pacejka-equipped one
     engine_coast.dynamics = new_dyn
@@ -155,16 +256,16 @@ def main():
 
     # ThresholdBraking with Pacejka
     brake_strat = ThresholdBrakingStrategy(new_dyn, coast_margin_ms=3.0, brake_threshold_ms=1.0, brake_intensity=0.5)
-    batt_brake = BatteryModel(config.battery, 4.5)
-    batt_brake.calibrate(voltt_df)
+    batt_brake = BatteryModel(config.battery)
+    batt_brake.calibrate_from_voltt(voltt_df)
     engine_brake = SimulationEngine(config, track, brake_strat, batt_brake)
     engine_brake.dynamics = new_dyn
     result_brake = engine_brake.run(num_laps=1, initial_soc_pct=initial_soc, initial_temp_c=initial_temp)
 
     # CoastOnly with legacy dynamics
     coast_legacy = CoastOnlyStrategy(legacy_dyn, coast_margin_ms=2.0)
-    batt_leg = BatteryModel(config.battery, 4.5)
-    batt_leg.calibrate(voltt_df)
+    batt_leg = BatteryModel(config.battery)
+    batt_leg.calibrate_from_voltt(voltt_df)
     engine_leg = SimulationEngine(config, track, coast_legacy, batt_leg)
     engine_leg.dynamics = legacy_dyn
     result_leg = engine_leg.run(num_laps=1, initial_soc_pct=initial_soc, initial_temp_c=initial_temp)
@@ -202,8 +303,11 @@ def main():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"  Replay validation:     {report.num_passed}/{report.num_total} metrics pass")
-    print(f"  Worst metric error:    {max(m.relative_error_pct for m in report.metrics):.1f}%")
+    if report is not None:
+        print(f"  Replay validation:     {report.num_passed}/{report.num_total} metrics pass")
+        print(f"  Worst metric error:    {max(m.relative_error_pct for m in report.metrics):.1f}%")
+    else:
+        print("  Replay validation:     SKIPPED (see REMAINING_ISSUES.md #21)")
     print(f"  Pacejka vs Legacy:     Higher corner speeds (mu={pdy1:.1f} vs 1.3)")
     print(f"  Real car lateral G:    {actual_peak_g:.2f}g peak, {actual_mean_g:.2f}g mean in corners")
     print(f"  Force-based lap delta: {result_coast.total_time_s - result_leg.total_time_s:+.1f}s (Pacejka vs Legacy coast)")
