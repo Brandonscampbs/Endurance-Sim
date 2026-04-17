@@ -51,6 +51,12 @@ class SimResult:
     total_energy_kwh: float
     final_soc: float
     laps_completed: int
+    # C8: track discharge and regen separately so we can reconcile the
+    # energy budget against telemetry.  ``total_energy_kwh`` remains the
+    # discharge-only number for backwards compatibility.
+    discharge_energy_kwh: float = 0.0
+    regen_energy_kwh: float = 0.0
+    net_energy_kwh: float = 0.0
 
 
 class SimulationEngine:
@@ -75,10 +81,17 @@ class SimulationEngine:
         self.strategy = strategy
         self.battery_model = battery_model
 
-        # Load motor efficiency map if available
+        # Load motor efficiency map if available.
+        # NF-3: resolve path relative to the package, not the caller's CWD,
+        # so sims run from any directory (tests, webapp, notebooks).
         motor_map = None
         if _HAS_MOTOR_MAP:
-            motor_map_path = Path("Real-Car-Data-And-Stats/emrax228_hv_cc_motor_map_long.csv")
+            repo_root = Path(__file__).resolve().parents[3]
+            motor_map_path = (
+                repo_root
+                / "Real-Car-Data-And-Stats"
+                / "emrax228_hv_cc_motor_map_long.csv"
+            )
             if motor_map_path.exists():
                 motor_map = MotorEfficiencyMap(motor_map_path)
 
@@ -142,8 +155,10 @@ class SimulationEngine:
         temp = initial_temp_c
         pack_voltage = self.battery_model.pack_voltage(soc, 0.0)
 
-        # Accumulator for energy
+        # Accumulator for energy (C8: discharge and regen tracked separately)
         total_energy_j = 0.0
+        discharge_energy_j = 0.0
+        regen_energy_j = 0.0
 
         # State log
         records: list[dict] = []
@@ -257,8 +272,17 @@ class SimulationEngine:
                             cmd.throttle_pct, motor_rpm, bms_current_limit,
                         )
                 elif cmd.action == ControlAction.BRAKE:
-                    max_torque = self.powertrain.max_motor_torque(motor_rpm)
-                    motor_torque = -cmd.brake_pct * max_torque
+                    # NF-5: derive motor_torque from the tire-clipped regen_f
+                    # rather than the raw brake command.  When the wheel can't
+                    # support the requested regen force we must reflect the
+                    # clipped force in the electrical power calculation too,
+                    # otherwise the sim reports more regen energy than the
+                    # tires actually transferred.
+                    gear = self.powertrain.config.gear_ratio
+                    eff = self.powertrain._GEARBOX_EFFICIENCY
+                    tire_r = self.powertrain.TIRE_RADIUS_M
+                    # regen_f is negative (braking); motor_torque is negative.
+                    motor_torque = regen_f * tire_r / (gear * eff)
                 else:
                     motor_torque = 0.0
 
@@ -277,10 +301,17 @@ class SimulationEngine:
                     pack_current, seg_time, soc, temp,
                 )
 
-                # 10. Energy accounting (positive = consumed)
+                # 10. Energy accounting.
+                # C8: keep discharge-only (positive pack power) for legacy
+                # metric ``total_energy_kwh`` but also accumulate regen and
+                # net so the verification page can reconcile against
+                # telemetry's pack V*I integral.
                 segment_energy_j = elec_power * seg_time
                 if segment_energy_j > 0:
                     total_energy_j += segment_energy_j
+                    discharge_energy_j += segment_energy_j
+                else:
+                    regen_energy_j += -segment_energy_j
 
                 # 11. Record state
                 records.append({
@@ -322,16 +353,19 @@ class SimulationEngine:
                 if soc <= self.vehicle.battery.discharged_soc_pct:
                     return self._build_result(
                         records, time, total_energy_j, soc, laps_completed,
+                        discharge_energy_j, regen_energy_j,
                     )
                 if temp >= 65.0:
                     return self._build_result(
                         records, time, total_energy_j, soc, laps_completed,
+                        discharge_energy_j, regen_energy_j,
                     )
 
             laps_completed += 1
 
         return self._build_result(
             records, time, total_energy_j, soc, laps_completed,
+            discharge_energy_j, regen_energy_j,
         )
 
     def _build_result(
@@ -341,6 +375,8 @@ class SimulationEngine:
         total_energy_j: float,
         final_soc: float,
         laps_completed: int,
+        discharge_energy_j: float = 0.0,
+        regen_energy_j: float = 0.0,
     ) -> SimResult:
         states = pd.DataFrame(records)
         return SimResult(
@@ -352,4 +388,7 @@ class SimulationEngine:
             total_energy_kwh=total_energy_j / 3.6e6,
             final_soc=final_soc,
             laps_completed=laps_completed,
+            discharge_energy_kwh=discharge_energy_j / 3.6e6,
+            regen_energy_kwh=regen_energy_j / 3.6e6,
+            net_energy_kwh=(discharge_energy_j - regen_energy_j) / 3.6e6,
         )
