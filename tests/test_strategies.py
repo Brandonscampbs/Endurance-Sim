@@ -303,3 +303,51 @@ class TestSegmentToZoneIndex:
             fast = strat.zone_for_segment(seg)
             expected = next(z for z in zones if z.segment_start <= seg <= z.segment_end)
             assert fast is expected, f"seg {seg}: fast={fast.zone_id} expected={expected.zone_id}"
+
+
+class TestEnvelopeAwareStrategies:
+    """D-20: CoastOnly/ThresholdBraking honor an injected SpeedEnvelope."""
+
+    def test_coast_only_sees_downstream_corner_via_envelope(self, dynamics, corner_segment):
+        from fsae_sim.driver.strategies import CoastOnlyStrategy
+        from fsae_sim.driver.strategy import SimState
+        from fsae_sim.track.track import Segment
+
+        straight = Segment(index=0, distance_start_m=0.0, length_m=5.0, curvature=0.0, grade=0.0)
+        # Synthetic envelope: segment 0 ceiling forced low by a downstream corner.
+        envelope = np.array([5.0, 20.0, 20.0])
+        strat_no_env = CoastOnlyStrategy(dynamics)
+        strat_env = CoastOnlyStrategy(dynamics, envelope=envelope)
+
+        state = SimState(0, 0.0, 8.0, 0.9, 400, 0, 25, 0, 0)
+        # With envelope, segment 0 ceiling is 5 m/s so 8 m/s ⇒ coast.
+        cmd_env = strat_env.decide(state, [straight])
+        assert cmd_env.action == ControlAction.COAST
+
+        # Without envelope, the straight has no corner limit ⇒ throttle.
+        cmd_raw = strat_no_env.decide(state, [straight])
+        assert cmd_raw.action == ControlAction.THROTTLE
+
+    def test_threshold_braking_envelope_brakes_earlier(self, dynamics):
+        from fsae_sim.driver.strategies import ThresholdBrakingStrategy
+        from fsae_sim.driver.strategy import SimState
+        from fsae_sim.track.track import Segment
+
+        # Two "straights" but envelope marks both as pre-corner slow zones.
+        upcoming = [
+            Segment(index=0, distance_start_m=0.0, length_m=5.0, curvature=0.0, grade=0.0),
+            Segment(index=1, distance_start_m=5.0, length_m=5.0, curvature=0.0, grade=0.0),
+        ]
+        envelope = np.array([8.0, 8.0])  # envelope says 8 m/s max here
+        state = SimState(0, 0.0, 20.0, 0.9, 400, 30, 25, 0, 0)
+
+        strat_env = ThresholdBrakingStrategy(
+            dynamics, brake_threshold_ms=1.0, brake_intensity=0.5, envelope=envelope,
+        )
+        strat_raw = ThresholdBrakingStrategy(
+            dynamics, brake_threshold_ms=1.0, brake_intensity=0.5,
+        )
+
+        assert strat_env.decide(state, upcoming).action == ControlAction.BRAKE
+        # Raw strategy sees inf corner speed on straights ⇒ no brake.
+        assert strat_raw.decide(state, upcoming).action != ControlAction.BRAKE

@@ -204,25 +204,58 @@ class CoastOnlyStrategy(DriverStrategy):
         self,
         dynamics: VehicleDynamics,
         coast_margin_ms: float = 2.0,
+        envelope: "SpeedEnvelope | None" = None,
     ) -> None:
         """
         Args:
             dynamics: Vehicle dynamics model for cornering speed limits.
             coast_margin_ms: Start coasting when speed is within this margin
                 of the corner speed limit (m/s).
+            envelope: D-20. Optional pre-computed forward-backward speed
+                envelope. When provided, ``decide`` consults the
+                per-segment ceiling for upcoming segments instead of the
+                isolated ``dynamics.max_cornering_speed``, so the driver
+                looks ahead past single-corner grip (matters for
+                back-to-back tight corners where a downstream corner
+                forces earlier lifting).
         """
         self._dynamics = dynamics
         self._coast_margin = coast_margin_ms
+        self._envelope: np.ndarray | None = None
+        if envelope is not None:
+            self.set_envelope(envelope)
+
+    def set_envelope(self, envelope: "SpeedEnvelope | np.ndarray") -> None:
+        """Attach (or replace) a pre-computed speed envelope.
+
+        Accepts either a SpeedEnvelope instance (we call ``compute()``)
+        or a pre-computed NumPy array of per-segment ceilings.
+        """
+        if hasattr(envelope, "compute"):
+            self._envelope = np.asarray(envelope.compute())
+        else:
+            self._envelope = np.asarray(envelope)
+
+    def _min_upcoming_limit(self, state: SimState, upcoming: list[Segment]) -> float:
+        if self._envelope is not None:
+            n = len(self._envelope)
+            min_v = float("inf")
+            for i, _ in enumerate(upcoming):
+                idx = (state.segment_idx + i) % n
+                min_v = min(min_v, float(self._envelope[idx]))
+            return min_v
+        # Fallback: per-corner max from dynamics.
+        min_v = float("inf")
+        for seg in upcoming:
+            v_max = self._dynamics.max_cornering_speed(seg.curvature, seg.grip_factor)
+            min_v = min(min_v, v_max)
+        return min_v
 
     def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
         if not upcoming:
             return ControlCommand(ControlAction.THROTTLE, throttle_pct=1.0)
 
-        # Find the minimum corner speed limit in upcoming segments
-        min_corner_speed = float("inf")
-        for seg in upcoming:
-            v_max = self._dynamics.max_cornering_speed(seg.curvature, seg.grip_factor)
-            min_corner_speed = min(min_corner_speed, v_max)
+        min_corner_speed = self._min_upcoming_limit(state, upcoming)
 
         if state.speed > min_corner_speed - self._coast_margin:
             return ControlCommand(ControlAction.COAST)
@@ -245,6 +278,7 @@ class ThresholdBrakingStrategy(DriverStrategy):
         coast_margin_ms: float = 3.0,
         brake_threshold_ms: float = 1.0,
         brake_intensity: float = 0.5,
+        envelope: "SpeedEnvelope | None" = None,
     ) -> None:
         """
         Args:
@@ -252,20 +286,42 @@ class ThresholdBrakingStrategy(DriverStrategy):
             coast_margin_ms: Start coasting at this speed margin above corner limit.
             brake_threshold_ms: Apply brakes when speed exceeds corner limit by this much.
             brake_intensity: Brake pedal fraction (0-1) when braking.
+            envelope: D-20. Optional pre-computed speed envelope; see
+                ``CoastOnlyStrategy`` for rationale.
         """
         self._dynamics = dynamics
         self._coast_margin = coast_margin_ms
         self._brake_threshold = brake_threshold_ms
         self._brake_intensity = brake_intensity
+        self._envelope: np.ndarray | None = None
+        if envelope is not None:
+            self.set_envelope(envelope)
+
+    def set_envelope(self, envelope: "SpeedEnvelope | np.ndarray") -> None:
+        if hasattr(envelope, "compute"):
+            self._envelope = np.asarray(envelope.compute())
+        else:
+            self._envelope = np.asarray(envelope)
+
+    def _min_upcoming_limit(self, state: SimState, upcoming: list[Segment]) -> float:
+        if self._envelope is not None:
+            n = len(self._envelope)
+            min_v = float("inf")
+            for i, _ in enumerate(upcoming):
+                idx = (state.segment_idx + i) % n
+                min_v = min(min_v, float(self._envelope[idx]))
+            return min_v
+        min_v = float("inf")
+        for seg in upcoming:
+            v_max = self._dynamics.max_cornering_speed(seg.curvature, seg.grip_factor)
+            min_v = min(min_v, v_max)
+        return min_v
 
     def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
         if not upcoming:
             return ControlCommand(ControlAction.THROTTLE, throttle_pct=1.0)
 
-        min_corner_speed = float("inf")
-        for seg in upcoming:
-            v_max = self._dynamics.max_cornering_speed(seg.curvature, seg.grip_factor)
-            min_corner_speed = min(min_corner_speed, v_max)
+        min_corner_speed = self._min_upcoming_limit(state, upcoming)
 
         if state.speed > min_corner_speed + self._brake_threshold:
             return ControlCommand(

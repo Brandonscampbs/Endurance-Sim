@@ -230,6 +230,15 @@ class SimulationEngine:
         is_replay = isinstance(self.strategy, ReplayStrategy)
         is_calibrated = isinstance(self.strategy, CalibratedStrategy)
 
+        # D-20: push the envelope into synthetic corner-braking strategies
+        # so their lookahead uses the forward-backward-solved ceiling
+        # rather than the isolated per-corner v_max.
+        if hasattr(self.strategy, "set_envelope"):
+            try:
+                self.strategy.set_envelope(v_max)
+            except Exception:
+                pass
+
         for lap in range(num_laps):
             for seg_idx, segment in enumerate(segments):
                 # Build SimState for driver strategy
