@@ -32,19 +32,22 @@ class ValidationMetric:
 class ValidationReport:
     """Summary of all validation metrics.
 
-    D-05 fields (``telem_discharge_j`` / ``telem_regen_j`` /
-    ``telem_net_j`` and the matching ``sim_*`` counterparts) expose the
-    gross/regen/net energy split on both sides of the comparison.
-    Earlier code only summed positive telemetry power, silently
-    discarding every regen segment.
+    Telemetry energy accounting uses two separate integrators (C8):
+    - ``telem_discharge_j``: integral of V*I where I > 0 (pack sourcing energy)
+    - ``telem_regen_j``: integral of V*|I| where I < 0 (regen back into pack)
+    - ``telem_net_j``: discharge minus regen (net electrical energy out)
+
+    The pre-fix implementation summed only ``power > 0``, silently dropping
+    regen. Three counters keep the accounting honest.
+
+    ``stints`` optionally carries per-stint sub-reports when the input
+    telemetry frame has a ``stint`` column (C16).
     """
     metrics: list[ValidationMetric]
     telem_discharge_j: float = 0.0
     telem_regen_j: float = 0.0
     telem_net_j: float = 0.0
-    sim_discharge_j: float = 0.0
-    sim_regen_j: float = 0.0
-    sim_net_j: float = 0.0
+    stints: list["ValidationReport"] | None = None
 
     @property
     def all_passed(self) -> bool:
@@ -202,12 +205,10 @@ def validate_simulation(
     sim_v = float(sim_states["pack_voltage_v"].mean())
     metrics.append(_metric("Mean pack voltage", "V", telem_v, sim_v, target_pct))
 
-    # --- Pack current (time-weighted mean) ---
+    # --- Pack current (mean of nonzero) ---
     telem_i_values = lap_telem["Pack Current"].values
     telem_i_mean = float(np.mean(np.abs(telem_i_values[np.abs(telem_i_values) > 0.5]))) if np.any(np.abs(telem_i_values) > 0.5) else 0.0
-    sim_seg_time = sim_states["segment_time_s"].values
-    sim_i_mean = float(np.average(np.abs(sim_states["pack_current_a"].values),
-                                  weights=sim_seg_time))
+    sim_i_mean = float(np.mean(np.abs(sim_states["pack_current_a"].values)))
     if telem_i_mean > 1.0:
         metrics.append(_metric("Mean |pack current|", "A", telem_i_mean, sim_i_mean, 20.0))
 
@@ -222,21 +223,54 @@ def validate_full_endurance(
     sim_total_energy_kwh: float,
     sim_laps: int,
     target_pct: float = 5.0,
-    *,
-    sim_total_discharge_j: float | None = None,
-    sim_total_regen_j: float | None = None,
-    sim_total_net_j: float | None = None,
 ) -> ValidationReport:
     """Compare full-endurance simulation against complete AiM recording.
 
     Uses the final state of the AiM data as the reference for the full run.
-    """
-    metrics = []
 
-    # --- Total driving time (excluding driver change / stopped periods) ---
+    Stint-aware (C16): if ``aim_df`` contains a ``stint`` column, per-stint
+    sub-reports are attached under ``ValidationReport.stints`` and the overall
+    report aggregates only the driving stints.
+
+    NF-45: on the cleaned-data path (stint column present, already trimmed),
+    the legacy ``speed > 5 km/h`` cutoff is skipped so genuine low-speed
+    hairpin samples are not dropped. Stint boundaries already exclude the
+    driver-change stationary period.
+    """
+    # --- Stint-aware segmentation (C16) ---
+    stints = None
+    if "stint" in aim_df.columns:
+        stint_ids = sorted(int(s) for s in pd.unique(aim_df["stint"]) if pd.notna(s))
+        if len(stint_ids) > 1:
+            stints = []
+            for sid in stint_ids:
+                sub = aim_df[aim_df["stint"] == sid].reset_index(drop=True)
+                # Per-stint report: no recursion into stints (already segmented)
+                sub_no_stint = sub.drop(columns=["stint"])
+                stints.append(
+                    validate_full_endurance(
+                        sim_states, sub_no_stint,
+                        sim_total_time_s, sim_final_soc,
+                        sim_total_energy_kwh, sim_laps,
+                        target_pct=target_pct,
+                    )
+                )
+
+    # NF-45: On cleaned data (stint column signals this), treat every sample
+    # as driving — pre/post/DC periods are already removed. Otherwise fall
+    # back to the >5 km/h heuristic for raw recordings.
+    is_cleaned = "stint" in aim_df.columns
     speed = aim_df["GPS Speed"].values
     dt_arr = np.diff(aim_df["Time"].values, prepend=aim_df["Time"].values[0])
-    telem_driving_time = float(np.sum(dt_arr[speed > 5]))
+    if is_cleaned:
+        moving_mask = np.ones(len(aim_df), dtype=bool)
+    else:
+        moving_mask = speed > 5
+
+    metrics = []
+
+    # --- Total driving time ---
+    telem_driving_time = float(np.sum(dt_arr[moving_mask]))
     metrics.append(_metric("Driving time", "s", telem_driving_time, sim_total_time_s, target_pct))
 
     # --- Total distance ---
@@ -257,7 +291,7 @@ def validate_full_endurance(
     metrics.append(_metric("Final cell temp", "C", telem_temp_end, sim_temp_end, 15.0))
 
     # --- Mean pack voltage ---
-    moving = aim_df["GPS Speed"].values > 5
+    moving = moving_mask
     telem_v = float(aim_df["Pack Voltage"][moving].mean())
     sim_v = float(sim_states["pack_voltage_v"].mean())
     metrics.append(_metric("Mean pack voltage", "V", telem_v, sim_v, target_pct))
@@ -267,281 +301,37 @@ def validate_full_endurance(
     sim_v_end = float(sim_states["pack_voltage_v"].iloc[-1])
     metrics.append(_metric("Final pack voltage", "V", telem_v_end, sim_v_end, target_pct))
 
-    # --- Mean pack current (time-weighted) ---
-    # Telemetry samples are uniform in time (20Hz), so unweighted mean is
-    # already time-weighted.  Sim segments are uniform in distance, so we
-    # must weight by segment_time_s to get a proper time-weighted average.
+    # --- Mean pack current ---
     telem_i = float(np.mean(np.abs(aim_df["Pack Current"][moving].values)))
-    sim_seg_time = sim_states["segment_time_s"].values
-    sim_i = float(np.average(np.abs(sim_states["pack_current_a"].values),
-                             weights=sim_seg_time))
+    sim_i = float(np.mean(np.abs(sim_states["pack_current_a"].values)))
     metrics.append(_metric("Mean |pack current|", "A", telem_i, sim_i, 20.0))
 
-    # --- Energy consumed (D-05: discharge / regen / net tracked) ---
-    # Telemetry: integrate V*I over time.  Previously only positive
-    # power was summed, which discarded every regen segment — biasing
-    # the telemetry total high vs any sim that tracks regen.  We now
-    # track gross discharge, gross regen, and net, and compare net.
-    telem_power = aim_df["Pack Voltage"].values * aim_df["Pack Current"].values
+    # --- Two-counter energy accounting (C8) ---
+    # Discharge: current > 0 (pack sourcing). Regen: current < 0 (pack sinking).
+    # The old single-counter "power > 0" filter silently discarded regen.
+    voltage = aim_df["Pack Voltage"].values
+    current = aim_df["Pack Current"].values
     dt = np.diff(aim_df["Time"].values, prepend=aim_df["Time"].values[0])
-    telem_discharge_j = float(np.sum(np.maximum(telem_power, 0.0) * dt))
-    telem_regen_j = float(np.sum(np.maximum(-telem_power, 0.0) * dt))
+    discharge_mask = current > 0
+    regen_mask = current < 0
+    telem_discharge_j = float(
+        np.sum(voltage[discharge_mask] * current[discharge_mask] * dt[discharge_mask])
+    )
+    telem_regen_j = float(
+        np.sum(voltage[regen_mask] * (-current[regen_mask]) * dt[regen_mask])
+    )
     telem_net_j = telem_discharge_j - telem_regen_j
-    telem_net_kwh = telem_net_j / 3.6e6
-    if telem_net_kwh > 0.1:
-        metrics.append(
-            _metric("Energy consumed (net)", "kWh",
-                    telem_net_kwh, sim_total_energy_kwh, 15.0)
-        )
 
-    # Sim-side counters: use explicit values when the caller passes them
-    # (preferred — the caller has exact bookkeeping), otherwise derive
-    # from the net scalar so the field is non-zero for downstream code.
-    if sim_total_net_j is None:
-        sim_net_j_val = sim_total_energy_kwh * 3.6e6
-    else:
-        sim_net_j_val = float(sim_total_net_j)
-    sim_disch_j_val = float(sim_total_discharge_j) if sim_total_discharge_j is not None else max(sim_net_j_val, 0.0)
-    sim_regen_j_val = float(sim_total_regen_j) if sim_total_regen_j is not None else 0.0
+    telem_energy_kwh = telem_net_j / 3.6e6
+    if telem_energy_kwh > 0.1:
+        metrics.append(_metric("Energy consumed", "kWh", telem_energy_kwh, sim_total_energy_kwh, 15.0))
 
     return ValidationReport(
         metrics=metrics,
         telem_discharge_j=telem_discharge_j,
         telem_regen_j=telem_regen_j,
         telem_net_j=telem_net_j,
-        sim_discharge_j=sim_disch_j_val,
-        sim_regen_j=sim_regen_j_val,
-        sim_net_j=sim_net_j_val,
-    )
-
-
-@dataclass
-class DriverChannelMetric:
-    """Per-channel statistics from driver-channel validation."""
-    name: str            # "throttle", "brake", "action"
-    rmse: float          # root-mean-squared error (same units as channel)
-    r_squared: float     # coefficient of determination; 1.0 = perfect
-    correlation: float   # Pearson correlation; 1.0 = perfectly linear
-    n_samples: int
-
-
-@dataclass
-class DriverChannelValidation:
-    """Result of :func:`validate_driver_channels`.
-
-    D-23 (driver-model fix campaign): compares per-sample driver
-    commands from the simulation against telemetry-derived inputs.
-
-    Channels: ``throttle`` (0-1), ``brake`` (0-1 of a fixed physical
-    reference), ``action`` (THROTTLE / BRAKE / COAST classification).
-    """
-    throttle: DriverChannelMetric
-    brake: DriverChannelMetric
-    action_accuracy: float      # fraction of samples with matching action
-    per_lap: pd.DataFrame       # per-lap RMSE / R² / corr per channel
-    laps_used: list[int]
-    n_samples: int
-
-    def summary(self) -> str:
-        lines = [
-            "Driver-Channel Validation",
-            "-" * 70,
-            f"  Laps used: {self.laps_used}  (n={self.n_samples} samples)",
-            f"  Throttle:   RMSE={self.throttle.rmse:.4f}  "
-            f"R²={self.throttle.r_squared:.3f}  "
-            f"corr={self.throttle.correlation:.3f}",
-            f"  Brake:      RMSE={self.brake.rmse:.4f}  "
-            f"R²={self.brake.r_squared:.3f}  "
-            f"corr={self.brake.correlation:.3f}",
-            f"  Action classification accuracy: "
-            f"{self.action_accuracy * 100:.1f}%",
-        ]
-        return "\n".join(lines)
-
-
-def _channel_stats(sim_ch: np.ndarray, telem_ch: np.ndarray,
-                   name: str) -> DriverChannelMetric:
-    """Compute RMSE, R², Pearson corr on two aligned 1-D arrays."""
-    mask = np.isfinite(sim_ch) & np.isfinite(telem_ch)
-    s = sim_ch[mask]
-    t = telem_ch[mask]
-    n = len(s)
-    if n == 0:
-        return DriverChannelMetric(name=name, rmse=float("nan"),
-                                   r_squared=float("nan"),
-                                   correlation=float("nan"), n_samples=0)
-    rmse = float(np.sqrt(np.mean((s - t) ** 2)))
-    ss_res = float(np.sum((t - s) ** 2))
-    ss_tot = float(np.sum((t - t.mean()) ** 2))
-    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else float("nan")
-    # Pearson correlation; guard zero-variance input.
-    if np.std(s) < 1e-12 or np.std(t) < 1e-12:
-        corr = float("nan")
-    else:
-        corr = float(np.corrcoef(s, t)[0, 1])
-    return DriverChannelMetric(
-        name=name, rmse=rmse, r_squared=r2, correlation=corr, n_samples=n,
-    )
-
-
-def validate_driver_channels(
-    sim_states: pd.DataFrame,
-    aim_df: pd.DataFrame,
-    *,
-    laps: list[int] | None = None,
-    throttle_threshold: float = 0.05,   # 5% of normalized scale
-    brake_threshold_bar: float = 2.0,   # 2 bar on physical pressure
-    brake_ref_bar: float = 30.0,        # normalize telemetry brake to this max
-    throttle_col: str = "Throttle Pos",
-    front_brake_col: str = "FBrakePressure",
-    rear_brake_col: str = "RBrakePressure",
-    distance_col: str = "Distance on GPS Speed",
-    lap_col: str = "lap",
-) -> DriverChannelValidation:
-    """Compare sim driver commands to telemetry driver inputs per sample.
-
-    The sim records per-segment driver commands (throttle_pct,
-    brake_pct, action).  Telemetry carries pedal position and brake
-    pressure at 20 Hz.  We align on per-lap distance — sim channels
-    are linearly interpolated onto the telemetry distance grid of
-    each lap — then compute RMSE, R², and Pearson correlation per
-    channel across the aligned samples.
-
-    Args:
-        sim_states: Per-segment sim state DataFrame (must include
-            ``lap``, ``distance_m``, ``throttle_pct``, ``brake_pct``,
-            ``action``).
-        aim_df: Telemetry DataFrame (must include a ``lap`` column
-            and the pedal/brake/distance columns).
-        laps: Optional lap subset (1-based).  ``None`` = all laps
-            present in both frames.  Use this to measure against a
-            held-out stint (e.g., laps 13-21 for Michigan 2025).
-        throttle_threshold: Normalized throttle above which a sample
-            is classified as THROTTLE action (matches the
-            telemetry_analysis calibration threshold of 5%).
-        brake_threshold_bar: Brake pressure (bar) above which a
-            sample is classified as BRAKE action.
-        brake_ref_bar: Physical reference used to normalize telemetry
-            brake to 0-1 for RMSE comparison against sim brake_pct.
-            Default 30 bar is DSS-plausible max line pressure; the
-            exact value is documented as a free parameter pending
-            D-08 normalization unification.
-        throttle_col / front_brake_col / rear_brake_col / distance_col /
-        lap_col: Column names.
-
-    Returns:
-        :class:`DriverChannelValidation` with per-channel RMSE / R²
-        / Pearson corr, action classification accuracy, and per-lap
-        breakdown.
-    """
-    required_sim = {"lap", "distance_m", "throttle_pct", "brake_pct", "action"}
-    missing_sim = required_sim - set(sim_states.columns)
-    if missing_sim:
-        raise ValueError(f"sim_states missing columns: {missing_sim}")
-    required_telem = {lap_col, distance_col, throttle_col,
-                      front_brake_col, rear_brake_col}
-    missing_telem = required_telem - set(aim_df.columns)
-    if missing_telem:
-        raise ValueError(f"aim_df missing columns: {missing_telem}")
-
-    if laps is None:
-        # Intersect laps present in both frames.
-        sim_laps = set(int(x) for x in sim_states["lap"].unique())
-        telem_laps = set(int(x) for x in aim_df[lap_col].unique() if x > 0)
-        laps_used = sorted(sim_laps & telem_laps)
-    else:
-        laps_used = sorted(int(x) for x in laps)
-
-    sim_t_all: list[np.ndarray] = []
-    sim_b_all: list[np.ndarray] = []
-    sim_a_all: list[np.ndarray] = []
-    telem_t_all: list[np.ndarray] = []
-    telem_b_all: list[np.ndarray] = []
-    telem_a_all: list[np.ndarray] = []
-    per_lap_rows: list[dict] = []
-
-    for lap_num in laps_used:
-        sim_lap = sim_states[sim_states["lap"] == lap_num].sort_values("distance_m")
-        telem_lap = aim_df[aim_df[lap_col] == lap_num].sort_values(distance_col)
-        if len(sim_lap) < 2 or len(telem_lap) < 2:
-            continue
-
-        # Normalize both distance axes to [0, lap_length) so the
-        # interpolation is robust to different absolute offsets.
-        sim_d = sim_lap["distance_m"].values - sim_lap["distance_m"].values[0]
-        telem_d = telem_lap[distance_col].values - telem_lap[distance_col].values[0]
-
-        sim_throttle = np.interp(telem_d, sim_d, sim_lap["throttle_pct"].values)
-        sim_brake = np.interp(telem_d, sim_d, sim_lap["brake_pct"].values)
-        # Action: use nearest-neighbour (categorical), not linear interp.
-        sim_actions_arr = sim_lap["action"].values
-        nn_idx = np.clip(np.searchsorted(sim_d, telem_d), 0, len(sim_d) - 1)
-        sim_action = sim_actions_arr[nn_idx]
-
-        telem_throttle = telem_lap[throttle_col].values / 100.0  # 0-100 → 0-1
-        telem_brake_bar = np.maximum(
-            telem_lap[front_brake_col].values,
-            telem_lap[rear_brake_col].values,
-        )
-        telem_brake_norm = np.clip(telem_brake_bar / brake_ref_bar, 0.0, 1.0)
-
-        # Telemetry action classification (same thresholds as calibration).
-        telem_action = np.where(
-            telem_brake_bar > brake_threshold_bar, "brake",
-            np.where(telem_throttle > throttle_threshold, "throttle", "coast"),
-        )
-
-        sim_t_all.append(sim_throttle)
-        sim_b_all.append(sim_brake)
-        sim_a_all.append(sim_action)
-        telem_t_all.append(telem_throttle)
-        telem_b_all.append(telem_brake_norm)
-        telem_a_all.append(telem_action)
-
-        # Per-lap stats
-        t_stat = _channel_stats(sim_throttle, telem_throttle, "throttle")
-        b_stat = _channel_stats(sim_brake, telem_brake_norm, "brake")
-        a_acc = float(np.mean(sim_action == telem_action)) if len(sim_action) else float("nan")
-        per_lap_rows.append({
-            "lap": lap_num,
-            "n_samples": len(telem_d),
-            "throttle_rmse": t_stat.rmse,
-            "throttle_r2": t_stat.r_squared,
-            "throttle_corr": t_stat.correlation,
-            "brake_rmse": b_stat.rmse,
-            "brake_r2": b_stat.r_squared,
-            "brake_corr": b_stat.correlation,
-            "action_accuracy": a_acc,
-        })
-
-    if not sim_t_all:
-        empty = DriverChannelMetric(name="", rmse=float("nan"),
-                                    r_squared=float("nan"),
-                                    correlation=float("nan"), n_samples=0)
-        return DriverChannelValidation(
-            throttle=empty, brake=empty, action_accuracy=float("nan"),
-            per_lap=pd.DataFrame(per_lap_rows), laps_used=laps_used,
-            n_samples=0,
-        )
-
-    sim_t = np.concatenate(sim_t_all)
-    sim_b = np.concatenate(sim_b_all)
-    sim_a = np.concatenate(sim_a_all)
-    telem_t = np.concatenate(telem_t_all)
-    telem_b = np.concatenate(telem_b_all)
-    telem_a = np.concatenate(telem_a_all)
-
-    throttle_stat = _channel_stats(sim_t, telem_t, "throttle")
-    brake_stat = _channel_stats(sim_b, telem_b, "brake")
-    action_acc = float(np.mean(sim_a == telem_a))
-
-    return DriverChannelValidation(
-        throttle=throttle_stat,
-        brake=brake_stat,
-        action_accuracy=action_acc,
-        per_lap=pd.DataFrame(per_lap_rows),
-        laps_used=laps_used,
-        n_samples=len(sim_t),
+        stints=stints,
     )
 
 

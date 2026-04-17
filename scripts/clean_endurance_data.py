@@ -112,6 +112,11 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     s1["Time"] = s1["Time"] - s1["Time"].iloc[0]
     s2["Time"] = s2["Time"] - s2["Time"].iloc[0] + s1_duration + dt
 
+    # C16: preserve stint identity so downstream consumers (validation,
+    # per-stint metrics) can segment on it without re-detecting the DC.
+    s1["stint"] = 1
+    s2["stint"] = 2
+
     cleaned = pd.concat([s1, s2], ignore_index=True)
 
     # Recalculate distance

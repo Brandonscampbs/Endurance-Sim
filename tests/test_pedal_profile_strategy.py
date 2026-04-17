@@ -43,7 +43,7 @@ class TestDriverParams:
         p = DriverParams()
         assert p.throttle_scale == 1.0
         assert p.brake_scale == 1.0
-        assert p.coast_throttle == 0.0
+        # D-03: coast_throttle field deleted.
         assert p.max_throttle == 1.0
         assert p.max_brake == 1.0
 
@@ -158,11 +158,12 @@ class TestDecide:
         cmd = strategy.decide(make_state(segment_idx=8), [])
         assert cmd.brake_pct == pytest.approx(0.4)
 
-    def test_coast_throttle(self):
-        strategy = self._make_strategy(coast_throttle=0.05)
+    def test_coast_always_zero_throttle(self):
+        """D-03: coast_throttle removed; COAST always returns throttle=0."""
+        strategy = self._make_strategy()
         cmd = strategy.decide(make_state(segment_idx=5), [])
         assert cmd.action == ControlAction.COAST
-        assert cmd.throttle_pct == pytest.approx(0.05)
+        assert cmd.throttle_pct == 0.0
 
     def test_throttle_clamped_to_one(self):
         strategy = self._make_strategy(throttle_scale=2.0)
@@ -211,10 +212,10 @@ class TestWithParams:
 
     def test_multiple_params(self):
         original = self._make_strategy()
-        modified = original.with_params(throttle_scale=0.8, max_throttle=0.6, coast_throttle=0.02)
+        modified = original.with_params(throttle_scale=0.8, max_throttle=0.6, max_brake=0.9)
         assert modified.params.throttle_scale == 0.8
         assert modified.params.max_throttle == 0.6
-        assert modified.params.coast_throttle == 0.02
+        assert modified.params.max_brake == 0.9
         assert modified.params.brake_scale == 1.0
 
     def test_chained_with_params(self):

@@ -278,6 +278,63 @@ class TestEdgeCases:
         )
         assert result.efficiency_score == pytest.approx(100.0, abs=1.0)
 
+    def test_driver_change_time_added_to_corrected(self, michigan_2025):
+        """NF-43: driver_change_time_s is added to corrected time before penalties."""
+        base = michigan_2025.score(
+            total_time_s=1500.0, total_energy_kwh=2.5, laps_completed=22,
+        )
+        with_dc = michigan_2025.score(
+            total_time_s=1500.0, total_energy_kwh=2.5, laps_completed=22,
+            driver_change_time_s=45.0,
+        )
+        assert with_dc.your_time_s == pytest.approx(base.your_time_s + 45.0)
+
+    def test_driver_change_bonus_requires_flag(self, michigan_2025):
+        """NF-44: 3-point DC bonus only applies when driver_change_completed=True."""
+        no_dc = michigan_2025.score(
+            total_time_s=1500.0, total_energy_kwh=2.5, laps_completed=15,
+            driver_change_completed=False,
+        )
+        with_dc = michigan_2025.score(
+            total_time_s=1500.0, total_energy_kwh=2.5, laps_completed=15,
+            driver_change_completed=True,
+        )
+        # Without DC: 15 laps * 1 pt = 15 (no bonus)
+        assert no_dc.endurance_laps_score == 15.0
+        # With DC: 15 * 1 + 3 = 18 (capped at 25)
+        assert with_dc.endurance_laps_score == 18.0
+
+    def test_driver_change_completed_default_true_backward_compat(self, michigan_2025):
+        """Default driver_change_completed preserves existing 22-lap bonus behavior."""
+        # A 22-lap run (implicitly assumes DC done) still gets 25
+        r = michigan_2025.score(
+            total_time_s=1500.0, total_energy_kwh=2.5, laps_completed=22,
+        )
+        assert r.endurance_laps_score == 25.0
+
+    def test_track_km_per_lap_propagated(self, michigan_2025):
+        """NF-59: score() accepts track_km_per_lap for EFmin computation."""
+        # Just verify signature accepts and does not crash; efficiency sensible
+        r = michigan_2025.score(
+            total_time_s=1500.0, total_energy_kwh=2.5, laps_completed=22,
+            track_km_per_lap=1.0,
+        )
+        assert 0 <= r.efficiency_score <= 100
+
+    def test_s11_raw_vs_corrected_lap_times(self, michigan_2025):
+        """S11: efficiency uses raw lap time; endurance time score uses corrected."""
+        r = michigan_2025.score(
+            total_time_s=1500.0, total_energy_kwh=2.5, laps_completed=22,
+            cone_penalties=5,  # adds 10s
+        )
+        # Result must expose both raw and corrected average lap
+        assert hasattr(r, "raw_avg_lap_s")
+        assert hasattr(r, "your_avg_lap_s")
+        # Corrected avg lap reflects penalties
+        assert r.your_avg_lap_s == pytest.approx(1510.0 / 22.0)
+        # Raw avg lap does not include penalties
+        assert r.raw_avg_lap_s == pytest.approx(1500.0 / 22.0)
+
     def test_co2_eligibility_cap(self, michigan_2025):
         """Teams exceeding 20.02 kg CO2/100km are ineligible for efficiency."""
         # 22 laps of ~1km = 22 km. 20.02 kg/100km => 4.404 kg max CO2.
