@@ -152,3 +152,47 @@ class TestZoneMaxSpeedCap:
             f"D-09 regression: speeds exceeded zone cap "
             f"(max={result.states['speed_ms'].max():.3f} > 10.0)"
         )
+
+
+class TestPackCurrentCarriedForward:
+    """D-11: SimState.pack_current carries last segment's pack current."""
+
+    def test_state_pack_current_is_last_iteration_value(self):
+        from fsae_sim.driver.strategy import ControlAction, ControlCommand
+
+        track = make_simple_track()
+        config = make_minimal_config()
+
+        class SpyStrategy(DriverStrategy):
+            name = "spy"
+
+            def __init__(self):
+                self.observed_pack_currents = []
+
+            def decide(self, state, upcoming):
+                self.observed_pack_currents.append(state.pack_current)
+                return ControlCommand(
+                    action=ControlAction.THROTTLE,
+                    throttle_pct=0.6,
+                    brake_pct=0.0,
+                )
+
+        batt = MagicMock(spec=BatteryModel)
+        batt.pack_voltage.return_value = 400.0
+        batt.max_discharge_current.return_value = 100.0
+        batt.step.return_value = (90.0, 26.0, 395.0)
+
+        spy = SpyStrategy()
+        engine = SimulationEngine(config, track, spy, batt)
+        result = engine.run(num_laps=1, initial_soc_pct=95.0)
+
+        # First segment sees 0.0 (no prior segment); later segments must
+        # see non-zero pack_current reflecting the previous segment's draw.
+        assert spy.observed_pack_currents[0] == 0.0
+        nonzero_later = [pc for pc in spy.observed_pack_currents[1:] if pc != 0.0]
+        assert len(nonzero_later) > 0, (
+            "D-11 regression: SimState.pack_current stuck at 0 across segments."
+        )
+        # And the recorded DataFrame's final pack_current_a should match
+        # what the next iteration would have seen if the loop continued.
+        assert result.states["pack_current_a"].iloc[-1] != 0.0
