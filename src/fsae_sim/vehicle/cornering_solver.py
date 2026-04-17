@@ -43,7 +43,9 @@ class CorneringSolver:
     GRAVITY: float = 9.81
     _V_LOW: float = 0.5
     _V_HIGH: float = 50.0
-    _ITERATIONS: int = 30
+    _ITERATIONS: int = 30  # hard cap; loop exits earlier on convergence
+    _V_TOL_ABS: float = 0.01  # absolute m/s tolerance
+    _V_TOL_REL: float = 1e-3  # relative tolerance
     _CURVATURE_THRESHOLD: float = 1e-6
 
     def __init__(
@@ -98,14 +100,23 @@ class CorneringSolver:
         v_low = self._V_LOW
         v_high = self._V_HIGH
 
+        # Convergence-gated bisection (NF-34): exit when bracket width drops
+        # below max(abs_tol, rel_tol * v_low).  The iteration counter is a
+        # hard safety cap; typical convergence is < 15 halvings.
         for _ in range(self._ITERATIONS):
+            tol = max(self._V_TOL_ABS, self._V_TOL_REL * v_low)
+            if (v_high - v_low) <= tol:
+                break
             v_mid = (v_low + v_high) / 2.0
             if self._can_sustain(v_mid, abs_curvature, mu_scale, longitudinal_g):
                 v_low = v_mid
             else:
                 v_high = v_mid
 
-        return (v_low + v_high) / 2.0
+        # Return the lower bracket (known to sustain) to avoid reporting a
+        # speed that fails the sustain check due to tire-model regularizer
+        # oscillation at the boundary.
+        return v_low
 
     def _can_sustain(
         self,
@@ -200,12 +211,17 @@ class CorneringSolver:
             total_capacity = 0.0
             for fz, camber, fx in zip(loads, cambers, fx_per_tire):
                 fx_peak = self._tire.peak_longitudinal_force(fz, camber)
-                if fx_peak > 0:
-                    fx_ratio = min(abs(fx) / fx_peak, 0.99)
+                # Physical friction ellipse (NF-33): no 0.99 cap — when the
+                # tire is at or past longitudinal peak it has zero lateral
+                # capacity, not 14%.  Divide-by-zero is protected by fx_peak
+                # check; overdrive (fx > fx_peak) is clipped to 1.0.
+                if fx_peak > 1e-6:
+                    fx_ratio = min(abs(fx) / fx_peak, 1.0)
                 else:
-                    fx_ratio = 0.99
+                    fx_ratio = 1.0
                 fy_peak = self._tire.peak_lateral_force(fz, camber)
-                fy_available = fy_peak * math.sqrt(1.0 - fx_ratio * fx_ratio)
+                arg = max(0.0, 1.0 - fx_ratio * fx_ratio)
+                fy_available = fy_peak * math.sqrt(arg)
                 total_capacity += fy_available * mu_scale
         else:
             # Pure cornering (no longitudinal demand)
