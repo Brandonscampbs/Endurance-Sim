@@ -67,7 +67,15 @@ tire:
   tir_file: "Real-Car-Data-And-Stats/Tire Models from TTC/Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir"
   static_camber_front_deg: -1.25
   static_camber_rear_deg: -1.25
-  grip_scale: 0.4697  # TTC-to-car calibration from Michigan 2025 endurance telemetry (cleaned LFspeed data)
+  # TTC-to-car grip calibration against Michigan 2025 endurance lap 16.
+  # Re-calibrated 2026-04-17 after Track.from_telemetry was fixed to compute
+  # curvature from GPS lat/lon path (previously used IMU LatAcc which was
+  # NaN on early laps, producing a nearly-straight track and forcing a
+  # far-too-low grip_scale to compensate). With the corrected track:
+  #   legacy backend       matches lap time at grip_scale ≈ 0.80 (71.27 s vs 71.05 s)
+  #   dynamics6dof backend matches lap time at grip_scale ≈ 0.60 (71.65 s vs 71.05 s)
+  # Default to the legacy tuning (engine default backend).
+  grip_scale: 0.80
 
 suspension:
   roll_stiffness_front_nm_per_deg: 238.0
