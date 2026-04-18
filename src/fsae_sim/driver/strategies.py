@@ -96,8 +96,21 @@ class ReplayStrategy(DriverStrategy):
         lap_start_idx: int,
         lap_end_idx: int,
         lap_distance_m: float,
+        brake_max_pressure_bar: float = 60.0,
     ) -> ReplayStrategy:
-        """Build single-lap replay from a slice of AiM DataFrame."""
+        """Build single-lap replay from a slice of AiM DataFrame.
+
+        ``brake_max_pressure_bar`` is the brake system's lockup / peak-
+        effort pressure at the master cylinder — the pressure that
+        corresponds to ``brake_pct=1.0`` (tire-limited deceleration).
+        For CT-16EV this is ~60 bar per the DSS brake-system sheet.
+
+        Previously this used a 99th-percentile normalization of observed
+        pressure, which silently saturated brake_pct when the driver used
+        only a fraction of the hardware's capability (e.g. 8.5 bar peak on
+        a 60-bar system was normalized to brake_pct=1.0, inflating replay
+        brake demand 7x above what the driver actually commanded).
+        """
         lap = aim_df.iloc[lap_start_idx:lap_end_idx].copy()
         dist = lap["Distance on GPS Speed"].values - lap["Distance on GPS Speed"].values[0]
 
@@ -106,8 +119,10 @@ class ReplayStrategy(DriverStrategy):
         brake_raw = np.maximum(
             lap["FBrakePressure"].values, lap["RBrakePressure"].values,
         )
-        bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
-        brake = np.clip(brake_raw / bmax, 0.0, 1.0)
+        # Drop broken-sensor negative values (FBrakePressure on this dataset
+        # sits at -18.5 bar for the whole lap).
+        brake_raw = np.where(brake_raw > 0.0, brake_raw, 0.0)
+        brake = np.clip(brake_raw / brake_max_pressure_bar, 0.0, 1.0)
 
         # S18: preserve regen. Previously clipped to [0, +limit] which
         # silently deleted negative torque commands (coast-regen). Keep
@@ -127,14 +142,16 @@ class ReplayStrategy(DriverStrategy):
         aim_df: "pd.DataFrame",
         lap_distance_m: float,
         min_speed_kmh: float = 5.0,
+        brake_max_pressure_bar: float = 60.0,
     ) -> ReplayStrategy:
         """Build replay from the full AiM endurance recording.
 
         Filters out stopped periods (driver change, stalls) to produce
         a clean distance-indexed driving profile.  Indexes by cumulative
-        distance rather than wrapping per-lap.
+        distance rather than wrapping per-lap. Brake pressure normalization
+        matches ``from_aim_data``: physical ``brake_max_pressure_bar``, not
+        an observed-percentile.
         """
-        # Filter to moving samples to cut driver change and stopped periods
         moving = aim_df["GPS Speed"].values > min_speed_kmh
         clean = aim_df[moving].copy()
 
@@ -144,8 +161,8 @@ class ReplayStrategy(DriverStrategy):
         brake_raw = np.maximum(
             clean["FBrakePressure"].values, clean["RBrakePressure"].values,
         )
-        bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
-        brake = np.clip(brake_raw / bmax, 0.0, 1.0)
+        brake_raw = np.where(brake_raw > 0.0, brake_raw, 0.0)
+        brake = np.clip(brake_raw / brake_max_pressure_bar, 0.0, 1.0)
 
         # S18: preserve regen (see from_aim_data).
         inverter_torque_limit = 85.0

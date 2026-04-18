@@ -90,9 +90,16 @@ class VehicleDynamics:
             else:
                 tire_radius = 0.2042  # Hoosier 16x7.5-10 UNLOADED_RADIUS fallback
             G = powertrain_config.gear_ratio
-            eta = powertrain_config.drivetrain_efficiency
+            # Inertia reflection to the wheel is pure kinematics:
+            #     J_reflected_at_wheel = J_rotor * G^2
+            # The gearbox efficiency does NOT reduce reflected inertia —
+            # efficiency is a torque/power loss, and the rotor still has
+            # to be angularly accelerated at G * wheel_omega every instant
+            # regardless of how lossy the path between them is.
+            # The old code multiplied by eta (~0.95) which silently made
+            # the car 0.3-0.5% faster in acceleration. Pure bug.
             j_eff = (
-                vehicle.rotor_inertia_kg_m2 * G * G * eta
+                vehicle.rotor_inertia_kg_m2 * G * G
                 + 4 * vehicle.wheel_inertia_kg_m2
             )
             self.m_effective: float = vehicle.mass_kg + j_eff / (tire_radius * tire_radius)

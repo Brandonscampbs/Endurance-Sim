@@ -244,20 +244,46 @@ class FastestLapDynamicsBackend:
     def max_cornering_speed(
         self, curvature: float, grip_factor: float = 1.0,
     ) -> float:
+        """Maximum sustainable cornering speed through ``curvature`` (1/m).
+
+        Physics: at max corner speed the car holds steady v, so the drive
+        axle must produce Fx equal to aero drag + rolling resistance. That
+        drive-tire Fx consumes part of the rear-tire friction circle; we
+        apply the standard elliptic reduction
+
+            Fy_available = Fy_peak · sqrt(1 - (Fx/Fx_peak)²)
+
+        per drive tire. Front (non-drive) tires retain full lateral peak.
+        Without this reduction the solver is over-optimistic and no single
+        grip_factor can simultaneously match straight-line and apex speeds
+        against telemetry.
+        """
         kappa = abs(curvature)
         if kappa < 1e-6:
             return float("inf")
 
-        mg = self.params.mass_kg * GRAVITY
-
-        # Bisection on v. At each v: available lateral = sum of 4 corner peak Fy
-        # under static Fz (with aero downforce). Vehicle demands m·v²·κ.
         def lateral_excess(v: float) -> float:
             front_fz, rear_fz = self._static_corner_loads(v)
-            peak_fy_total = (
-                2.0 * float(self.corner.model.peak_lateral_force(front_fz))
-                + 2.0 * float(self.corner.model.peak_lateral_force(rear_fz))
-            ) * grip_factor
+            # Non-drive (front) tires: pure lateral peak.
+            fy_front = 2.0 * float(
+                self.corner.model.peak_lateral_force(front_fz)
+            )
+            # Drive (rear) tires: elliptic reduction by Fx demand.
+            fx_demand_total = self.drag_force(v) + self.rolling_resistance_force(v)
+            fx_per_rear = 0.5 * fx_demand_total  # RWD, split evenly
+            fx_peak_rear = float(
+                self.corner.model.peak_longitudinal_force(rear_fz)
+            )
+            fy_peak_rear = float(
+                self.corner.model.peak_lateral_force(rear_fz)
+            )
+            if fx_peak_rear > 1e-6:
+                fx_ratio = min(fx_per_rear / fx_peak_rear, 1.0)
+            else:
+                fx_ratio = 1.0
+            fy_per_rear = fy_peak_rear * math.sqrt(max(0.0, 1.0 - fx_ratio * fx_ratio))
+            fy_rear = 2.0 * fy_per_rear
+            peak_fy_total = (fy_front + fy_rear) * grip_factor
             required = self.params.mass_kg * v * v * kappa
             return peak_fy_total - required
 
@@ -265,7 +291,6 @@ class FastestLapDynamicsBackend:
         if lateral_excess(lo) < 0:
             return 0.0
         if lateral_excess(hi) > 0:
-            # Even at hi the tires can deliver the needed lateral -> return hi
             return hi
         for _ in range(40):
             mid = 0.5 * (lo + hi)

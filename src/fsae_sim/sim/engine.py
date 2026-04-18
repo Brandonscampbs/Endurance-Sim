@@ -154,6 +154,18 @@ class SimulationEngine:
                 math.radians(tire_cfg.static_camber_rear_deg),
                 susp_cfg.roll_camber_front_deg_per_deg,
                 susp_cfg.roll_camber_rear_deg_per_deg,
+                # Close the loop: give the solver the aero + rolling params
+                # so it can compute drive-tire Fx demand self-consistently
+                # at each candidate speed. Without this the ellipse check
+                # defaults to pure-lateral, and no grip_scale can match
+                # both straight-line and apex speeds against telemetry.
+                cd_a_m2=(
+                    vehicle.vehicle.drag_coefficient
+                    * vehicle.vehicle.frontal_area_m2
+                ),
+                cl_a_m2=vehicle.vehicle.downforce_coefficient,
+                rolling_resistance=vehicle.vehicle.rolling_resistance,
+                rear_wheel_drive=True,
             )
             self.dynamics = VehicleDynamics(
                 vehicle.vehicle, tire_model, load_transfer, cornering_solver,
@@ -332,21 +344,22 @@ class SimulationEngine:
                     regen_f = 0.0
                 elif cmd.action == ControlAction.BRAKE:
                     # CT-16EV uses MECHANICAL brakes only — brake pedal
-                    # drives hydraulic pressure to the friction pads.
-                    # We use ``powertrain.regen_force`` here ONLY as a
-                    # convenient brake-pedal → decel-force mapping
-                    # (which happens to match real brake-system design:
-                    # peak brake force sized similar to peak motor
-                    # torque).  The force is applied as a DECELERATION
-                    # only; the electrical side is intentionally
-                    # disabled via motor_torque = 0 below, so no
-                    # phantom regen accumulates.  Regen is reserved
-                    # for strategies that command negative motor
-                    # torque explicitly (2025 telemetry never does).
+                    # drives hydraulic pressure to the friction pads. The
+                    # brake force is scaled by pedal% up to the tire limit
+                    # (all four wheels contributing, computed at the current
+                    # speed with its aero downforce).
+                    #
+                    # Prior implementation routed this through
+                    # ``powertrain.regen_force`` which caps brake force at
+                    # motor torque capability (~1.5 kN, ~0.55 g on CT-16EV),
+                    # but real hydraulic discs can hit 1.5-2 g. Using
+                    # ``mechanical_brake_force`` lets the tire limit bind
+                    # instead of a non-existent regen torque ceiling.
                     drive_f = 0.0
-                    brake_force = abs(self.powertrain.regen_force(cmd.brake_pct, speed))
-                    max_brake = self.dynamics.max_braking_force(speed)
-                    regen_f = -min(brake_force, max_brake)
+                    brake_force = self.dynamics.mechanical_brake_force(
+                        cmd.brake_pct, speed,
+                    )
+                    regen_f = -brake_force
                 else:  # COAST
                     drive_f = 0.0
                     regen_f = 0.0

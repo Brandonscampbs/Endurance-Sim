@@ -5,6 +5,16 @@ curvature by bisecting over speed and checking whether the four tires
 can collectively produce the required centripetal force.  Roll-induced
 camber changes are modelled so that degressive tire models and load
 transfer effects are captured accurately.
+
+At max cornering speed the car is locally at steady speed, but the
+drive tires still carry a non-zero longitudinal force to balance
+aerodynamic drag + rolling resistance.  That longitudinal demand
+consumes part of each drive tire's friction circle and reduces the
+available lateral grip via the friction ellipse.  Ignoring it (as
+an earlier version of this solver did when ``longitudinal_g=0``)
+produces over-optimistic apex speeds; no single grip_scale can
+simultaneously match straight-line top speed AND corner apex speeds
+against telemetry when the solver does not close this loop.
 """
 
 from __future__ import annotations
@@ -12,7 +22,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from fsae_sim.physics_constants import GRAVITY_M_S2
+from fsae_sim.physics_constants import AIR_DENSITY_KG_M3, GRAVITY_M_S2
 
 if TYPE_CHECKING:
     from fsae_sim.vehicle.load_transfer import LoadTransferModel
@@ -59,6 +69,10 @@ class CorneringSolver:
         static_camber_rear_rad: float,
         roll_camber_front: float,
         roll_camber_rear: float,
+        cd_a_m2: float = 0.0,
+        cl_a_m2: float = 0.0,
+        rolling_resistance: float = 0.0,
+        rear_wheel_drive: bool = True,
     ) -> None:
         self._tire = tire_model
         self._load_transfer = load_transfer
@@ -67,12 +81,39 @@ class CorneringSolver:
         self._static_camber_rear_rad = static_camber_rear_rad
         self._roll_camber_front = roll_camber_front
         self._roll_camber_rear = roll_camber_rear
+        # Used to compute the self-consistent drive-tire Fx demand at max
+        # cornering speed. Pass 0.0 for all three to fall back to the
+        # pre-close-the-loop pure-lateral solver (over-optimistic).
+        self._cd_a_m2 = float(cd_a_m2)
+        self._cl_a_m2 = float(cl_a_m2)
+        self._rolling_resistance = float(rolling_resistance)
+        self._rear_wheel_drive = bool(rear_wheel_drive)
+
+    def _longitudinal_g_at_speed(self, speed_ms: float) -> float:
+        """Return the self-consistent longitudinal acceleration (g) required
+        for the drive axle to hold ``speed_ms`` against drag + rolling.
+
+        At max cornering speed the car is locally at steady speed so the
+        drivetrain must produce exactly enough Fx to balance resistance.
+        That Fx is routed through the drive tires (rear-only on CT-16EV),
+        consuming part of their friction-circle and reducing available Fy.
+        """
+        v = max(abs(speed_ms), 0.0)
+        # Aero drag
+        drag_n = 0.5 * AIR_DENSITY_KG_M3 * self._cd_a_m2 * v * v
+        # Rolling resistance (scales with normal load = weight + downforce)
+        downforce_n = 0.5 * AIR_DENSITY_KG_M3 * self._cl_a_m2 * v * v
+        normal_n = self._mass_kg * self.GRAVITY + downforce_n
+        rolling_n = self._rolling_resistance * normal_n
+        f_demand_n = drag_n + rolling_n
+        mg = self._mass_kg * self.GRAVITY
+        return f_demand_n / mg if mg > 0.0 else 0.0
 
     def max_cornering_speed(
         self,
         curvature: float,
         mu_scale: float = 1.0,
-        longitudinal_g: float = 0.0,
+        longitudinal_g: float | None = None,
     ) -> float:
         """Find the maximum speed sustainable through a corner.
 
@@ -85,11 +126,18 @@ class CorneringSolver:
                 Only the magnitude matters; sign is ignored.
             mu_scale: Friction scaling factor.  1.0 = nominal grip,
                 < 1.0 = reduced grip (e.g. wet), > 1.0 = extra grip.
-            longitudinal_g: Simultaneous longitudinal acceleration in g-units.
-                Positive = accelerating, negative = braking.  Values with
-                ``|longitudinal_g| < 0.01`` are treated as zero (pure
-                cornering).  Non-zero values invoke the friction-ellipse
-                model, reducing available lateral capacity.
+            longitudinal_g: Optional override for the longitudinal
+                acceleration (g-units) to impose during the ellipse check.
+                When ``None`` (default), the solver computes the
+                self-consistent steady-cornering demand from aero drag and
+                rolling resistance at each candidate speed — that is, the
+                drive axle must produce the Fx that balances resistance at
+                max cornering speed. This is the physically correct default:
+                a car holding max apex speed is dragging air and its drive
+                tires cannot also deliver full lateral. Pass ``0.0``
+                explicitly to revert to the old "pure lateral" behavior
+                (over-optimistic); pass a non-zero value to model entry
+                braking or corner-exit acceleration.
 
         Returns:
             Maximum sustainable speed in m/s.  ``math.inf`` for straights.
@@ -110,7 +158,14 @@ class CorneringSolver:
             if (v_high - v_low) <= tol:
                 break
             v_mid = (v_low + v_high) / 2.0
-            if self._can_sustain(v_mid, abs_curvature, mu_scale, longitudinal_g):
+            # Self-consistent longitudinal_g at v_mid unless explicitly
+            # overridden by the caller.
+            long_g = (
+                longitudinal_g
+                if longitudinal_g is not None
+                else self._longitudinal_g_at_speed(v_mid)
+            )
+            if self._can_sustain(v_mid, abs_curvature, mu_scale, long_g):
                 v_low = v_mid
             else:
                 v_high = v_mid

@@ -275,15 +275,17 @@ class TestEffectiveInertia:
         """Verify m_effective calculation for CT-16EV.
 
         Uses TIRE_RADIUS_M = 0.2042 from PowertrainModel.
-        J_eff = 0.06 * 3.6363^2 * 0.92 + 4 * 0.3 = 1.930 kg*m^2
-        m_eff = 288 + 1.930 / 0.2042^2 = 288 + 46.28 = 334.28 kg
+        Inertia reflection is pure kinematics — no eta multiplier on rotor
+        inertia. Gearbox efficiency is a torque/power loss, not an inertia
+        reduction.
+            J_eff = 0.06 * 3.6363^2 + 4 * 0.3 = 0.793 + 1.2 = 1.993 kg·m^2
+            m_eff = 288 + 1.993 / 0.2042^2 = 288 + 47.79 = 335.79 kg
         """
         from fsae_sim.vehicle.powertrain_model import PowertrainModel
         dyn = VehicleDynamics(ct16ev_params, powertrain_config=ct16ev_powertrain)
         G = 3.6363
-        eta = 0.92
         r = PowertrainModel.TIRE_RADIUS_M
-        J_eff = 0.06 * G**2 * eta + 4 * 0.3
+        J_eff = 0.06 * G**2 + 4 * 0.3  # NOTE: no eta — pure kinematics
         expected = ct16ev_params.mass_kg + J_eff / r**2
         assert dyn.m_effective == pytest.approx(expected, rel=1e-4)
 
