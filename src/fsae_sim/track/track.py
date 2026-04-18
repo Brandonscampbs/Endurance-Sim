@@ -35,6 +35,16 @@ _SMOOTH_DISTANCE_M: float = 5.0
 # Minimum speed (m/s) for curvature computation to be valid.
 _V_MIN_FOR_CURVATURE_MS: float = 2.0
 
+# Position-based curvature: physical scale (m) of the pre-differentiation
+# smoothing window applied to GPS x,y path. 4 m retains hairpin peaks while
+# suppressing per-sample GPS noise (at ~0.75 m/sample this is ~5 samples).
+_POSITION_SMOOTH_M: float = 4.0
+
+# Meters per degree latitude (WGS-84 average near ±45° latitude). Good to
+# ~0.1% anywhere in the continental US; used for the equirectangular
+# projection when computing position-based curvature.
+_M_PER_DEG_LAT: float = 111_320.0
+
 # Start/finish detection gate tolerances (2D gate per S19).
 # Proximity radius to the reference start point (degrees; ~11 m at MI lat).
 # Chosen so all 21 Michigan laps cleanly trigger while still being far
@@ -43,6 +53,88 @@ _SF_GATE_RADIUS_DEG: float = 1.0e-4
 # Minimum physical distance between consecutive valid crossings (metres).
 # Prevents same-lap re-triggers when the gate passes through a slow section.
 _SF_MIN_LAP_DISTANCE_M: float = 400.0
+
+
+def _curvature_from_position(
+    lat_deg: np.ndarray,
+    lon_deg: np.ndarray,
+    dist_m: np.ndarray,
+    smooth_window_m: float = _POSITION_SMOOTH_M,
+) -> np.ndarray:
+    """Compute signed curvature κ(s) directly from the GPS path.
+
+    Uses the parametrization-invariant 2D curvature formula
+
+        κ = (x' y'' − y' x'') / (x'² + y'²)^(3/2)
+
+    where ``x = (lon − lon_ref) · cos(lat_ref) · 111 320`` and ``y = (lat −
+    lat_ref) · 111 320`` are local east/north coordinates in metres (flat-
+    earth equirectangular projection), and primes denote derivatives with
+    respect to sample index. The output is independent of the parametrization
+    chosen, so sample-index derivatives give the same geometric κ as
+    arc-length derivatives.
+
+    Sign convention: SAE / ``Segment.curvature`` style — positive = right
+    turn (CW when viewed from above, y-axis towards rear). Standard math
+    convention for the above formula is positive = CCW (left turn), so the
+    result is negated on return.
+
+    Parameters
+    ----------
+    lat_deg, lon_deg:
+        GPS latitude and longitude in degrees, one entry per sample.
+    dist_m:
+        Cumulative along-path distance in metres, one per sample. Used only
+        to size the smoothing window in physical units.
+    smooth_window_m:
+        Physical smoothing window in metres applied to (x, y) before taking
+        finite differences. Smaller windows preserve sharp corners at the
+        cost of GPS noise; larger windows are smoother but clip hairpins.
+
+    Returns
+    -------
+    np.ndarray
+        Signed curvature per sample, 1/m, length ``len(lat_deg)``.
+
+    Raises
+    ------
+    ValueError
+        If the input arrays have mismatched lengths or fewer than 3 samples.
+    """
+    if not (len(lat_deg) == len(lon_deg) == len(dist_m)):
+        raise ValueError("lat_deg, lon_deg, and dist_m must be the same length")
+    if len(lat_deg) < 3:
+        raise ValueError(f"need ≥3 samples for curvature, got {len(lat_deg)}")
+
+    ref_lat = float(np.nanmean(lat_deg))
+    ref_lon = float(np.nanmean(lon_deg))
+    cos_ref = math.cos(math.radians(ref_lat))
+    x = (lon_deg - ref_lon) * _M_PER_DEG_LAT * cos_ref  # east (m)
+    y = (lat_deg - ref_lat) * _M_PER_DEG_LAT           # north (m)
+
+    # Size the rolling-mean window in samples from the physical window and
+    # the median per-sample step along the path.
+    median_step_m = float(np.median(np.diff(dist_m))) if len(dist_m) > 1 else 1.0
+    median_step_m = max(median_step_m, 1e-3)
+    window = max(3, int(round(smooth_window_m / median_step_m)))
+    if window % 2 == 0:
+        window += 1
+
+    x_s = pd.Series(x).rolling(window=window, center=True, min_periods=1).mean().to_numpy()
+    y_s = pd.Series(y).rolling(window=window, center=True, min_periods=1).mean().to_numpy()
+
+    dx = np.gradient(x_s)
+    dy = np.gradient(y_s)
+    d2x = np.gradient(dx)
+    d2y = np.gradient(dy)
+
+    denom = (dx * dx + dy * dy) ** 1.5
+    # Guard against divide-by-zero at zero-velocity samples.
+    denom = np.where(denom < 1e-9, 1.0, denom)
+
+    kappa_math = (dx * d2y - dy * d2x) / denom
+    # Flip to SAE convention: positive = right turn (CW)
+    return -kappa_math
 
 
 @dataclass(frozen=True)
@@ -118,15 +210,21 @@ class Track:
            at least :data:`_SF_MIN_LAP_DISTANCE_M` since the previous
            crossing.  Laps that fail the minimum-distance gate are logged
            and dropped (S19).
-        4. Isolate a crossing-to-crossing interval where GPS LatAcc data
-           is available.
+        4. Isolate the first crossing-to-crossing interval with ≥99% valid
+           GPS lat/lon samples. LatAcc is no longer required.
         5. Bin that lap into ``bin_size_m``-metre windows (``math.ceil`` so
            the fractional tail segment is preserved, NF-20).
         6. Per bin:
 
-           - **curvature** = median(``GPS LatAcc`` × 9.81 / ``GPS Speed²``),
-             where speed is in m/s.  Sign encodes direction: positive =
-             right-hand turn, negative = left-hand turn.  At samples where
+           - **curvature** = median over bin of per-sample signed curvature
+             computed from the GPS lat/lon path by
+             :func:`_curvature_from_position`. This derives κ directly from
+             the second derivative of the smoothed x(s), y(s) track — the
+             actual 2D route the car drove. Sign encodes direction: positive
+             = right-hand turn (SAE convention), negative = left-hand turn.
+             (Prior implementation used ``GPS LatAcc × 9.81 / GPS Speed²``,
+             which silently returned zero when LatAcc was NaN and produced
+             a near-straight track for affected laps.)  At samples where
              ``v_ms <= V_MIN``, ``k_raw`` is recovered by interpolating from
              neighbouring high-speed samples (or GPS Radius if present)
              rather than forced to zero (NF-7).
@@ -230,10 +328,15 @@ class Track:
                 "need at least 2 to isolate a complete lap."
             )
 
-        # ---- 3. Isolate a complete lap with GPS LatAcc data -----------------
-        # Pick the first crossing-to-crossing interval that has GPS LatAcc
-        # data available (some cleaned datasets have NaN LatAcc early on).
-        lat_acc_col: np.ndarray = good["GPS LatAcc"].values
+        # ---- 3. Isolate a complete lap with valid GPS positions -------------
+        # Curvature is now computed directly from GPS lat/lon path geometry
+        # (see _curvature_from_position), so we no longer require valid
+        # GPS LatAcc. Pick the first crossing-to-crossing interval where at
+        # least 99% of samples have valid lat/lon. GPS positions are almost
+        # always available whenever GPS Speed > 5 km/h, which the ``good``
+        # filter already enforces, so this typically selects the first lap.
+        lat_col: np.ndarray = good["GPS Latitude"].values
+        lon_col: np.ndarray = good["GPS Longitude"].values
         lap_df: pd.DataFrame = pd.DataFrame()
         lap_start_dist: float = 0.0
 
@@ -241,83 +344,47 @@ class Track:
             _start_dist = sf_crossings[lap_index][2]
             _end_dist = sf_crossings[lap_index + 1][2]
             _mask = (cum_dist >= _start_dist) & (cum_dist <= _end_dist)
-            _lat_acc_in_lap = lat_acc_col[_mask]
-            # Require at least 80% of samples to have valid LatAcc
-            valid_frac = np.sum(~np.isnan(_lat_acc_in_lap)) / max(len(_lat_acc_in_lap), 1)
-            if valid_frac >= 0.8:
+            _lat_in_lap = lat_col[_mask]
+            _lon_in_lap = lon_col[_mask]
+            n = max(len(_lat_in_lap), 1)
+            valid_frac = float(
+                np.sum(np.isfinite(_lat_in_lap) & np.isfinite(_lon_in_lap)) / n
+            )
+            if valid_frac >= 0.99:
                 lap_start_dist = _start_dist
                 lap_df = good[_mask].reset_index(drop=True)
                 break
 
         if lap_df.empty:
             raise ValueError(
-                "No lap with sufficient GPS LatAcc data found. "
-                "Need at least 80% valid samples in one crossing-to-crossing interval."
+                "No lap with valid GPS positions found. "
+                "Need at least 99% valid lat/lon in one crossing-to-crossing interval."
             )
 
         # ---- 4. Normalise distance within lap ------------------------------
         dist_in_lap: np.ndarray = lap_df["Distance on GPS Speed"].values - lap_start_dist
 
         # ---- 5. Pre-compute per-sample curvature and grade -----------------
-        v_ms: np.ndarray = lap_df["GPS Speed"].values * (1_000.0 / 3_600.0)
-        a_lat_raw: np.ndarray = lap_df["GPS LatAcc"].values.copy()
-        # Fill any remaining NaN in LatAcc with 0 (straight assumption)
-        a_lat_raw = np.nan_to_num(a_lat_raw, nan=0.0)
-        a_lat_ms2: np.ndarray = a_lat_raw * 9.81
+        # Curvature comes from the GPS path geometry — the ACTUAL 2D route the
+        # car drove, computed as the second derivative of the smoothed x(s),
+        # y(s) projection. Previously this step inferred curvature from GPS
+        # LatAcc/v², which silently returned zero whenever LatAcc was NaN
+        # (early laps in some AiM exports), producing a near-straight track
+        # that wasn't the actual circuit. Using lat/lon directly avoids that
+        # entirely — GPS positions are valid whenever GPS Speed > 5 km/h.
+        lap_lat: np.ndarray = lap_df["GPS Latitude"].values.astype(float)
+        lap_lon: np.ndarray = lap_df["GPS Longitude"].values.astype(float)
+        k_raw: np.ndarray = _curvature_from_position(lap_lat, lap_lon, dist_in_lap)
+
+        # Safety: any residual NaN (e.g. NaN at a lat/lon input) gets zeroed.
+        k_raw = np.nan_to_num(k_raw, nan=0.0, posinf=0.0, neginf=0.0)
+
         if "GPS Slope" in lap_df.columns:
             slope_deg: np.ndarray = np.nan_to_num(
                 lap_df["GPS Slope"].values, nan=0.0,
             )
         else:
             slope_deg = np.zeros(len(lap_df))
-
-        # κ = a_lat / v²  (signed: positive = right turn, negative = left turn)
-        # NF-7: at samples where v_ms <= V_MIN, fall back to GPS Radius (signed
-        # by LatAcc direction) when present, or interpolate k_raw from
-        # neighbouring high-speed samples.  Do NOT force to zero.
-        valid_v = v_ms > _V_MIN_FOR_CURVATURE_MS
-        v_safe = np.where(valid_v, v_ms, np.nan)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            k_raw: np.ndarray = a_lat_ms2 / (v_safe ** 2)
-
-        low_speed = ~valid_v
-        if low_speed.any():
-            # First try GPS Radius if available.
-            filled_from_radius = np.zeros_like(low_speed)
-            if "GPS Radius" in lap_df.columns:
-                radius = lap_df["GPS Radius"].values.astype(float)
-                radius_ok = (
-                    low_speed
-                    & np.isfinite(radius)
-                    & (radius > 0.0)
-                    & (radius < _GPS_RADIUS_STRAIGHT)
-                )
-                if radius_ok.any():
-                    # Sign κ by the sign of LatAcc at the low-speed sample.
-                    sign = np.sign(a_lat_ms2[radius_ok])
-                    # If LatAcc is exactly 0, default positive sign.
-                    sign = np.where(sign == 0.0, 1.0, sign)
-                    k_raw[radius_ok] = sign / radius[radius_ok]
-                    filled_from_radius = radius_ok
-
-            # Remaining low-speed samples: interpolate from valid neighbours.
-            still_missing = low_speed & ~filled_from_radius & ~np.isfinite(k_raw)
-            if still_missing.any():
-                idx = np.arange(len(k_raw))
-                known = np.isfinite(k_raw) & ~still_missing
-                if known.any():
-                    k_raw[still_missing] = np.interp(
-                        idx[still_missing], idx[known], k_raw[known]
-                    )
-                else:
-                    # No high-speed anchor at all — fall back to zero, the
-                    # lap is effectively static and curvature is undefined.
-                    k_raw[still_missing] = 0.0
-
-        # Final safety: any residual NaN (e.g. leading edge with no anchor)
-        # gets zeroed so downstream code sees finite values.
-        k_raw = np.nan_to_num(k_raw, nan=0.0, posinf=0.0, neginf=0.0)
-
         grade_raw: np.ndarray = np.tan(slope_deg * (math.pi / 180.0))
 
         # ---- 6. Bin into segments (NF-20: ceil + fractional tail) ---------

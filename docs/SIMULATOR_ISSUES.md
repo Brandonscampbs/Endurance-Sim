@@ -14,6 +14,10 @@ Legend: `C*` critical, `S*` significant, `M*` moderate, `m*` minor, `NF-*` new-f
 
 ---
 
+## CLOSED
+
+- **Track curvature from IMU LatAcc** (FIXED 2026-04-17, commit pending) — `Track.from_telemetry` now computes signed curvature directly from GPS lat/lon path geometry via `_curvature_from_position` (second derivative of the smoothed x(s), y(s) projection). Previously used `GPS LatAcc × 9.81 / GPS Speed²`, which silently returned zero whenever LatAcc was NaN (the first 3-4 laps of Michigan 2025 had all-NaN LatAcc during IMU warm-up), producing a nearly-straight track with no corners and breaking every downstream sim. Sim speed-vs-telemetry traces went from anti-correlated to shape-aligned.
+
 ## PARTIAL
 
 - **3** `regen_force` generator-mode sign — S12 addressed; latent under CT-16EV (no regen commanded per commit 591d79e), hot for CT-17EV if regen is enabled.
