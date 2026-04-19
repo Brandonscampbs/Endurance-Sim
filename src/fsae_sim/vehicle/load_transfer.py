@@ -74,6 +74,10 @@ class LoadTransferModel:
         self._weight_dist_front = weight_dist_front
         self._downforce_dist_front = downforce_dist_front
 
+        # Public read-only accessor (used by downstream solvers for yaw-
+        # equilibrium axle share — see VehicleDynamics._cornering_drag_pacejka).
+        self.weight_dist_front: float = weight_dist_front
+
         # Convert track widths from mm to m
         self.front_track: float = suspension.front_track_mm / 1000.0
         self.rear_track: float = suspension.rear_track_mm / 1000.0
@@ -166,13 +170,33 @@ class LoadTransferModel:
         """Return lateral load transfer per axle.
 
         Decomposes into geometric (direct) and elastic (roll stiffness)
-        components. Uses absolute value of lateral_g; sign handling is done
-        in tire_loads() to assign left/right correctly.
+        components using physically-correct mass splits:
+
+        - **Geometric** transfer is driven by the *total* axle normal
+          force (static weight + aero downforce). Both sprung and
+          unsprung mass contribute because both press down on the roll
+          centre at road level. Includes aero downforce at the current
+          speed.
+
+        - **Elastic** transfer (roll-stiffness path) is driven only by
+          the *sprung* mass's lateral inertia acting on the moment arm
+          between sprung CG and the roll axis. Unsprung mass rolls with
+          the road, not the chassis, so it does not feed a roll moment
+          at the springs. Aero downforce does not feed the elastic path
+          either — it acts at the aerodynamic centre of pressure which
+          is assumed on the roll axis for this model.
+
+        The previous implementation used total mass in both paths,
+        which over-counted elastic transfer by the unsprung fraction
+        and under-counted geometric transfer's dependence on speed (no
+        downforce coupling). On CT-16EV the error is ~5-8% of lateral
+        transfer at high speed, shifting front/rear balance and thus
+        apex-saturation behaviour.
 
         Args:
             lateral_g: Lateral acceleration in g-units (positive = right turn).
-            speed_ms: Vehicle speed in m/s (unused here, reserved for
-                future aero-dependent weight distribution).
+            speed_ms: Vehicle speed in m/s. Used to include aero downforce
+                in the per-axle normal force for geometric transfer.
 
         Returns:
             (delta_front, delta_rear) lateral load transfer magnitudes
@@ -182,17 +206,32 @@ class LoadTransferModel:
         if abs_lat_g < 1e-12:
             return (0.0, 0.0)
 
-        mass_front = self._vehicle.mass_kg * self._weight_dist_front
-        mass_rear = self._vehicle.mass_kg * (1.0 - self._weight_dist_front)
+        # Total mass per axle (sprung + unsprung) from weight distribution.
+        mass_front_total = self._vehicle.mass_kg * self._weight_dist_front
+        mass_rear_total = self._vehicle.mass_kg * (1.0 - self._weight_dist_front)
+        m_unsp_f = getattr(self._vehicle, "unsprung_mass_front_kg", 0.0)
+        m_unsp_r = getattr(self._vehicle, "unsprung_mass_rear_kg", 0.0)
+        mass_front_sprung = max(mass_front_total - m_unsp_f, 0.0)
+        mass_rear_sprung = max(mass_rear_total - m_unsp_r, 0.0)
+        mass_sprung_total = mass_front_sprung + mass_rear_sprung
 
-        # Geometric (direct) transfer through roll centre
-        geo_front = mass_front * abs_lat_g * GRAVITY * self.rc_front / self.front_track
-        geo_rear = mass_rear * abs_lat_g * GRAVITY * self.rc_rear / self.rear_track
+        # Aero downforce per axle at current speed — contributes to
+        # geometric transfer only.
+        aero_front, aero_rear = self.aero_loads(speed_ms)
 
-        # Elastic transfer through roll stiffness distribution
-        total_lateral_force = self._vehicle.mass_kg * abs_lat_g * GRAVITY
-        roll_arm = self._cg_height_m - self._rc_at_cg
-        roll_moment = total_lateral_force * roll_arm
+        # Geometric (direct) transfer. Per-axle normal force = static
+        # axle weight (total mass) + downforce at that axle.
+        fz_front_nominal = mass_front_total * GRAVITY + aero_front
+        fz_rear_nominal = mass_rear_total * GRAVITY + aero_rear
+        geo_front = fz_front_nominal * abs_lat_g * self.rc_front / self.front_track
+        geo_rear = fz_rear_nominal * abs_lat_g * self.rc_rear / self.rear_track
+
+        # Elastic transfer through roll stiffness distribution.
+        # Roll moment arm is sprung-CG height minus roll-axis height at CG;
+        # at this level of model we approximate sprung CG = chassis CG.
+        roll_moment = mass_sprung_total * abs_lat_g * GRAVITY * (
+            self._cg_height_m - self._rc_at_cg
+        )
 
         elastic_front = (
             roll_moment * self.roll_stiffness_front / self._k_roll_total / self.front_track

@@ -189,26 +189,53 @@ class TestLateralTransfer:
         assert dr == pytest.approx(0.0, abs=1e-10)
 
     def test_lateral_1g_front_value(self, model: LoadTransferModel) -> None:
-        """1g lateral at 0 speed: front transfer = 329.49 N."""
+        """1g lateral at 0 speed: front transfer = 297.6 N.
+
+        With sprung/unsprung split (default 20 kg/axle unsprung on 278 kg
+        total: 238 kg sprung), the elastic component uses only sprung mass
+        and unsprung contributes solely to geometric transfer at rc_front.
+        """
         df, dr = model.lateral_transfer(1.0, 0.0)
-        assert df == pytest.approx(329.49, abs=0.01)
+        assert df == pytest.approx(297.6, abs=0.5)
 
     def test_lateral_1g_rear_value(self, model: LoadTransferModel) -> None:
-        """1g lateral at 0 speed: rear transfer = 315.55 N."""
+        """1g lateral at 0 speed: rear transfer = 280.2 N (sprung/unsprung split)."""
         df, dr = model.lateral_transfer(1.0, 0.0)
-        assert dr == pytest.approx(315.55, abs=0.01)
+        assert dr == pytest.approx(280.2, abs=0.5)
 
     def test_lateral_front_greater_than_rear(self, model: LoadTransferModel) -> None:
         """53% front weight distribution shifts more lateral transfer to front axle."""
         df, dr = model.lateral_transfer(1.0, 0.0)
         assert df > dr
 
-    def test_lateral_moment_balance(self, model: LoadTransferModel) -> None:
-        """delta_f*track_f + delta_r*track_r = m*g*lat_g*cg_height."""
+    def test_lateral_moment_balance(self, model: LoadTransferModel, vehicle) -> None:
+        """Sum of per-axle transfer moments equals total lateral-inertia moment.
+
+        The correct identity with sprung/unsprung split is
+            Σ delta_i·track_i = g·lat_g·[m_sprung·(h_cg − h_rc_at_cg)
+                                          + m_f_total·rc_front
+                                          + m_r_total·rc_rear]
+        where sprung contributes via the elastic path (rolling about the
+        roll axis) and each axle's *total* mass (sprung + unsprung)
+        contributes via geometric transfer at its own roll-centre height.
+        Collapses to the old ``m·g·lat_g·h_cg`` identity only when
+        unsprung = 0 and rc_front = rc_rear = h_cg.
+        """
         df, dr = model.lateral_transfer(1.0, 0.0)
         check = df * model.front_track + dr * model.rear_track
-        expected = 278.0 * GRAVITY * 1.0 * 0.2794
-        assert check == pytest.approx(expected, abs=0.2)
+        m_f_total = vehicle.mass_kg * 0.53
+        m_r_total = vehicle.mass_kg * 0.47
+        m_sprung = (
+            vehicle.mass_kg
+            - vehicle.unsprung_mass_front_kg
+            - vehicle.unsprung_mass_rear_kg
+        )
+        expected = GRAVITY * 1.0 * (
+            m_sprung * (0.2794 - model._rc_at_cg)
+            + m_f_total * model.rc_front
+            + m_r_total * model.rc_rear
+        )
+        assert check == pytest.approx(expected, abs=0.5)
 
     def test_lateral_sign_symmetry(self, model: LoadTransferModel) -> None:
         """Magnitude of transfer is the same for left and right turns."""

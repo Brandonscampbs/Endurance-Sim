@@ -256,69 +256,113 @@ class VehicleDynamics:
     def _cornering_drag_pacejka(
         self, speed_ms: float, curvature: float, f_lat_total: float,
     ) -> float:
-        """Cornering drag from per-tire Pacejka slip angles.
+        """Cornering drag from per-axle common-slip-angle Pacejka solve.
 
-        For each wheel:
-            1. Query the load-transfer model for the tire normal load at
-               the current lateral demand ``a_lat_g`` and zero
-               longitudinal demand.
-            2. Distribute the required lateral force across the four
-               tires proportional to normal load (simple steady-state
-               share; combined-slip is handled separately).
-            3. Solve for the slip angle that produces the per-tire
-               lateral-force share.
-            4. Project the resulting lateral force onto the velocity
-               direction:  drag = |Fy| * sin(alpha).
+        Physics (steady-state cornering):
 
-        The per-tire slip angle is scaled by
-        ``1.0 / cornering_stiffness_scale`` to model the gap between
-        TTC lab stiffness and real-world on-car stiffness.  When
-        ``cornering_stiffness_scale == 1.0`` the stock Pacejka result is
-        returned unchanged.  This is the physics-faithful location for
-        that calibration: it changes the operating point of every tire,
-        every corner, rather than multiplying the final drag by a
-        constant.  No power-law or scalar fudge factor exists anywhere
-        in the path.
+        1. Yaw equilibrium distributes ``f_lat_total`` between axles by
+           lever-arm balance:
+
+               F_front · a = F_rear · b      (a, b = CG-to-axle distances)
+           =>  F_front / F_total = b / wheelbase = weight_dist_front.
+
+        2. Both tires on an axle share a common slip angle (to leading
+           order — a rigid steering rack imposes equal ``α`` front-left
+           and front-right for pure yaw input). So per axle we solve for
+           the ``α`` such that
+
+               Fy(α, Fz_outer) + Fy(α, Fz_inner) = F_lat_axle
+
+           with the load-transfer model giving ``Fz_outer`` / ``Fz_inner``.
+
+        3. Each tire's drag contribution is ``|Fy_i| · sin(α)``; sum all
+           four for total cornering drag.
+
+        The common-slip solve replaces the old "distribute F_lat in
+        proportion to normal load" heuristic, which produced near-zero
+        drag from the lightly-loaded inside tire (because it was asked
+        for its proportional share of a sub-peak demand) and therefore
+        under-counted drag in high-lat-g corners. With this solver the
+        inside tire is at the same α as the outside, contributes
+        correctly to drag, and the total matches the yaw-equilibrium
+        constraint exactly.
+
+        ``cornering_stiffness_scale`` still rescales α to model TTC-vs-
+        on-car cornering stiffness — applied after the solve so the ratio
+        is independent of the load-transfer loop.
         """
         if f_lat_total < 1.0:
             return 0.0
 
-        # Lateral acceleration for load transfer
         a_lat_g = speed_ms ** 2 * abs(curvature) / GRAVITY_M_S2
 
-        # Per-tire normal loads under cornering
         fl, fr, rl, rr = self.load_transfer.tire_loads(
             speed_ms, a_lat_g, 0.0,
         )
-        loads = [fl, fr, rl, rr]
-        total_load = sum(loads)
-        if total_load < 1.0:
-            return 0.0
 
-        # Stiffness-scale factor (<= 1 means tire needs more slip than TTC)
+        # Yaw equilibrium: front axle carries weight_dist_front of the
+        # total lateral force (larger share on the axle closer to the CG).
+        wdf_attr = getattr(self.load_transfer, "weight_dist_front", None)
+        wdf = float(wdf_attr) if isinstance(wdf_attr, (int, float)) else 0.47
+        f_lat_front = f_lat_total * wdf
+        f_lat_rear = f_lat_total * (1.0 - wdf)
+
         scale = self.cornering_stiffness_scale
         if scale <= 0.0:
             scale = 1.0
         alpha_scale = 1.0 / scale
 
         total_drag = 0.0
-        for fz in loads:
-            if fz < 1.0:
+        for f_lat_axle, fz_a, fz_b in (
+            (f_lat_front, fl, fr),
+            (f_lat_rear, rl, rr),
+        ):
+            if fz_a + fz_b < 1.0:
                 continue
-            # This tire's share of lateral force, proportional to load
-            f_lat_tire = f_lat_total * (fz / total_load)
-            # Find the slip angle that produces this lateral force in
-            # the TTC-calibrated Pacejka model.
-            alpha_ttc = self._find_slip_angle(f_lat_tire, fz)
-            # Real-world effective slip angle: lower stiffness => more
-            # slip to produce the same lateral force.
+            alpha_ttc = self._find_common_slip_angle(f_lat_axle, fz_a, fz_b)
             alpha_eff = min(alpha_ttc * alpha_scale, math.pi / 2.0)
-            # Drag component: lateral force projected onto velocity direction.
-            # Fy magnitude is preserved — only the operating slip angle
-            # grows — so the extra cornering drag comes from sin(alpha).
-            total_drag += f_lat_tire * math.sin(alpha_eff)
+            fy_a = abs(self.tire_model.lateral_force(alpha_ttc, fz_a))
+            fy_b = abs(self.tire_model.lateral_force(alpha_ttc, fz_b))
+            total_drag += (fy_a + fy_b) * math.sin(alpha_eff)
 
         return total_drag
+
+    def _find_common_slip_angle(
+        self, f_lat_axle: float, fz_a: float, fz_b: float,
+    ) -> float:
+        """Find α such that |Fy(α, Fz_a)| + |Fy(α, Fz_b)| = f_lat_axle.
+
+        Monotone in α up to the combined axle peak; robust bracketing
+        handles the Pacejka horizontal-shift edge case (Fy(0) > 0 due to
+        Sh) and the post-peak saturation case (f_lat > combined peak).
+        """
+        if f_lat_axle < 1.0 or fz_a + fz_b < 1.0:
+            return 0.0
+
+        def axle_fy(alpha: float) -> float:
+            return (
+                abs(self.tire_model.lateral_force(alpha, fz_a))
+                + abs(self.tire_model.lateral_force(alpha, fz_b))
+            )
+
+        # If even at α=0 the tires already exceed demand (Pacejka horizontal
+        # shift + load-asymmetric summing), we're demand-satisfied at 0 slip.
+        if axle_fy(0.0) >= f_lat_axle:
+            return 0.0
+
+        # Upper bracket: Pacejka Fy peaks around 8-12° for FSAE loads. Use
+        # 45° as a safe upper bound. If combined Fy at 45° is still below
+        # demand (saturated tire or post-peak droop), return that α.
+        alpha_hi = math.radians(45.0)
+        if axle_fy(alpha_hi) <= f_lat_axle:
+            return alpha_hi
+
+        return brentq(
+            lambda a: axle_fy(a) - f_lat_axle,
+            0.0,
+            alpha_hi,
+            xtol=1e-4,
+        )
 
     # Constant mechanical parasitic drag (N): drivetrain bearings, chain
     # friction, brake pad drag, motor cogging/windage.  Back-derived from

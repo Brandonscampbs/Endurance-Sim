@@ -387,6 +387,7 @@ class TestCorneringDragPacejka:
         total_weight = ct16ev_params.mass_kg * 9.81
         per_tire = total_weight / 4.0
         lt.tire_loads.return_value = (per_tire, per_tire, per_tire, per_tire)
+        lt.weight_dist_front = 0.47  # used by cornering-drag axle-share split
         return lt
 
     @pytest.fixture
@@ -429,6 +430,7 @@ class TestCorneringDragPacejka:
         tire.peak_lateral_force.side_effect = lambda fz, camber=0.0: 100.0
         lt = MagicMock()
         lt.tire_loads.return_value = (200, 200, 200, 200)
+        lt.weight_dist_front = 0.47
         dyn = VehicleDynamics(ct16ev_params, tire_model=tire, load_transfer=lt)
         drag = dyn.cornering_drag(15.0, 0.10)  # high speed, tight corner
         assert drag > 0.0

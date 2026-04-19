@@ -26,6 +26,15 @@ class VehicleParams:
     # FSAE-typical max; override in configs/ct16ev.yaml when the DSS Brake
     # System sheet provides a measured value.
     brake_max_pressure_bar: float = 60.0
+    # Unsprung mass per axle (kg). Hub + upright + rotor + caliper +
+    # half-control-arms + half-driveshaft + wheel + tire. Defaults are
+    # FSAE-typical (~14% of total mass split evenly); override when
+    # measured. Used by LoadTransferModel to split geometric vs elastic
+    # lateral transfer — unsprung mass does not contribute to the roll
+    # moment (it's below/at the roll centre) but does contribute to the
+    # per-axle normal force that drives geometric transfer.
+    unsprung_mass_front_kg: float = 20.0
+    unsprung_mass_rear_kg: float = 20.0
 
 
 @dataclass(frozen=True)
