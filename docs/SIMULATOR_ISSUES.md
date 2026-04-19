@@ -16,7 +16,54 @@ Legend: `C*` critical, `S*` significant, `M*` moderate, `m*` minor, `NF-*` new-f
 
 ## CLOSED
 
-- **Track curvature from IMU LatAcc** (FIXED 2026-04-17, commit pending) — `Track.from_telemetry` now computes signed curvature directly from GPS lat/lon path geometry via `_curvature_from_position` (second derivative of the smoothed x(s), y(s) projection). Previously used `GPS LatAcc × 9.81 / GPS Speed²`, which silently returned zero whenever LatAcc was NaN (the first 3-4 laps of Michigan 2025 had all-NaN LatAcc during IMU warm-up), producing a nearly-straight track with no corners and breaking every downstream sim. Sim speed-vs-telemetry traces went from anti-correlated to shape-aligned.
+Full-audit pass against Michigan lap 16. With these fixes the legacy
+backend now matches telemetry at ``grip_scale=0.65`` on **both** lap
+time (70.92 s sim vs 71.05 s telem) **and** mean bias (+0.01 m/s) —
+previously no single grip_scale could match both, which was the
+smoking gun for missing physics.
+
+- **Track curvature from IMU LatAcc** (2026-04-17) — `Track.from_telemetry`
+  now computes signed curvature directly from GPS lat/lon path geometry
+  via `_curvature_from_position` (second derivative of the smoothed
+  x(s), y(s) projection). Previously used `GPS LatAcc × 9.81 / GPS
+  Speed²`, which silently returned zero whenever LatAcc was NaN (the
+  first 3-4 laps of Michigan 2025 had all-NaN LatAcc during IMU
+  warm-up), producing a nearly-straight track with no corners.
+- **Cornering solver pure-lateral default** (2026-04-19) — `CorneringSolver.max_cornering_speed`
+  now closes the drag loop: at each candidate speed the drive-tire Fx
+  demand is computed from aero drag + rolling resistance, and the
+  friction-ellipse reduction is applied to the rear tires via the
+  existing `_can_sustain` path.
+- **Mechanical brake force via motor-torque cap** (2026-04-19) —
+  `engine.py` now routes brake commands through
+  `dynamics.mechanical_brake_force`, which caps at the tire limit (~4-5 kN,
+  ~1.5-2g). Previously used `powertrain.regen_force`, capping at motor
+  torque capability (~1.5 kN, ~0.55g) — wrong for CT-16EV's mechanical-
+  only brakes.
+- **ReplayStrategy brake_pct percentile normalization** (2026-04-19) —
+  `from_aim_data` / `from_full_endurance` now normalize by physical
+  `brake_max_pressure_bar=60`, not by 99th-percentile of observed
+  pressure. Previously 8.5 bar peak on a 60-bar system became
+  `brake_pct=1.0`, inflating replay brake demand 7×.
+- **`m_effective` spurious gearbox-efficiency multiplier** (2026-04-19) —
+  `VehicleDynamics.m_effective` now uses `J_reflected = J_rotor · G²`
+  (pure kinematics). Previously multiplied by `η_gearbox` which silently
+  made sim ~0.4% fast in acceleration.
+- **Cornering drag Fy-proportional-to-Fz distribution** (2026-04-19) —
+  `_cornering_drag_pacejka` now uses yaw-equilibrium axle share and
+  per-axle common-slip-angle solve. Previously distributed lateral force
+  proportional to each tire's Fz and solved per-tire, which under-
+  counted drag from lightly-loaded inside tires.
+- **Lateral load transfer total-mass + no-aero** (2026-04-19) —
+  `LoadTransferModel.lateral_transfer` now uses sprung mass only for the
+  elastic (roll-stiffness) path and includes aero downforce in the
+  per-axle Fz that drives the geometric path. Adds
+  `unsprung_mass_front_kg`/`unsprung_mass_rear_kg` to `VehicleParams`.
+- **Segment resistance evaluated at entry speed only** (2026-04-19) —
+  `engine.py` now evaluates `total_resistance` at the segment mid-point
+  speed via one Picard iteration. Previously held entry-speed resistance
+  constant across the segment, under-counting drag by up to 2× on
+  accelerating straights where v can double.
 
 ## PARTIAL
 

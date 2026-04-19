@@ -364,8 +364,26 @@ class SimulationEngine:
                     drive_f = 0.0
                     regen_f = 0.0
 
-                # 4. Resistive forces
-                resist_f = self.dynamics.total_resistance(speed, segment.grade, segment.curvature)
+                # 4. Resistive forces — evaluate at the segment MID-POINT
+                # speed, not the entry speed, so that on accelerating
+                # straights we don't under-count drag (which scales as v²
+                # and nearly doubles between 20 → 30 m/s over a single
+                # straight). One Picard iteration: predict exit speed from
+                # entry-speed resistance, then re-evaluate resistance at
+                # the mid-point of the bracketed interval and re-solve.
+                # Converges in one step because drag is a smooth function
+                # of v; a second pass would change v_exit by <1 cm/s.
+                resist_f = self.dynamics.total_resistance(
+                    speed, segment.grade, segment.curvature,
+                )
+                net_force = drive_f + regen_f - resist_f
+                exit_speed_est, _ = self.dynamics.resolve_exit_speed(
+                    speed, segment.length_m, net_force, corner_limit,
+                )
+                v_mid = 0.5 * (speed + exit_speed_est)
+                resist_f = self.dynamics.total_resistance(
+                    v_mid, segment.grade, segment.curvature,
+                )
 
                 # 5. Net force and speed resolution
                 net_force = drive_f + regen_f - resist_f

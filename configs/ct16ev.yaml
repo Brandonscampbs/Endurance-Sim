@@ -68,14 +68,20 @@ tire:
   static_camber_front_deg: -1.25
   static_camber_rear_deg: -1.25
   # TTC-to-car grip calibration against Michigan 2025 endurance lap 16.
-  # Re-calibrated 2026-04-17 after Track.from_telemetry was fixed to compute
-  # curvature from GPS lat/lon path (previously used IMU LatAcc which was
-  # NaN on early laps, producing a nearly-straight track and forcing a
-  # far-too-low grip_scale to compensate). With the corrected track:
-  #   legacy backend       matches lap time at grip_scale ≈ 0.80 (71.27 s vs 71.05 s)
-  #   dynamics6dof backend matches lap time at grip_scale ≈ 0.60 (71.65 s vs 71.05 s)
-  # Default to the legacy tuning (engine default backend).
-  grip_scale: 0.80
+  # After the full physics audit (2026-04-19) — track curvature from GPS
+  # lat/lon, cornering solver closing the drag loop, brake routing through
+  # mechanical_brake_force, ReplayStrategy brake normalization, m_effective
+  # sans spurious eta, cornering drag via common-axle-slip-angle solve,
+  # lateral transfer with sprung/unsprung split + aero in geometric path,
+  # and mid-segment drag evaluation — the legacy backend matches telemetry
+  # at grip_scale=0.65 on BOTH straight-line speed AND corner apex speed
+  # simultaneously:
+  #     lap time:  70.92 s sim vs 71.05 s telem  (0.2% low)
+  #     mean bias: +0.01 m/s (zero)
+  #     RMS:       2.85 m/s (residual driver-model noise on replay)
+  # Earlier values of 0.47 (pre-track-fix) and 0.80 (pre-audit) were
+  # calibrated against broken physics and do not reflect real grip.
+  grip_scale: 0.65
 
 suspension:
   roll_stiffness_front_nm_per_deg: 238.0
