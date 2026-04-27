@@ -319,22 +319,24 @@ class SimulationEngine:
                     drive_f = min(drive_f, self.dynamics.max_traction_force(speed))
                     regen_f = 0.0
                 elif cmd.action == ControlAction.BRAKE:
-                    # CT-16EV uses MECHANICAL brakes only — brake pedal
-                    # drives hydraulic pressure to the friction pads.
-                    # We use ``powertrain.regen_force`` here ONLY as a
-                    # convenient brake-pedal → decel-force mapping
-                    # (which happens to match real brake-system design:
-                    # peak brake force sized similar to peak motor
-                    # torque).  The force is applied as a DECELERATION
-                    # only; the electrical side is intentionally
-                    # disabled via motor_torque = 0 below, so no
-                    # phantom regen accumulates.  Regen is reserved
-                    # for strategies that command negative motor
-                    # torque explicitly (2025 telemetry never does).
+                    # CT-16EV mechanical brakes: hydraulic pressure on
+                    # friction pads, sized to lock all four wheels at
+                    # peak — i.e., the only physical limit is tire-grip,
+                    # not pad capacity. Use ``mechanical_brake_force``
+                    # which scales the (per-speed) tire-limited maximum
+                    # by ``brake_pct``. The previous implementation used
+                    # ``powertrain.regen_force`` as a proxy and silently
+                    # capped braking at motor torque — about 0.5 g at
+                    # racing speeds, vs the ~1 g real drivers pull on
+                    # mechanical pads. That under-braking forced the
+                    # forward-backward speed envelope to start
+                    # decelerating ~13 m earlier than the real driver,
+                    # producing a 15 km/h sim-slow band before every
+                    # tight corner.
                     drive_f = 0.0
-                    brake_force = abs(self.powertrain.regen_force(cmd.brake_pct, speed))
-                    max_brake = self.dynamics.max_braking_force(speed)
-                    regen_f = -min(brake_force, max_brake)
+                    regen_f = -self.dynamics.mechanical_brake_force(
+                        cmd.brake_pct, speed,
+                    )
                 else:  # COAST
                     drive_f = 0.0
                     regen_f = 0.0
@@ -390,6 +392,53 @@ class SimulationEngine:
                     motor_torque = 0.0
                 else:
                     motor_torque = 0.0
+
+                # Energy-honest clamp: if the corner-speed envelope (or
+                # zone cap) clipped exit_speed below what net_force
+                # would have produced, the motor cannot actually have
+                # delivered the commanded torque — a real driver lifts
+                # off-throttle when speed maxes out at the corner
+                # limit, otherwise grip saturates as longitudinal slip.
+                # Without this back-correction, drive_force × distance
+                # produces kinetic energy that the clamp silently
+                # erases, yet electrical_power is computed from the
+                # over-commanded motor_torque — inflating the energy
+                # budget by ~15% on tracks with many corner-limited
+                # segments. We back out the actual delivered torque
+                # from the realized acceleration: a_actual = (v_exit^2
+                # - v_entry^2) / (2L); F_drive_actual = m * a_actual
+                # + resist_f; T_motor_actual = wheel_force /
+                # (gear_ratio * tire_radius * gearbox_eff). Clamped
+                # to [0, motor_torque] so the correction can only
+                # *reduce* commanded torque, never amplify it.
+                if (
+                    cmd.action == ControlAction.THROTTLE
+                    and motor_torque > 0.0
+                    and segment.length_m > 0.0
+                ):
+                    a_actual = (
+                        exit_speed * exit_speed - speed * speed
+                    ) / (2.0 * segment.length_m)
+                    f_drive_actual = self.dynamics.m_effective * a_actual + resist_f
+                    if f_drive_actual < 0.0:
+                        # Net deceleration despite throttle — physical
+                        # cap means motor torque drops to zero and the
+                        # remaining decel comes from tire/grip drag.
+                        motor_torque = 0.0
+                        drive_f = 0.0
+                    else:
+                        gear = self.powertrain.config.gear_ratio
+                        radius = self.powertrain.TIRE_RADIUS_M
+                        eta_gb = self.powertrain._GEARBOX_EFFICIENCY
+                        denom = gear * eta_gb / radius
+                        if denom > 0.0:
+                            motor_torque_required = f_drive_actual / denom
+                            if motor_torque_required < motor_torque:
+                                motor_torque = motor_torque_required
+                                # Logged drive_f stays consistent with the
+                                # delivered motor_torque for downstream
+                                # mechanical-work bookkeeping.
+                                drive_f = self.powertrain.wheel_force(motor_torque)
 
                 # 7. Electrical power and pack current.
                 #

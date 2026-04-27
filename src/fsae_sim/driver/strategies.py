@@ -133,12 +133,36 @@ class ReplayStrategy(DriverStrategy):
         Filters out stopped periods (driver change, stalls) to produce
         a clean distance-indexed driving profile.  Indexes by cumulative
         distance rather than wrapping per-lap.
+
+        Distance alignment: the AiM "Distance on GPS Speed" channel
+        accumulates from the first moving sample of the recording, so
+        lap 1 may start at a non-zero global distance (warm-up / pit-out
+        precedes the start/finish gate). Sim cumulative distance starts
+        at 0 at the start/finish line. We trim the recording to begin at
+        the first detected start/finish crossing (lap 1 entry) and
+        re-zero distances so sim and replay share the same origin.
+        Without this trim, sim distance 200 m maps to pit-out throttle,
+        not lap-1 driver inputs.
         """
+        # Trim to lap 1 start so the distance origin matches the sim's.
+        try:
+            from fsae_sim.analysis.validation import detect_lap_boundaries
+            laps = detect_lap_boundaries(aim_df)
+        except Exception:
+            laps = []
+        if laps:
+            start_row = laps[0][0]
+            aim_df = aim_df.iloc[start_row:].copy()
+
         # Filter to moving samples to cut driver change and stopped periods
         moving = aim_df["GPS Speed"].values > min_speed_kmh
         clean = aim_df[moving].copy()
 
         dist = clean["Distance on GPS Speed"].values.copy()
+        # Re-zero so sim distance 0 corresponds to the first telem sample
+        # we are now using (lap 1 start).
+        if len(dist):
+            dist = dist - dist[0]
         throttle = np.clip(clean["Throttle Pos"].values / 100.0, 0.0, 1.0)
 
         brake_raw = np.maximum(

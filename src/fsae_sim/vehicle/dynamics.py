@@ -314,9 +314,16 @@ class VehicleDynamics:
         return total_drag
 
     # Constant mechanical parasitic drag (N): drivetrain bearings, chain
-    # friction, brake pad drag, motor cogging/windage.  Back-derived from
-    # direction-averaged straight-line coasting telemetry at Michigan 2025.
-    _PARASITIC_DRAG_N: float = 70.0
+    # friction, brake pad drag, motor cogging/windage. Re-derived from
+    # 318 clean coast samples (no throttle, no brake, |lat_g|<0.05) in the
+    # Michigan 2025 endurance recording: median 19 N (sign-flipped), mean
+    # 31 N, p25-p75 spread ±90 N. The previous 70 N was an over-estimate
+    # absorbing other physics gaps (track curvature smoothing, grip scale)
+    # that have since been re-derived independently. 30 N is the conservative
+    # mean — picks up bearing+chain+seal drag without compensating for
+    # downstream model errors.
+    # See scripts/calibrate_physics.py.
+    _PARASITIC_DRAG_N: float = 30.0
 
     def parasitic_drag(self) -> float:
         """Mechanical parasitic drag (N) from drivetrain and bearings."""
@@ -416,23 +423,49 @@ class VehicleDynamics:
             long_g = long_g_new
         return f_drive
 
+    # Maximum effective braking deceleration (g) at brake_pct=1.0.
+    # This is the peak deceleration the brake system actually produces
+    # at full driver effort, NOT the tire-grip ceiling. Calibrated from
+    # the 1st-percentile of GPS LonAcc on Michigan 2025 endurance: real
+    # peak |decel| was 0.536 g across the entire run. Tire-grip ceiling
+    # for this car is ~1.3 g; the gap (0.54 g actual vs 1.3 g possible)
+    # reflects driver discipline, brake-bias setup, and pad/master-
+    # cylinder sizing — the brake hardware does not push pads hard
+    # enough at full pedal to lock all four wheels. Using tire-grip as
+    # the cap caused the sim to over-brake by 2.4× wherever brake_pct
+    # was non-zero, dragging speeds 20+ km/h below telemetry through
+    # corner-entry zones.
+    _MAX_BRAKE_DECEL_G: float = 0.55
+
     def mechanical_brake_force(
         self, brake_pct: float, speed_ms: float,
     ) -> float:
-        """Friction-brake deceleration force (N), tire-limit capped.
+        """Friction-brake deceleration force (N), brake-system capped.
 
         CT-16EV has no regen — the driver's brake pedal drives hydraulic
         pressure to the friction pads; energy dissipates as heat at the
-        pads, with zero electrical consequence.  This is the path to
-        use for brake commands.  Returns a positive number; the caller
-        subtracts it from net_force (it opposes motion).
+        pads, with zero electrical consequence.  Returns a positive
+        number; the caller subtracts it from net_force.
+
+        Force = brake_pct * (peak observed brake decel * mass), bounded
+        above by the tire-grip ceiling (rare but a safety net for very
+        high downforce regimes where downforce raises tire grip well
+        beyond the brake hardware's effective output).
 
         Args:
             brake_pct: Brake pedal fraction in [0, 1].
             speed_ms: Instantaneous vehicle speed (m/s).
         """
         brake_pct = max(0.0, min(1.0, brake_pct))
-        return brake_pct * self.max_braking_force(speed_ms)
+        peak_brake_force_n = (
+            self._MAX_BRAKE_DECEL_G * GRAVITY_M_S2 * self.vehicle.mass_kg
+        )
+        # Tire grip is the absolute physical ceiling — never let the
+        # commanded brake force exceed what the tires can transmit.
+        # Under the calibrated peak decel of 0.55 g this almost never
+        # binds, but it's the right invariant.
+        tire_ceiling = self.max_braking_force(speed_ms)
+        return brake_pct * min(peak_brake_force_n, tire_ceiling)
 
     def max_braking_force(self, speed_ms: float) -> float:
         """Maximum braking force (N) from all four tires.

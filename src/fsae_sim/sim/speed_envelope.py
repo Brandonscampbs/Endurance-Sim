@@ -68,11 +68,20 @@ class SpeedEnvelope:
         for i in range(n - 2, -1, -1):
             v = v_back[i + 1]
             seg = segments[i]
-            # Max braking force at the speed we need to reach
+            # Max braking force = passive resistance + active mechanical
+            # braking, bounded by tire grip. CT-16EV mechanical pads can
+            # exceed motor regen (~0.5 g) and reach the tire limit (~1 g),
+            # so brake capacity is the tire-grip ceiling, not the regen
+            # ceiling. Adding resistance on top keeps the math honest:
+            # every newton of drag also reduces speed.
             f_resist = self._resistance(v, seg.grade, seg.curvature)
-            f_regen = abs(self._powertrain.regen_force(1.0, v))
-            f_tire_limit = self._dynamics.max_braking_force(v)
-            f_brake = min(f_resist + f_regen, f_tire_limit)
+            # Use mechanical_brake_force(1.0, v) as the active braking
+            # ceiling. This honours the calibrated peak-brake-decel
+            # (~0.55 g for CT-16EV) rather than the tire-grip ceiling.
+            # Adding resist on top is honest: drag and rolling resistance
+            # also slow the car independently of brake-pad output.
+            f_brake_active = self._dynamics.mechanical_brake_force(1.0, v)
+            f_brake = f_brake_active + f_resist
             a_brake = f_brake / m_eff
 
             # v_entry^2 = v_exit^2 + 2 * a_brake * d
@@ -89,9 +98,8 @@ class SpeedEnvelope:
             f_resist = self._resistance(
                 v_back[0], last_seg.grade, last_seg.curvature
             )
-            f_regen = abs(self._powertrain.regen_force(1.0, v_back[0]))
-            f_tire_limit = self._dynamics.max_braking_force(v_back[0])
-            f_brake = min(f_resist + f_regen, f_tire_limit)
+            f_brake_active = self._dynamics.mechanical_brake_force(1.0, v_back[0])
+            f_brake = f_brake_active + f_resist
             a_brake = f_brake / m_eff
             v_wrap_sq = (
                 v_back[0] * v_back[0] + 2.0 * a_brake * last_seg.length_m
@@ -107,9 +115,8 @@ class SpeedEnvelope:
                 v = v_back[i + 1]
                 seg = segments[i]
                 f_resist = self._resistance(v, seg.grade, seg.curvature)
-                f_regen = abs(self._powertrain.regen_force(1.0, v))
-                f_tire_limit = self._dynamics.max_braking_force(v)
-                f_brake = min(f_resist + f_regen, f_tire_limit)
+                f_brake_active = self._dynamics.mechanical_brake_force(1.0, v)
+                f_brake = f_brake_active + f_resist
                 a_brake = f_brake / m_eff
                 v_entry_sq = v * v + 2.0 * a_brake * seg.length_m
                 new_limit = min(v_corner[i], math.sqrt(max(0.0, v_entry_sq)))
@@ -211,9 +218,8 @@ class SpeedEnvelope:
                 v = v_corrected[i + 1]
                 seg = segments[i]
                 f_resist = self._resistance(v, seg.grade, seg.curvature)
-                f_regen = abs(self._powertrain.regen_force(1.0, v))
-                f_tire_limit = self._dynamics.max_braking_force(v)
-                f_brake = min(f_resist + f_regen, f_tire_limit)
+                f_brake_active = self._dynamics.mechanical_brake_force(1.0, v)
+                f_brake = f_brake_active + f_resist
                 a_brake = f_brake / m_eff
                 v_entry_sq = v * v + 2.0 * a_brake * seg.length_m
                 new_limit = min(v_corrected[i], math.sqrt(max(0.0, v_entry_sq)))

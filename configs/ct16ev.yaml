@@ -13,7 +13,7 @@ vehicle:
   wheel_inertia_kg_m2: 0.3    # per wheel estimate (10" Hoosier + aluminum rim)
 
 powertrain:
-  motor_speed_max_rpm: 2900  # Inverter setting (EMRAX 228 capable of 6500)
+  motor_speed_max_rpm: 3000  # Real telem peak 2947 RPM (Cascadia inverter overshoots its setting transiently). EMRAX 228 capable of 6500.
   brake_speed_rpm: 2400  # Inverter field-weakening onset
   torque_limit_inverter_nm: 85.0  # IQ=170A setting
   # C17: LVCU firmware default is 2200/10 = 220 Nm (LVCU Code.txt:109).
@@ -67,7 +67,7 @@ tire:
   tir_file: "Real-Car-Data-And-Stats/Tire Models from TTC/Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir"
   static_camber_front_deg: -1.25
   static_camber_rear_deg: -1.25
-  grip_scale: 0.4697  # TTC-to-car calibration from Michigan 2025 endurance telemetry (cleaned LFspeed data)
+  grip_scale: 0.50  # ~96th-percentile demonstrated effective_mu (Michigan 2025). The cornering envelope assumes pure-cornering peak grip can be sustained; in reality the driver trades grip for stability (friction circle). p99 (0.548) was too aggressive in the d≈767 m hairpin; p75 (0.35) over-constrained light-curvature zones now visible thanks to the YawRate fallback. 0.50 is the empirical sweet spot for residual RMSE on Michigan 2025.
 
 suspension:
   roll_stiffness_front_nm_per_deg: 238.0

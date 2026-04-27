@@ -21,7 +21,11 @@ class TestVehicleConfigLoading:
 
     def test_powertrain_params(self, ct16ev_config_path):
         config = VehicleConfig.from_yaml(ct16ev_config_path)
-        assert config.powertrain.motor_speed_max_rpm == 2900
+        # Cap raised from inverter setpoint 2900 to 3000 to cover the
+        # transient overshoot the Cascadia inverter exhibits — Michigan
+        # 2025 telemetry peaks at 2947 RPM. Without this, sim hard-clips
+        # straight-line top speed about 2.5 km/h below the real car.
+        assert config.powertrain.motor_speed_max_rpm == 3000
         assert config.powertrain.torque_limit_inverter_nm == 85.0
         assert config.powertrain.iq_limit_a == 170.0
         assert config.powertrain.gear_ratio == 3.6363  # DSS: 40/11 final drive ratio
