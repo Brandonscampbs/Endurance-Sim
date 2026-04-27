@@ -15,6 +15,14 @@ _CLEANED_CSV = _PROJECT_ROOT / "Real-Car-Data-And-Stats" / "CleanedEndurance.csv
 def get_telemetry() -> pd.DataFrame:
     """Load and cache the cleaned AiM telemetry CSV."""
     _, df = load_cleaned_csv(str(_CLEANED_CSV))
+    try:
+        boundaries = detect_lap_boundaries(df)
+    except Exception:
+        boundaries = []
+    if boundaries:
+        df["lap"] = 0
+        for lap_idx, (start, end, _) in enumerate(boundaries, start=1):
+            df.loc[df.index[start:end], "lap"] = lap_idx
     return df
 
 

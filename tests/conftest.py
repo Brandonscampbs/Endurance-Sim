@@ -1,9 +1,13 @@
 """Shared test fixtures for FSAE simulation tests."""
 
 import pytest
+import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 # Data paths
 DATA_DIR = PROJECT_ROOT / "Real-Car-Data-And-Stats"

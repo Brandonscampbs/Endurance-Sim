@@ -32,6 +32,7 @@ class DriverZone:
     distance_end_m: float
     label: str
     max_speed_ms: float = 0.0  # observed peak speed in this zone (m/s), 0 = no limit
+    max_speed_source: str = "none"
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +653,9 @@ def collapse_to_zones(
             distance_end_m=dist_end,
             label=label,
             max_speed_ms=max_speed_ms,
+            max_speed_source=(
+                "telemetry_observed_p95" if max_speed_ms > 0.0 else "none"
+            ),
         ))
 
     return zones

@@ -113,6 +113,8 @@ class BatteryModel:
         self._pack_ocv_interp: interp1d | None = None
         self._pack_resistance_interp: interp1d | None = None
         self._pack_calibrated = False
+        self.calibration_sources: list[str] = []
+        self.pack_calibration_holdout_laps: tuple[int, ...] | None = None
 
         # Idempotency guard for pack-from-telemetry calibration (NF-26)
         self._pack_telemetry_calibrated: bool = False
@@ -235,6 +237,7 @@ class BatteryModel:
         )
 
         self._calibrated = True
+        self.calibration_sources.append("voltt_cell")
 
     # Backward-compatible alias for existing call sites.  Deprecated.
     def calibrate(self, voltt_cell_df: "pd.DataFrame") -> None:
@@ -245,6 +248,8 @@ class BatteryModel:
         self,
         aim_df: "pd.DataFrame",
         holdout_laps: Sequence[int] | None = None,
+        *,
+        allow_same_run_validation: bool = False,
     ) -> None:
         """Refine pack-level OCV curve from AiM telemetry.
 
@@ -267,16 +272,22 @@ class BatteryModel:
             )
         # D-04: make the train/test leak explicit. Fitting pack OCV and
         # resistance on the same AiM recording used for validation is a
-        # circular comparison. Callers that want to opt in (train on one
-        # stint, validate on another) must pass `holdout_laps`.
-        import warnings
-        warnings.warn(
-            "calibrate_pack_from_telemetry fits pack OCV/R on AiM telemetry "
-            "— do not use for validation against the same data. Pass "
-            "`holdout_laps=` or rely on `calibrate_from_voltt` alone.",
-            stacklevel=2,
-        )
+        # circular comparison. Callers that intentionally use all samples
+        # must say so in the call site.
+        if holdout_laps is None and not allow_same_run_validation:
+            warnings.warn(
+                "calibrate_pack_from_telemetry fits pack OCV/R on AiM telemetry "
+                "without a holdout_laps split. Do not validate against this "
+                "same telemetry unless allow_same_run_validation=True is "
+                "documented at the call site.",
+                stacklevel=2,
+            )
         self._pack_telemetry_calibrated = True
+        self.pack_calibration_holdout_laps = (
+            tuple(int(x) for x in holdout_laps)
+            if holdout_laps is not None else None
+        )
+        self.calibration_sources.append("telemetry_pack")
 
         # Apply holdout filter.  We look for a 'lap' column; if absent,
         # we silently accept the full frame (no laps to hold out).

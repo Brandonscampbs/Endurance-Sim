@@ -80,15 +80,10 @@ class VehicleDynamics:
         self.cornering_stiffness_scale = float(cornering_stiffness_scale)
 
         # Effective mass: bare mass + rotational inertia of spinning components.
-        # Use the loaded tire radius at static weight (roughly mg/4 per tire)
-        # rather than the unloaded radius — loaded radius is ~2-3% smaller
-        # and the rotational-inertia contribution scales as 1/r^2.
+        # Use the configured rolling radius so motor RPM, wheel force, and
+        # rotational inertia all share one driveline geometry.
         if powertrain_config is not None:
-            if tire_model is not None:
-                static_load_per_tire = vehicle.mass_kg * GRAVITY_M_S2 / 4.0
-                tire_radius = tire_model.loaded_radius(static_load_per_tire)
-            else:
-                tire_radius = 0.2042  # Hoosier 16x7.5-10 UNLOADED_RADIUS fallback
+            tire_radius = powertrain_config.rolling_radius_m
             G = powertrain_config.gear_ratio
             eta = powertrain_config.drivetrain_efficiency
             j_eff = (
@@ -346,7 +341,10 @@ class VehicleDynamics:
     # ------------------------------------------------------------------
 
     def max_cornering_speed(
-        self, curvature: float, grip_factor: float = 1.0,
+        self,
+        curvature: float,
+        grip_factor: float = 1.0,
+        longitudinal_g: float = 0.0,
     ) -> float:
         """Maximum speed (m/s) through a corner of given curvature.
 
@@ -365,6 +363,10 @@ class VehicleDynamics:
 
         # Delegate to physics-based solver when available
         if self.cornering_solver is not None:
+            if abs(longitudinal_g) > 0.0:
+                return self.cornering_solver.max_cornering_speed(
+                    kappa, mu_scale=grip_factor, longitudinal_g=longitudinal_g,
+                )
             return self.cornering_solver.max_cornering_speed(
                 kappa, mu_scale=grip_factor,
             )

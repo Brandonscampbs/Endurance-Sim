@@ -24,15 +24,16 @@ def compute_heading(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
 
 def distribute_drive_force(
     total_drive_n: float,
-    total_regen_n: float,
+    total_regen_n: float = 0.0,
+    total_brake_n: float = 0.0,
 ) -> tuple[float, float, float, float]:
     """Distribute longitudinal force to wheels. CT-16EV is rear-wheel drive.
 
     Returns: (fl_fx, fr_fx, rl_fx, rr_fx)
     """
-    net = total_drive_n - total_regen_n
-    # Rear-wheel drive: all drive force on rear axle, split 50/50
-    return (0.0, 0.0, net / 2, net / 2)
+    brake_each = -total_brake_n / 4.0
+    rear_each = (total_drive_n + total_regen_n) / 2.0
+    return (brake_each, brake_each, brake_each + rear_each, brake_each + rear_each)
 
 
 def _compute_lateral_forces(
@@ -132,7 +133,7 @@ def get_visualization_data(source: str = "sim") -> VisualizationResponse:
     aim_df = get_telemetry()
     track = get_track()
     vehicle = get_vehicle_config()
-    mass_kg = vehicle.vehicle.mass_kg + 68
+    mass_kg = vehicle.vehicle.mass_kg
     gear_ratio = vehicle.powertrain.gear_ratio
     tire_radius = 0.2042  # Hoosier 16x7.5-10 LC0 unloaded radius
 
@@ -199,16 +200,34 @@ def _build_sim_frames(
 
         speed_ms = float(row["speed_ms"])
         curvature = float(row["curvature"])
-        drive_force = float(row["drive_force_n"])
-        regen_force = float(row["regen_force_n"])
-
-        fl_fx, fr_fx, rl_fx, rr_fx = distribute_drive_force(drive_force, regen_force)
-        fl_fy, fr_fy, rl_fy, rr_fy = _compute_lateral_forces(speed_ms, curvature, mass_kg)
-
-        long_g = float(row["net_force_n"]) / (mass_kg * _GRAVITY)
-        fl_fz, fr_fz, rl_fz, rr_fz = _compute_tire_loads(
-            speed_ms, curvature, long_g, mass_kg,
-        )
+        if {"wheel_fl_fx_n", "wheel_fl_fz_n"}.issubset(sim_df.columns):
+            fl_fx = float(row["wheel_fl_fx_n"])
+            fr_fx = float(row["wheel_fr_fx_n"])
+            rl_fx = float(row["wheel_rl_fx_n"])
+            rr_fx = float(row["wheel_rr_fx_n"])
+            fl_fy = float(row["wheel_fl_fy_n"])
+            fr_fy = float(row["wheel_fr_fy_n"])
+            rl_fy = float(row["wheel_rl_fy_n"])
+            rr_fy = float(row["wheel_rr_fy_n"])
+            fl_fz = float(row["wheel_fl_fz_n"])
+            fr_fz = float(row["wheel_fr_fz_n"])
+            rl_fz = float(row["wheel_rl_fz_n"])
+            rr_fz = float(row["wheel_rr_fz_n"])
+            long_g = float(row.get("longitudinal_g", 0.0))
+        else:
+            drive_force = float(row["drive_force_n"])
+            regen_force = float(row.get("regen_force_n", 0.0))
+            brake_force = float(row.get("brake_force_n", 0.0))
+            fl_fx, fr_fx, rl_fx, rr_fx = distribute_drive_force(
+                drive_force, regen_force, brake_force,
+            )
+            fl_fy, fr_fy, rl_fy, rr_fy = _compute_lateral_forces(
+                speed_ms, curvature, mass_kg,
+            )
+            long_g = float(row["net_force_n"]) / (mass_kg * _GRAVITY)
+            fl_fz, fr_fz, rl_fz, rr_fz = _compute_tire_loads(
+                speed_ms, curvature, long_g, mass_kg,
+            )
 
         wheels = [
             WheelForce(fx=round(fl_fx, 1), fy=round(fl_fy, 1), fz=round(fl_fz, 1),
@@ -319,9 +338,10 @@ def _build_real_frames(
 
         # (#15) Use passed parameters instead of hardcoded values
         torque_req = _safe_float(row.get("LVCU Torque Req"))
-        # (#7) Both drive and regen use gearbox_efficiency for mechanical force
+        # Positive torque drives the rear wheels; negative torque is rear-axle
+        # regen and must remain negative in the force visualization.
         drive_force = torque_req * gear_ratio / tire_radius * gearbox_efficiency if torque_req > 0 else 0
-        regen_force = abs(torque_req) * gear_ratio / tire_radius * gearbox_efficiency if torque_req < 0 else 0
+        regen_force = torque_req * gear_ratio / tire_radius / gearbox_efficiency if torque_req < 0 else 0
 
         fl_fx, fr_fx, rl_fx, rr_fx = distribute_drive_force(drive_force, regen_force)
         fl_fy, fr_fy, rl_fy, rr_fy = _compute_lateral_forces(speed_ms, curvature, mass_kg)

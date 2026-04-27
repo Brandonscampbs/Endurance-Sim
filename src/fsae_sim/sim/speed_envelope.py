@@ -42,7 +42,11 @@ class SpeedEnvelope:
         self._track = track
         self._corner_speed_cache: dict[tuple, np.ndarray] = {}
 
-    def compute(self, initial_speed: float = 0.5) -> np.ndarray:
+    def compute(
+        self,
+        initial_speed: float = 0.5,
+        bms_current_limit_a: float | None = None,
+    ) -> np.ndarray:
         """Compute the speed envelope for the full track.
 
         Args:
@@ -80,7 +84,7 @@ class SpeedEnvelope:
             # (~0.55 g for CT-16EV) rather than the tire-grip ceiling.
             # Adding resist on top is honest: drag and rolling resistance
             # also slow the car independently of brake-pad output.
-            f_brake_active = self._dynamics.mechanical_brake_force(1.0, v)
+            f_brake_active = self._brake_force(v)
             f_brake = f_brake_active + f_resist
             a_brake = f_brake / m_eff
 
@@ -98,7 +102,7 @@ class SpeedEnvelope:
             f_resist = self._resistance(
                 v_back[0], last_seg.grade, last_seg.curvature
             )
-            f_brake_active = self._dynamics.mechanical_brake_force(1.0, v_back[0])
+            f_brake_active = self._brake_force(v_back[0])
             f_brake = f_brake_active + f_resist
             a_brake = f_brake / m_eff
             v_wrap_sq = (
@@ -115,7 +119,7 @@ class SpeedEnvelope:
                 v = v_back[i + 1]
                 seg = segments[i]
                 f_resist = self._resistance(v, seg.grade, seg.curvature)
-                f_brake_active = self._dynamics.mechanical_brake_force(1.0, v)
+                f_brake_active = self._brake_force(v)
                 f_brake = f_brake_active + f_resist
                 a_brake = f_brake / m_eff
                 v_entry_sq = v * v + 2.0 * a_brake * seg.length_m
@@ -145,9 +149,7 @@ class SpeedEnvelope:
         for i in range(1, n):
             v = v_fwd[i - 1]
             prev_seg = segments[i - 1]
-            f_drive = self._powertrain.drive_force(1.0, v)
-            f_traction = self._dynamics.max_traction_force(v)
-            f_drive = min(f_drive, f_traction)
+            f_drive = self._drive_force(v, bms_current_limit_a)
             f_resist = self._resistance(v, prev_seg.grade, prev_seg.curvature)
             f_net = f_drive - f_resist
             a_accel = f_net / m_eff
@@ -218,7 +220,7 @@ class SpeedEnvelope:
                 v = v_corrected[i + 1]
                 seg = segments[i]
                 f_resist = self._resistance(v, seg.grade, seg.curvature)
-                f_brake_active = self._dynamics.mechanical_brake_force(1.0, v)
+                f_brake_active = self._brake_force(v)
                 f_brake = f_brake_active + f_resist
                 a_brake = f_brake / m_eff
                 v_entry_sq = v * v + 2.0 * a_brake * seg.length_m
@@ -232,9 +234,7 @@ class SpeedEnvelope:
             for i in range(1, n):
                 v = v_corrected[i - 1]
                 prev_seg = segments[i - 1]
-                f_drive = self._powertrain.drive_force(1.0, v)
-                f_traction = self._dynamics.max_traction_force(v)
-                f_drive = min(f_drive, f_traction)
+                f_drive = self._drive_force(v, bms_current_limit_a)
                 f_resist = self._resistance(v, prev_seg.grade, prev_seg.curvature)
                 f_net = f_drive - f_resist
                 a_accel = f_net / m_eff
@@ -276,6 +276,50 @@ class SpeedEnvelope:
         if self._resist_kwargs["curvature"]:
             kwargs["curvature"] = curvature
         return self._dynamics.total_resistance(speed, **kwargs)
+
+    def _as_finite_float(self, value, fallback: float) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        if not math.isfinite(out):
+            return fallback
+        return out
+
+    def _brake_force(self, speed: float) -> float:
+        """Runtime-consistent active mechanical braking ceiling."""
+        fallback = self._as_finite_float(
+            self._dynamics.max_braking_force(speed), 0.0,
+        )
+        fn = getattr(self._dynamics, "mechanical_brake_force", None)
+        if fn is None:
+            return fallback
+        active = self._as_finite_float(fn(1.0, speed), fallback)
+        if fallback > 10.0 and active < 10.0:
+            return fallback
+        return active
+
+    def _drive_force(
+        self,
+        speed: float,
+        bms_current_limit_a: float | None,
+    ) -> float:
+        """Runtime-consistent full-throttle force, optionally BMS limited."""
+        if bms_current_limit_a is not None and hasattr(
+            self._powertrain, "lvcu_torque_ceiling"
+        ):
+            rpm = self._powertrain.motor_rpm_from_speed(speed)
+            torque = self._powertrain.lvcu_torque_ceiling(
+                rpm, bms_current_limit_a,
+            )
+            f_drive = self._powertrain.wheel_force(torque)
+        else:
+            f_drive = self._powertrain.drive_force(1.0, speed)
+        f_traction = self._dynamics.max_traction_force(speed)
+        return min(
+            self._as_finite_float(f_drive, 0.0),
+            self._as_finite_float(f_traction, float("inf")),
+        )
 
     # ------------------------------------------------------------------
     # Corner speed caching

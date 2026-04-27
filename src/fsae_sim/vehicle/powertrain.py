@@ -19,6 +19,9 @@ class PowertrainConfig:
     id_limit_a: float
     gear_ratio: float
     drivetrain_efficiency: float
+    # Rolling radius used for motor RPM, wheel force, and reflected inertia.
+    # Keep this single value authoritative across the longitudinal model.
+    rolling_radius_m: float = 0.2042
     # LVCU torque command parameters (from real LVCU Code.txt)
     lvcu_power_constant: float = 420.0        # 4200 in 0.1Nm CAN units / 10
     # Firmware fixed-point constant; intentionally offset from pi/30 ≈ 0.10472
@@ -59,4 +62,8 @@ class PowertrainConfig:
                 f"must exceed lvcu_pedal_deadzone_low "
                 f"({self.lvcu_pedal_deadzone_low}) by at least 0.01; got "
                 f"span={span:.6f}."
+            )
+        if self.rolling_radius_m <= 0.0:
+            raise ValueError(
+                f"rolling_radius_m must be positive, got {self.rolling_radius_m!r}"
             )

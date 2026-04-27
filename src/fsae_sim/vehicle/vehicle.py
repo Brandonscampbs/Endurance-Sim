@@ -20,12 +20,35 @@ class VehicleParams:
     downforce_coefficient: float = 0.0  # Cl * A (m²), 0 = no downforce
     rotor_inertia_kg_m2: float = 0.06  # EMRAX 228 default
     wheel_inertia_kg_m2: float = 0.3   # per wheel (10" Hoosier + aluminum rim)
+    cg_height_m: float = 0.2794
+    weight_distribution_front: float = 0.53
+    downforce_distribution_front: float = 0.61
+    aero_drag_is_cda: bool = True
+    aero_downforce_is_cla: bool = True
     # D-08: brake system peak pressure (bar). Data-independent so that
     # recalibration on a short subset produces the same normalized brake_pct
     # as recalibration on the full endurance. Default is a conservative
     # FSAE-typical max; override in configs/ct16ev.yaml when the DSS Brake
     # System sheet provides a measured value.
     brake_max_pressure_bar: float = 60.0
+
+    def __post_init__(self) -> None:
+        if self.mass_kg <= 0.0:
+            raise ValueError(f"mass_kg must be positive, got {self.mass_kg!r}")
+        if self.wheelbase_m <= 0.0:
+            raise ValueError(
+                f"wheelbase_m must be positive, got {self.wheelbase_m!r}"
+            )
+        for name, value in (
+            ("weight_distribution_front", self.weight_distribution_front),
+            ("downforce_distribution_front", self.downforce_distribution_front),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        if self.cg_height_m <= 0.0:
+            raise ValueError(
+                f"cg_height_m must be positive, got {self.cg_height_m!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -36,6 +59,14 @@ class TireConfig:
     static_camber_front_deg: float
     static_camber_rear_deg: float
     grip_scale: float = 1.0  # TTC-to-car grip calibration factor
+    grip_scale_source: str = "nominal"
+    grip_scale_notes: str = ""
+
+    def __post_init__(self) -> None:
+        if self.grip_scale <= 0.0:
+            raise ValueError(
+                f"grip_scale must be positive, got {self.grip_scale!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -64,6 +95,43 @@ class VehicleConfig:
     battery: BatteryConfig
     tire: TireConfig | None = None
     suspension: SuspensionConfig | None = None
+
+    def require_predictive_ready(
+        self,
+        *,
+        allow_empirical_grip: bool = False,
+    ) -> None:
+        """Fail loudly if a vehicle config is incomplete for prediction."""
+        missing: list[str] = []
+        if self.tire is None:
+            missing.append("tire")
+        if self.suspension is None:
+            missing.append("suspension")
+        if not self.vehicle.aero_drag_is_cda:
+            missing.append("vehicle.aero_drag_is_cda=true")
+        if self.vehicle.downforce_coefficient > 0.0 and not self.vehicle.aero_downforce_is_cla:
+            missing.append("vehicle.aero_downforce_is_cla=true")
+        if missing:
+            raise ValueError(
+                f"{self.name} is not prediction-ready; missing or ambiguous "
+                f"physics sections: {', '.join(missing)}"
+            )
+
+        assert self.tire is not None
+        empirical_source = self.tire.grip_scale_source.lower()
+        uses_empirical_grip = (
+            self.tire.grip_scale != 1.0
+            and any(
+                token in empirical_source
+                for token in ("telemetry", "endurance", "validation", "calibration")
+            )
+        )
+        if uses_empirical_grip and not allow_empirical_grip:
+            raise ValueError(
+                f"{self.name} tire grip_scale={self.tire.grip_scale} comes from "
+                f"{self.tire.grip_scale_source!r}; prediction mode requires an "
+                "independent tire assumption or allow_empirical_grip=True."
+            )
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "VehicleConfig":

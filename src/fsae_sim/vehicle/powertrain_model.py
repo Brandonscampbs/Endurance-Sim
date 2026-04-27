@@ -101,6 +101,7 @@ class PowertrainModel:
     ) -> None:
         self.config = config
         self._efficiency_map = efficiency_map
+        self.rolling_radius_m = float(config.rolling_radius_m)
 
         # Pre-compute constants used in every call.  The effective torque
         # ceiling is inverter ∧ LVCU ∧ (optional operational safety cap).
@@ -155,7 +156,7 @@ class PowertrainModel:
             inputs (reversing is not modelled).
         """
         speed = max(0.0, vehicle_speed_ms)
-        wheel_rpm = (speed / self.TIRE_RADIUS_M) * 60.0 / (2.0 * math.pi)
+        wheel_rpm = (speed / self.rolling_radius_m) * 60.0 / (2.0 * math.pi)
         return wheel_rpm * self.config.gear_ratio
 
     def speed_from_motor_rpm(self, motor_rpm: float) -> float:
@@ -172,7 +173,7 @@ class PowertrainModel:
         """
         rpm = max(0.0, motor_rpm)
         wheel_rpm = rpm / self.config.gear_ratio
-        return wheel_rpm * self.TIRE_RADIUS_M * 2.0 * math.pi / 60.0
+        return wheel_rpm * self.rolling_radius_m * 2.0 * math.pi / 60.0
 
     # ------------------------------------------------------------------
     # Torque capability
@@ -427,7 +428,14 @@ class PowertrainModel:
             Force in N at the contact patch.  Positive = forward, negative =
             rearward (regen/braking).
         """
-        return self.wheel_torque(motor_torque_nm) / self.TIRE_RADIUS_M
+        return self.wheel_torque(motor_torque_nm) / self.rolling_radius_m
+
+    def motor_torque_from_wheel_force(self, wheel_force_n: float) -> float:
+        """Inverse of :meth:`wheel_force` for a realized contact-patch force."""
+        denom = self.config.gear_ratio * self._GEARBOX_EFFICIENCY
+        if denom <= 0.0:
+            return 0.0
+        return wheel_force_n * self.rolling_radius_m / denom
 
     # ------------------------------------------------------------------
     # Drive and regen demand
@@ -493,7 +501,7 @@ class PowertrainModel:
         regen_wheel_torque = (
             commanded_torque * self.config.gear_ratio / self._GEARBOX_EFFICIENCY
         )
-        return -(regen_wheel_torque / self.TIRE_RADIUS_M)
+        return -(regen_wheel_torque / self.rolling_radius_m)
 
     # ------------------------------------------------------------------
     # Electrical power

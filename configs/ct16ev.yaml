@@ -9,6 +9,11 @@ vehicle:
   rolling_resistance: 0.015
   wheelbase_m: 1.549  # DSS: 1549 mm
   downforce_coefficient: 2.18  # DSS: ClA=2.18 m² (625N at 80 kph)
+  cg_height_m: 0.2794
+  weight_distribution_front: 0.53
+  downforce_distribution_front: 0.61
+  aero_drag_is_cda: true
+  aero_downforce_is_cla: true
   rotor_inertia_kg_m2: 0.06   # EMRAX 228 datasheet
   wheel_inertia_kg_m2: 0.3    # per wheel estimate (10" Hoosier + aluminum rim)
 
@@ -24,6 +29,7 @@ powertrain:
   id_limit_a: 30.0
   gear_ratio: 3.6363  # DSS: 40/11 teeth
   drivetrain_efficiency: 0.92
+  rolling_radius_m: 0.2042
   lvcu_power_constant: 420.0
   lvcu_rpm_scale: 0.1076
   lvcu_omega_floor: 23.04
@@ -68,6 +74,8 @@ tire:
   static_camber_front_deg: -1.25
   static_camber_rear_deg: -1.25
   grip_scale: 0.50  # ~96th-percentile demonstrated effective_mu (Michigan 2025). The cornering envelope assumes pure-cornering peak grip can be sustained; in reality the driver trades grip for stability (friction circle). p99 (0.548) was too aggressive in the d≈767 m hairpin; p75 (0.35) over-constrained light-curvature zones now visible thanks to the YawRate fallback. 0.50 is the empirical sweet spot for residual RMSE on Michigan 2025.
+  grip_scale_source: "telemetry_calibration_michigan_2025"
+  grip_scale_notes: "Not independent tire truth; use only for calibration/replay unless explicitly allowed."
 
 suspension:
   roll_stiffness_front_nm_per_deg: 238.0

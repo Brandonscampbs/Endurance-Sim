@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
 import pandas as pd
@@ -30,6 +31,7 @@ except ImportError:
 from pathlib import Path
 
 from fsae_sim.sim.speed_envelope import SpeedEnvelope
+from fsae_sim.physics_constants import GRAVITY_M_S2
 
 try:
     from fsae_sim.vehicle.tire_model import PacejkaTireModel
@@ -60,6 +62,25 @@ class SimResult:
     net_energy_kwh: float = 0.0
 
 
+class SimulationMode(str, Enum):
+    """Controls whether telemetry-derived shortcuts are allowed."""
+
+    REPLAY = "replay"
+    CALIBRATION = "calibration"
+    PREDICTION = "prediction"
+    VALIDATION = "validation"
+
+    @classmethod
+    def coerce(cls, value: str | "SimulationMode") -> "SimulationMode":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).lower())
+        except ValueError as exc:
+            allowed = ", ".join(m.value for m in cls)
+            raise ValueError(f"Unknown simulation mode {value!r}; expected {allowed}") from exc
+
+
 class SimulationEngine:
     """Quasi-static endurance simulation.
 
@@ -76,11 +97,35 @@ class SimulationEngine:
         track: Track,
         strategy: DriverStrategy,
         battery_model: BatteryModel,
+        *,
+        mode: str | SimulationMode = SimulationMode.CALIBRATION,
+        allow_telemetry_track: bool = False,
+        allow_empirical_grip: bool = False,
     ) -> None:
         self.vehicle = vehicle
         self.track = track
         self.strategy = strategy
         self.battery_model = battery_model
+        self.mode = SimulationMode.coerce(mode)
+
+        if self.mode == SimulationMode.PREDICTION:
+            vehicle.require_predictive_ready(
+                allow_empirical_grip=allow_empirical_grip,
+            )
+            if (
+                getattr(track, "source", "unknown").startswith("telemetry")
+                and not allow_telemetry_track
+            ):
+                raise ValueError(
+                    "prediction mode requires an independent track model; "
+                    f"track {track.name!r} was built from {track.source!r}."
+                )
+            if getattr(strategy, "uses_observed_speed_caps", False):
+                raise ValueError(
+                    "prediction mode forbids telemetry-derived speed caps. "
+                    "Use strategy.without_observed_speed_caps() or construct "
+                    "the strategy with use_observed_speed_caps=False."
+                )
 
         # Termination temperature comes from the config's discharge_limits:
         # the hottest point where max_current_a == 0 (battery can no longer
@@ -133,7 +178,13 @@ class SimulationEngine:
             tire_model = PacejkaTireModel(tire_cfg.tir_file)
             if tire_cfg.grip_scale != 1.0:
                 tire_model.apply_grip_scale(tire_cfg.grip_scale)
-            load_transfer = LoadTransferModel(vehicle.vehicle, susp_cfg)
+            load_transfer = LoadTransferModel(
+                vehicle.vehicle,
+                susp_cfg,
+                cg_height_m=vehicle.vehicle.cg_height_m,
+                weight_dist_front=vehicle.vehicle.weight_distribution_front,
+                downforce_dist_front=vehicle.vehicle.downforce_distribution_front,
+            )
             cornering_solver = CorneringSolver(
                 tire_model,
                 load_transfer,
@@ -223,8 +274,14 @@ class SimulationEngine:
         records: list[dict] = []
         laps_completed = 0
 
-        # Pre-compute speed envelope (cornering limits from tire grip)
-        v_max = self._envelope.compute(initial_speed=speed)
+        # Pre-compute speed envelope (cornering + accel/brake feasibility).
+        # Use the initial BMS limit so the forward pass is not more
+        # optimistic than the runtime torque ceiling.
+        initial_bms_limit = self.battery_model.max_discharge_current(temp, soc)
+        v_max = self._envelope.compute(
+            initial_speed=speed,
+            bms_current_limit_a=initial_bms_limit,
+        )
         is_replay = isinstance(self.strategy, ReplayStrategy)
         is_calibrated = isinstance(self.strategy, CalibratedStrategy)
 
@@ -236,6 +293,127 @@ class SimulationEngine:
                 self.strategy.set_envelope(v_max)
             except Exception:
                 pass
+
+        def solve_exit_speed(v0: float, length_m: float, net_force_n: float) -> float:
+            if length_m <= 0.0:
+                return max(v0, 0.0)
+            a = net_force_n / self.dynamics.m_effective
+            v_sq = v0 * v0 + 2.0 * a * length_m
+            return math.sqrt(max(0.0, v_sq))
+
+        def segment_time(v0: float, v1: float, length_m: float) -> float:
+            avg = (v0 + v1) / 2.0
+            return length_m / max(avg, 0.1)
+
+        def commanded_motor_torque(
+            op_speed_ms: float,
+            command: ControlCommand,
+            current_limit_a: float,
+            seg_mid_distance_m: float,
+        ) -> float:
+            rpm = self.powertrain.motor_rpm_from_speed(op_speed_ms)
+            if command.action == ControlAction.THROTTLE:
+                if is_replay:
+                    return float(self.strategy.target_torque(seg_mid_distance_m))
+                if is_calibrated:
+                    ceiling = self.powertrain.lvcu_torque_ceiling(
+                        rpm, current_limit_a,
+                    )
+                    return command.throttle_pct * ceiling
+                return float(self.powertrain.lvcu_torque_command(
+                    command.throttle_pct, rpm, current_limit_a,
+                ))
+            return 0.0
+
+        def command_forces(
+            op_speed_ms: float,
+            command: ControlCommand,
+            current_limit_a: float,
+            seg_mid_distance_m: float,
+        ) -> tuple[float, float, float, float]:
+            """Return motor torque, drive force, brake force, motor regen force."""
+            torque = commanded_motor_torque(
+                op_speed_ms, command, current_limit_a, seg_mid_distance_m,
+            )
+            drive_force = 0.0
+            brake_force = 0.0
+            regen_force = 0.0
+
+            if command.action == ControlAction.THROTTLE and torque > 0.0:
+                drive_force = self.powertrain.wheel_force(torque)
+                drive_force = min(
+                    drive_force,
+                    self.dynamics.max_traction_force(op_speed_ms),
+                )
+            elif command.action == ControlAction.BRAKE:
+                brake_force = self.dynamics.mechanical_brake_force(
+                    command.brake_pct, op_speed_ms,
+                )
+
+            return torque, drive_force, brake_force, regen_force
+
+        def enforce_speed_limit(
+            entry_speed_ms: float,
+            length_m: float,
+            drive_force_n: float,
+            brake_force_n: float,
+            regen_force_n: float,
+            resistance_force_n: float,
+            speed_limit_ms: float,
+        ) -> tuple[float, float, float, float, bool, bool]:
+            """Apply a speed ceiling through force work, not speed deletion."""
+            net = drive_force_n + regen_force_n - brake_force_n - resistance_force_n
+            unconstrained_exit = solve_exit_speed(entry_speed_ms, length_m, net)
+            if (
+                not math.isfinite(speed_limit_ms)
+                or unconstrained_exit <= speed_limit_ms
+                or length_m <= 0.0
+            ):
+                return (
+                    unconstrained_exit,
+                    drive_force_n,
+                    brake_force_n,
+                    net,
+                    False,
+                    False,
+                )
+
+            target_exit = max(0.0, speed_limit_ms)
+            required_net = (
+                self.dynamics.m_effective
+                * (target_exit * target_exit - entry_speed_ms * entry_speed_ms)
+                / (2.0 * length_m)
+            )
+            required_drive_minus_brake = (
+                required_net + resistance_force_n - regen_force_n
+            )
+
+            limited = True
+            violated = False
+            if required_drive_minus_brake >= 0.0:
+                drive_force_n = min(drive_force_n, required_drive_minus_brake)
+                brake_force_n = 0.0
+            else:
+                drive_force_n = 0.0
+                needed_brake = -required_drive_minus_brake
+                max_brake = self.dynamics.mechanical_brake_force(
+                    1.0, max(entry_speed_ms, target_exit),
+                )
+                brake_force_n = min(needed_brake, max_brake)
+                violated = needed_brake > max_brake + 1e-6
+
+            net = drive_force_n + regen_force_n - brake_force_n - resistance_force_n
+            exit_speed_ms = solve_exit_speed(entry_speed_ms, length_m, net)
+            if not violated:
+                exit_speed_ms = target_exit
+            return (
+                exit_speed_ms,
+                drive_force_n,
+                brake_force_n,
+                net,
+                limited,
+                violated,
+            )
 
         for lap in range(num_laps):
             for seg_idx, segment in enumerate(segments):
@@ -265,7 +443,7 @@ class SimulationEngine:
                 # --- Force-based resolution (all strategies) ---
 
                 # 2. Speed limit from pre-computed envelope
-                corner_limit = float(v_max[seg_idx])
+                speed_limit = float(v_max[seg_idx])
 
                 # 2a. D-09: honor zone-level ``max_speed_ms`` from the
                 # driver's ControlCommand.metadata.  CalibratedStrategy /
@@ -276,7 +454,7 @@ class SimulationEngine:
                 if cmd.metadata is not None:
                     meta_cap = cmd.metadata.get("max_speed_ms")
                     if meta_cap is not None:
-                        corner_limit = min(corner_limit, float(meta_cap))
+                        speed_limit = min(speed_limit, float(meta_cap))
 
                 # 2b. Entry-speed clamp.  If the previous segment exited
                 # above this segment's envelope (driver over-accelerated
@@ -285,10 +463,7 @@ class SimulationEngine:
                 # speed — clamp down.  Without this, resolve_exit_speed
                 # clamps the *exit* but average = (entry+exit)/2 can
                 # exceed the corner limit.
-                if speed > corner_limit:
-                    speed = corner_limit
-
-                # 2c. BMS current limit for LVCU torque command
+                # BMS current limit for LVCU torque command
                 bms_current_limit = self.battery_model.max_discharge_current(temp, soc)
                 motor_rpm = self.powertrain.motor_rpm_from_speed(speed)
 
@@ -317,6 +492,7 @@ class SimulationEngine:
                         )
                     drive_f = self.powertrain.wheel_force(motor_torque)
                     drive_f = min(drive_f, self.dynamics.max_traction_force(speed))
+                    brake_f = 0.0
                     regen_f = 0.0
                 elif cmd.action == ControlAction.BRAKE:
                     # CT-16EV mechanical brakes: hydraulic pressure on
@@ -334,21 +510,36 @@ class SimulationEngine:
                     # producing a 15 km/h sim-slow band before every
                     # tight corner.
                     drive_f = 0.0
-                    regen_f = -self.dynamics.mechanical_brake_force(
+                    brake_f = self.dynamics.mechanical_brake_force(
                         cmd.brake_pct, speed,
                     )
+                    regen_f = 0.0
                 else:  # COAST
                     drive_f = 0.0
+                    brake_f = 0.0
                     regen_f = 0.0
 
                 # 4. Resistive forces
                 resist_f = self.dynamics.total_resistance(speed, segment.grade, segment.curvature)
 
                 # 5. Net force and speed resolution
-                net_force = drive_f + regen_f - resist_f
+                net_force = drive_f + regen_f - brake_f - resist_f
 
-                exit_speed, seg_time = self.dynamics.resolve_exit_speed(
-                    speed, segment.length_m, net_force, corner_limit,
+                (
+                    exit_speed,
+                    drive_f,
+                    brake_f,
+                    net_force,
+                    speed_limited,
+                    speed_limit_violation,
+                ) = enforce_speed_limit(
+                    speed,
+                    segment.length_m,
+                    drive_f,
+                    brake_f,
+                    regen_f,
+                    resist_f,
+                    speed_limit,
                 )
                 exit_speed = max(exit_speed, self._MIN_SPEED_MS)
 
@@ -361,9 +552,29 @@ class SimulationEngine:
                 if cmd.metadata is not None and "max_speed_ms" in cmd.metadata:
                     zone_cap = float(cmd.metadata["max_speed_ms"])
                     if zone_cap > 0.0:
-                        exit_speed = min(exit_speed, zone_cap)
+                        (
+                            exit_speed,
+                            drive_f,
+                            brake_f,
+                            net_force,
+                            zone_limited,
+                            zone_violation,
+                        ) = enforce_speed_limit(
+                            speed,
+                            segment.length_m,
+                            drive_f,
+                            brake_f,
+                            regen_f,
+                            resist_f,
+                            zone_cap,
+                        )
+                        speed_limited = speed_limited or zone_limited
+                        speed_limit_violation = (
+                            speed_limit_violation or zone_violation
+                        )
 
                 avg_speed = (speed + exit_speed) / 2.0
+                seg_time = segment_time(speed, exit_speed, segment.length_m)
                 motor_rpm = self.powertrain.motor_rpm_from_speed(avg_speed)
 
                 # Recompute torque at resolved avg speed for accurate power calc
@@ -393,52 +604,23 @@ class SimulationEngine:
                 else:
                     motor_torque = 0.0
 
-                # Energy-honest clamp: if the corner-speed envelope (or
-                # zone cap) clipped exit_speed below what net_force
-                # would have produced, the motor cannot actually have
-                # delivered the commanded torque — a real driver lifts
-                # off-throttle when speed maxes out at the corner
-                # limit, otherwise grip saturates as longitudinal slip.
-                # Without this back-correction, drive_force × distance
-                # produces kinetic energy that the clamp silently
-                # erases, yet electrical_power is computed from the
-                # over-commanded motor_torque — inflating the energy
-                # budget by ~15% on tracks with many corner-limited
-                # segments. We back out the actual delivered torque
-                # from the realized acceleration: a_actual = (v_exit^2
-                # - v_entry^2) / (2L); F_drive_actual = m * a_actual
-                # + resist_f; T_motor_actual = wheel_force /
-                # (gear_ratio * tire_radius * gearbox_eff). Clamped
-                # to [0, motor_torque] so the correction can only
-                # *reduce* commanded torque, never amplify it.
-                if (
-                    cmd.action == ControlAction.THROTTLE
-                    and motor_torque > 0.0
-                    and segment.length_m > 0.0
-                ):
-                    a_actual = (
-                        exit_speed * exit_speed - speed * speed
-                    ) / (2.0 * segment.length_m)
-                    f_drive_actual = self.dynamics.m_effective * a_actual + resist_f
-                    if f_drive_actual < 0.0:
-                        # Net deceleration despite throttle — physical
-                        # cap means motor torque drops to zero and the
-                        # remaining decel comes from tire/grip drag.
-                        motor_torque = 0.0
-                        drive_f = 0.0
-                    else:
-                        gear = self.powertrain.config.gear_ratio
-                        radius = self.powertrain.TIRE_RADIUS_M
-                        eta_gb = self.powertrain._GEARBOX_EFFICIENCY
-                        denom = gear * eta_gb / radius
-                        if denom > 0.0:
-                            motor_torque_required = f_drive_actual / denom
-                            if motor_torque_required < motor_torque:
-                                motor_torque = motor_torque_required
-                                # Logged drive_f stays consistent with the
-                                # delivered motor_torque for downstream
-                                # mechanical-work bookkeeping.
-                                drive_f = self.powertrain.wheel_force(motor_torque)
+                # Keep electrical power consistent with the force actually
+                # delivered after traction and speed-limit resolution.
+                if cmd.action == ControlAction.THROTTLE and motor_torque > 0.0:
+                    delivered_torque = (
+                        self.powertrain.motor_torque_from_wheel_force(drive_f)
+                    )
+                    if delivered_torque < motor_torque:
+                        motor_torque = max(0.0, delivered_torque)
+                        drive_f = self.powertrain.wheel_force(motor_torque)
+
+                net_force = drive_f + regen_f - brake_f - resist_f
+                kinetic_energy_delta_j = (
+                    0.5
+                    * self.dynamics.m_effective
+                    * (exit_speed * exit_speed - speed * speed)
+                )
+                mechanical_brake_energy_j = brake_f * segment.length_m
 
                 # 7. Electrical power and pack current.
                 #
@@ -499,6 +681,48 @@ class SimulationEngine:
                 else:
                     regen_energy_j += -segment_energy_j
 
+                longitudinal_g = (
+                    net_force / (self.dynamics.m_effective * GRAVITY_M_S2)
+                    if self.dynamics.m_effective > 0.0 else 0.0
+                )
+                lateral_g = avg_speed * avg_speed * segment.curvature / GRAVITY_M_S2
+                if self.dynamics.load_transfer is not None:
+                    fl_fz, fr_fz, rl_fz, rr_fz = self.dynamics.load_transfer.tire_loads(
+                        avg_speed, lateral_g, longitudinal_g,
+                    )
+                else:
+                    front = (
+                        self.vehicle.vehicle.mass_kg
+                        * GRAVITY_M_S2
+                        * self.vehicle.vehicle.weight_distribution_front
+                    )
+                    rear = self.vehicle.vehicle.mass_kg * GRAVITY_M_S2 - front
+                    fl_fz = fr_fz = front / 2.0
+                    rl_fz = rr_fz = rear / 2.0
+
+                total_fz = max(fl_fz + fr_fz + rl_fz + rr_fz, 1e-9)
+                brake_fx = [
+                    -brake_f * fl_fz / total_fz,
+                    -brake_f * fr_fz / total_fz,
+                    -brake_f * rl_fz / total_fz,
+                    -brake_f * rr_fz / total_fz,
+                ]
+                fl_fx = brake_fx[0]
+                fr_fx = brake_fx[1]
+                rl_fx = brake_fx[2] + drive_f / 2.0 + regen_f / 2.0
+                rr_fx = brake_fx[3] + drive_f / 2.0 + regen_f / 2.0
+                total_lat_force = (
+                    self.vehicle.vehicle.mass_kg
+                    * avg_speed
+                    * avg_speed
+                    * segment.curvature
+                )
+                front_lat = (
+                    total_lat_force
+                    * self.vehicle.vehicle.weight_distribution_front
+                )
+                rear_lat = total_lat_force - front_lat
+
                 # 11. Record state
                 records.append({
                     "lap": lap,
@@ -516,15 +740,36 @@ class SimulationEngine:
                     "electrical_power_w": elec_power,
                     "drive_force_n": drive_f,
                     "regen_force_n": regen_f,
+                    "brake_force_n": brake_f,
                     "resistance_force_n": resist_f,
                     "net_force_n": net_force,
+                    "kinetic_energy_delta_j": kinetic_energy_delta_j,
+                    "mechanical_brake_energy_j": mechanical_brake_energy_j,
+                    "entry_speed_ms": speed,
+                    "exit_speed_ms": exit_speed,
                     "segment_time_s": seg_time,
                     "action": cmd.action.value,
                     "throttle_pct": cmd.throttle_pct,
                     "brake_pct": cmd.brake_pct,
                     "curvature": segment.curvature,
-                    "corner_speed_limit_ms": corner_limit,
+                    "corner_speed_limit_ms": speed_limit,
+                    "speed_limit_active": speed_limited,
+                    "speed_limit_violation": speed_limit_violation,
                     "grade": segment.grade,
+                    "lateral_g": lateral_g,
+                    "longitudinal_g": longitudinal_g,
+                    "wheel_fl_fx_n": fl_fx,
+                    "wheel_fr_fx_n": fr_fx,
+                    "wheel_rl_fx_n": rl_fx,
+                    "wheel_rr_fx_n": rr_fx,
+                    "wheel_fl_fy_n": front_lat / 2.0,
+                    "wheel_fr_fy_n": front_lat / 2.0,
+                    "wheel_rl_fy_n": rear_lat / 2.0,
+                    "wheel_rr_fy_n": rear_lat / 2.0,
+                    "wheel_fl_fz_n": fl_fz,
+                    "wheel_fr_fz_n": fr_fz,
+                    "wheel_rl_fz_n": rl_fz,
+                    "wheel_rr_fz_n": rr_fz,
                 })
 
                 # 12. Advance state

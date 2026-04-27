@@ -8,6 +8,12 @@ vehicle:
   drag_coefficient: 1.502  # CdA=1.502 from DSS (431N drag at 80 kph)
   rolling_resistance: 0.015
   wheelbase_m: 1.549
+  downforce_coefficient: 2.18  # Explicit assumption: same ClA convention as CT-16EV until measured.
+  cg_height_m: 0.2794
+  weight_distribution_front: 0.53
+  downforce_distribution_front: 0.61
+  aero_drag_is_cda: true
+  aero_downforce_is_cla: true
   rotor_inertia_kg_m2: 0.06   # EMRAX 228 datasheet (same motor)
   wheel_inertia_kg_m2: 0.3    # per wheel estimate
 
@@ -20,6 +26,7 @@ powertrain:
   id_limit_a: 30.0
   gear_ratio: 3.6363  # 40/11 teeth
   drivetrain_efficiency: 0.92
+  rolling_radius_m: 0.2042
   # NF-31: LVCU power constant scaled for CT-17EV 100S pack.
   # Firmware default (420.0) was calibrated for 110S (~410V nominal).
   # With 100S pack (~370V nominal), torque-per-amp at the same ω scales
@@ -64,3 +71,21 @@ battery:
       max_current_a: 35.0
     - temp_c: 65.0
       max_current_a: 0.0
+
+tire:
+  tir_file: "Real-Car-Data-And-Stats/Tire Models from TTC/Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir"
+  static_camber_front_deg: -1.25
+  static_camber_rear_deg: -1.25
+  grip_scale: 1.0
+  grip_scale_source: "independent_assumption_ttc_nominal"
+  grip_scale_notes: "Prediction placeholder; replace with measured CT17 tire validation before design decisions."
+
+suspension:
+  roll_stiffness_front_nm_per_deg: 238.0
+  roll_stiffness_rear_nm_per_deg: 258.0
+  roll_center_height_front_mm: 88.9
+  roll_center_height_rear_mm: 63.5
+  roll_camber_front_deg_per_deg: -0.5
+  roll_camber_rear_deg_per_deg: -0.554
+  front_track_mm: 1194.0
+  rear_track_mm: 1168.0

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -74,6 +74,8 @@ class Track:
 
     name: str
     segments: list[Segment]
+    source: str = "unknown"
+    provenance: dict[str, object] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
     # Properties                                                           #
@@ -399,7 +401,17 @@ class Track:
             float(np.percentile(np.abs(kappa_grid), 99)),
         )
 
-        return cls(name=name, segments=segments)
+        return cls(
+            name=name,
+            segments=segments,
+            source="telemetry_gps_centerline",
+            provenance={
+                "lap_count": len(x_stack),
+                "mean_lap_length_m": mean_lap_length,
+                "centerline_sigma_m": centerline_sigma_m,
+                "bin_size_m": bin_size_m,
+            },
+        )
 
     # ------------------------------------------------------------------ #
     # Legacy fallback: single-lap LatAcc / v^2 with YawRate fill-in       #
@@ -616,7 +628,18 @@ class Track:
             )
             cumulative += segment_lengths[i]
 
-        return cls(name=name, segments=segments)
+        return cls(
+            name=name,
+            segments=segments,
+            source="telemetry_single_lap",
+            provenance={
+                "lap_index_zero_based": chosen_lap_idx,
+                "curvature_source": chosen_curv_source,
+                "bin_size_m": bin_size_m,
+                "smooth_distance_m": smooth_distance_m,
+                "lap_length_m": lap_length,
+            },
+        )
 
 
 # ----------------------------------------------------------------------

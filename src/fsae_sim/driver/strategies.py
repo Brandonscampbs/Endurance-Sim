@@ -380,10 +380,12 @@ class CalibratedStrategy(DriverStrategy):
         num_segments: int,
         name: str = "calibrated",
         params: "DriverParams | None" = None,
+        use_observed_speed_caps: bool = True,
     ) -> None:
         self.name = name
         self._zones = list(zones)
         self._num_segments = num_segments
+        self._use_observed_speed_caps = bool(use_observed_speed_caps)
         # D-28: shared DriverParams surface with PedalProfileStrategy.
         # Defaults to an identity (all 1.0) so existing behavior is
         # unchanged. Applied in ``decide`` to zone intensity.
@@ -424,7 +426,7 @@ class CalibratedStrategy(DriverStrategy):
         # the engine can cap exit_speed. Only populated when a real cap
         # is available (>0) to leave straight-line zones unconstrained.
         meta: dict | None = None
-        if max_speed_ms > 0.0:
+        if self._use_observed_speed_caps and max_speed_ms > 0.0:
             meta = {"max_speed_ms": float(max_speed_ms)}
 
         # D-28: apply optional DriverParams scale/cap.  Multiplier
@@ -478,6 +480,8 @@ class CalibratedStrategy(DriverStrategy):
                 "distance_start_m": z.distance_start_m,
                 "distance_end_m": z.distance_end_m,
                 "label": z.label,
+                "max_speed_ms": z.max_speed_ms,
+                "max_speed_source": z.max_speed_source,
             })
         return pd.DataFrame(rows)
 
@@ -516,11 +520,16 @@ class CalibratedStrategy(DriverStrategy):
                     distance_end_m=z.distance_end_m,
                     label=z.label,
                     max_speed_ms=z.max_speed_ms,
+                    max_speed_source=z.max_speed_source,
                 ))
             else:
                 new_zones.append(z)
         return CalibratedStrategy(
-            new_zones, self._num_segments, name=self.name, params=self._params,
+            new_zones,
+            self._num_segments,
+            name=self.name,
+            params=self._params,
+            use_observed_speed_caps=self._use_observed_speed_caps,
         )
 
     def with_params(self, params: "DriverParams") -> CalibratedStrategy:
@@ -531,12 +540,33 @@ class CalibratedStrategy(DriverStrategy):
         so both strategies now expose a single sweep surface.
         """
         return CalibratedStrategy(
-            self._zones, self._num_segments, name=self.name, params=params,
+            self._zones,
+            self._num_segments,
+            name=self.name,
+            params=params,
+            use_observed_speed_caps=self._use_observed_speed_caps,
         )
 
     @property
     def params(self) -> "DriverParams | None":
         return self._params
+
+    @property
+    def uses_observed_speed_caps(self) -> bool:
+        return self._use_observed_speed_caps and any(
+            z.max_speed_ms > 0.0 and z.max_speed_source != "none"
+            for z in self._zones
+        )
+
+    def without_observed_speed_caps(self) -> CalibratedStrategy:
+        """Return a copy that ignores telemetry-derived speed caps."""
+        return CalibratedStrategy(
+            self._zones,
+            self._num_segments,
+            name=self.name,
+            params=self._params,
+            use_observed_speed_caps=False,
+        )
 
     @classmethod
     def from_telemetry(
@@ -556,6 +586,7 @@ class CalibratedStrategy(DriverStrategy):
         brake_max_pressure_bar: float | None = None,
         merge_tolerance: float = 0.15,
         name: str = "calibrated",
+        use_observed_speed_caps: bool = True,
     ) -> CalibratedStrategy:
         """Calibrate from AiM telemetry.
 
@@ -611,7 +642,12 @@ class CalibratedStrategy(DriverStrategy):
 
         # D-02: no per-segment intensity passed — zone intensity is the
         # single source of runtime truth.
-        return cls(zones, track.num_segments, name=name)
+        return cls(
+            zones,
+            track.num_segments,
+            name=name,
+            use_observed_speed_caps=use_observed_speed_caps,
+        )
 
     @classmethod
     def from_zone_list(

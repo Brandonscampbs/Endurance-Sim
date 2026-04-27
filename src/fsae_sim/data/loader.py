@@ -129,12 +129,26 @@ def load_cleaned_csv(path: str | Path) -> tuple[dict[str, str], pd.DataFrame]:
 
     # Add compatibility columns
     df["GPS Speed"] = df["LFspeed"]
+    df.attrs["speed_source"] = {
+        "GPS Speed": "LFspeed",
+        "note": (
+            "Cleaned data lacks an independent GPS speed channel; GPS Speed "
+            "is a compatibility alias for front-left wheel speed."
+        ),
+    }
 
     # Compute cumulative distance from speed (trapezoidal integration)
     time = df["Time"].values
     speed_ms = df["LFspeed"].values / 3.6
     dt = np.diff(time, prepend=time[0])
     df["Distance on GPS Speed"] = np.cumsum(speed_ms * dt)
+    df.attrs["distance_source"] = {
+        "Distance on GPS Speed": "integrated LFspeed over Time",
+        "note": (
+            "Distance is derived from the cleaned wheel-speed channel, not "
+            "from an independent GPS-distance measurement."
+        ),
+    }
 
     return {}, df
 

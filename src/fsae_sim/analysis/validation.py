@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -48,6 +49,8 @@ class ValidationReport:
     telem_regen_j: float = 0.0
     telem_net_j: float = 0.0
     stints: list["ValidationReport"] | None = None
+    calibration_laps: tuple[int, ...] | None = None
+    validation_laps: tuple[int, ...] | None = None
 
     @property
     def all_passed(self) -> bool:
@@ -124,6 +127,35 @@ def detect_lap_boundaries(
     return laps
 
 
+def assert_calibration_validation_split(
+    *,
+    calibration_laps: Sequence[int] | None,
+    validation_laps: Sequence[int] | None,
+    allow_overlap: bool = False,
+) -> None:
+    """Require calibration and validation lap sets to be independent.
+
+    Lap numbering is caller-defined; the helper only checks overlap.  Use it
+    before fitting telemetry-derived driver, grip, or battery calibrations
+    that will later be scored against held-out laps.
+    """
+    if calibration_laps is None or validation_laps is None:
+        if allow_overlap:
+            return
+        raise ValueError(
+            "Validation requires explicit calibration_laps and validation_laps. "
+            "Pass allow_overlap=True only for exploratory replay/calibration runs."
+        )
+    overlap = set(int(x) for x in calibration_laps) & set(
+        int(x) for x in validation_laps
+    )
+    if overlap and not allow_overlap:
+        raise ValueError(
+            "Calibration and validation lap sets overlap: "
+            f"{sorted(overlap)}. This is circular validation."
+        )
+
+
 def extract_lap_telemetry(
     aim_df: pd.DataFrame,
     start_idx: int,
@@ -145,6 +177,9 @@ def validate_simulation(
     lap_start_idx: int,
     lap_end_idx: int,
     target_pct: float = 5.0,
+    calibration_laps: Sequence[int] | None = None,
+    validation_laps: Sequence[int] | None = None,
+    allow_overlap: bool = False,
 ) -> ValidationReport:
     """Compare simulation output against one lap of real telemetry.
 
@@ -158,6 +193,13 @@ def validate_simulation(
     Returns:
         ValidationReport with all comparison metrics.
     """
+    if calibration_laps is not None or validation_laps is not None:
+        assert_calibration_validation_split(
+            calibration_laps=calibration_laps,
+            validation_laps=validation_laps,
+            allow_overlap=allow_overlap,
+        )
+
     lap_telem = extract_lap_telemetry(aim_df, lap_start_idx, lap_end_idx)
 
     metrics = []
@@ -212,7 +254,17 @@ def validate_simulation(
     if telem_i_mean > 1.0:
         metrics.append(_metric("Mean |pack current|", "A", telem_i_mean, sim_i_mean, 20.0))
 
-    return ValidationReport(metrics=metrics)
+    return ValidationReport(
+        metrics=metrics,
+        calibration_laps=(
+            tuple(int(x) for x in calibration_laps)
+            if calibration_laps is not None else None
+        ),
+        validation_laps=(
+            tuple(int(x) for x in validation_laps)
+            if validation_laps is not None else None
+        ),
+    )
 
 
 def validate_full_endurance(
@@ -223,6 +275,9 @@ def validate_full_endurance(
     sim_total_energy_kwh: float,
     sim_laps: int,
     target_pct: float = 5.0,
+    calibration_laps: Sequence[int] | None = None,
+    validation_laps: Sequence[int] | None = None,
+    allow_overlap: bool = False,
 ) -> ValidationReport:
     """Compare full-endurance simulation against complete AiM recording.
 
@@ -237,6 +292,13 @@ def validate_full_endurance(
     hairpin samples are not dropped. Stint boundaries already exclude the
     driver-change stationary period.
     """
+    if calibration_laps is not None or validation_laps is not None:
+        assert_calibration_validation_split(
+            calibration_laps=calibration_laps,
+            validation_laps=validation_laps,
+            allow_overlap=allow_overlap,
+        )
+
     # --- Stint-aware segmentation (C16) ---
     # Per-stint sub-reports compare a per-stint SLICE of sim_states
     # against the matching telemetry stint.  Previous code passed the
@@ -313,6 +375,7 @@ def validate_full_endurance(
                         stint_sim_time_s, stint_sim_final_soc,
                         stint_sim_energy_kwh, n_stint_laps,
                         target_pct=target_pct,
+                        allow_overlap=True,
                     )
                 )
 
@@ -392,6 +455,14 @@ def validate_full_endurance(
         telem_regen_j=telem_regen_j,
         telem_net_j=telem_net_j,
         stints=stints,
+        calibration_laps=(
+            tuple(int(x) for x in calibration_laps)
+            if calibration_laps is not None else None
+        ),
+        validation_laps=(
+            tuple(int(x) for x in validation_laps)
+            if validation_laps is not None else None
+        ),
     )
 
 
