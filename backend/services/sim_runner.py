@@ -28,6 +28,13 @@ def get_vehicle_config() -> VehicleConfig:
 
 @lru_cache(maxsize=1)
 def get_track() -> Track:
+    """Single-lap track (legacy) used by calibrated/baseline backends.
+
+    Calibrated zones are lap-relative; per-lap stitched tracks need
+    cumulative-distance-aware zones, which the strategy doesn't have
+    yet. Replay paths that want lap-to-lap curvature variation should
+    call ``Track.from_telemetry_per_lap`` directly.
+    """
     aim_df = get_telemetry()
     return Track.from_telemetry(df=aim_df)
 
@@ -69,8 +76,11 @@ def get_baseline_result() -> SimResult:
 def run_single_lap_sim(lap_number: int = 1) -> SimResult:
     """Run a single-lap simulation for visualization."""
     vehicle = get_vehicle_config()
-    track = get_track()
     aim_df = get_telemetry()
+    # Single-lap viz uses the legacy single-lap reconstruction, not the
+    # stitched per-lap track — one lap's geometry is exactly what we
+    # want here, repeated however many times the caller asks for.
+    track = Track.from_telemetry(df=aim_df)
 
     # Use fresh battery (not calibrated-pack) for single-lap
     battery = BatteryModel.from_config_and_data(vehicle.battery, str(_VOLTT_CELL_PATH))

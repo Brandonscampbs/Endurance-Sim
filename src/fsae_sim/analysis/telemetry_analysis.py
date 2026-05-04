@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from fsae_sim.analysis.validation import telemetry_speed_col
 from fsae_sim.driver.strategy import ControlAction
 from fsae_sim.track.track import Track
 
@@ -60,7 +61,8 @@ def extract_tire_grip_scale(
     data to on-car grip.
 
     Args:
-        aim_df: AiM telemetry DataFrame with GPS LatAcc (g) and GPS Speed (km/h).
+        aim_df: AiM telemetry DataFrame with GPS LatAcc (g) and LFspeed
+            or GPS Speed (km/h).
         mass_kg: Total vehicle mass including driver (kg).
         cla: Downforce coefficient * area (ClA, m^2).
         tire_model: PacejkaTireModel instance (uncalibrated).
@@ -76,7 +78,7 @@ def extract_tire_grip_scale(
         n_samples, peak_lat_g.
     """
     g = 9.81
-    speed_kmh = aim_df["GPS Speed"].values
+    speed_kmh = aim_df[telemetry_speed_col(aim_df)].values
     lat_g = np.abs(aim_df["GPS LatAcc"].values)
 
     # Filter: moving and cornering
@@ -136,7 +138,7 @@ def extract_per_segment_actions(
     throttle_col: str = "Throttle Pos",
     front_brake_col: str = "FBrakePressure",
     rear_brake_col: str = "RBrakePressure",
-    speed_col: str = "GPS Speed",
+    speed_col: str | None = None,
     distance_col: str = "Distance on GPS Speed",
 ) -> pd.DataFrame:
     """Sample telemetry at each segment midpoint and classify actions.
@@ -150,7 +152,8 @@ def extract_per_segment_actions(
 
     Args:
         aim_df: AiM telemetry DataFrame with columns: Distance on GPS Speed,
-            GPS Speed, Throttle Pos, FBrakePressure, RBrakePressure.
+            LFspeed or GPS Speed, Throttle Pos, FBrakePressure,
+            RBrakePressure.
         track: Track geometry with segments.
         laps: Which lap indices (0-based into detected laps) to average.
             None = auto-select non-outlier laps (skip first, skip short laps,
@@ -163,6 +166,8 @@ def extract_per_segment_actions(
         curvature, mean_throttle_pct, mean_brake_bar, mean_speed_kmh,
         action, intensity.
     """
+    resolved_speed_col = speed_col or telemetry_speed_col(aim_df)
+
     # Try to detect lap boundaries for per-lap classification
     lap_boundaries = _detect_lap_boundaries_safe(aim_df)
 
@@ -176,7 +181,7 @@ def extract_per_segment_actions(
             throttle_col=throttle_col,
             front_brake_col=front_brake_col,
             rear_brake_col=rear_brake_col,
-            speed_col=speed_col,
+            speed_col=resolved_speed_col,
             distance_col=distance_col,
         )
     else:
@@ -189,7 +194,7 @@ def extract_per_segment_actions(
             throttle_col=throttle_col,
             front_brake_col=front_brake_col,
             rear_brake_col=rear_brake_col,
-            speed_col=speed_col,
+            speed_col=resolved_speed_col,
             distance_col=distance_col,
         )
 
@@ -219,7 +224,10 @@ def _auto_select_laps(
     durations: list[float] = []
     mean_speeds: list[float] = []
     has_time = "Time" in aim_df.columns
-    speed_col = aim_df.get("GPS Speed")
+    try:
+        speed_series = aim_df.get(telemetry_speed_col(aim_df))
+    except KeyError:
+        speed_series = None
     n_rows = len(aim_df)
     for start_idx, end_idx, _ in lap_boundaries:
         # end_idx is exclusive; clamp for `iloc` to stay within bounds.
@@ -230,8 +238,8 @@ def _auto_select_laps(
             durations.append(float(t))
         else:
             durations.append(float("nan"))
-        if speed_col is not None:
-            v = speed_col.iloc[start_idx:end_idx].values
+        if speed_series is not None:
+            v = speed_series.iloc[start_idx:end_idx].values
             mean_speeds.append(float(np.mean(v)) if len(v) else 0.0)
         else:
             mean_speeds.append(float("nan"))
@@ -715,14 +723,17 @@ def _auto_split_driver_laps(
     ``lap_boundaries``.  If no lap-internal pause is detected, falls back
     to a simple midpoint split.
     """
-    speed_col = "GPS Speed" if "GPS Speed" in aim_df.columns else None
-    if speed_col is None or not lap_boundaries:
+    try:
+        speed_name = telemetry_speed_col(aim_df)
+    except KeyError:
+        speed_name = None
+    if speed_name is None or not lap_boundaries:
         half = len(lap_boundaries) // 2
         return list(range(half)), list(range(half, len(lap_boundaries)))
 
     # Find the lap whose minimum speed stays nearest zero the longest —
     # that's the lap the driver-change pit stop lands in.
-    speeds = aim_df[speed_col].values
+    speeds = aim_df[speed_name].values
     best_lap, best_stopped = -1, 0
     for i, (s, e, _) in enumerate(lap_boundaries):
         stopped = int(np.sum(speeds[s:e] < 1.0))

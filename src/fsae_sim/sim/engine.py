@@ -28,6 +28,12 @@ try:
     _HAS_MOTOR_MAP = True
 except ImportError:
     _HAS_MOTOR_MAP = False
+
+try:
+    from fsae_sim.vehicle.inverter_delivery import InverterDeliveryMap
+    _HAS_INVERTER_DELIVERY_MAP = True
+except ImportError:
+    _HAS_INVERTER_DELIVERY_MAP = False
 from pathlib import Path
 
 from fsae_sim.sim.speed_envelope import SpeedEnvelope
@@ -169,7 +175,38 @@ class SimulationEngine:
                 stacklevel=2,
             )
 
-        self.powertrain = PowertrainModel(vehicle.powertrain, efficiency_map=motor_map)
+        # Inverter torque-delivery map: translates LVCU command into the
+        # actual shaft torque the Cascadia inverter delivers, so replay
+        # and calibrated paths produce honest wheel forces. Falls back
+        # to identity (command == delivered) when the map is missing.
+        inverter_delivery_map = None
+        if _HAS_INVERTER_DELIVERY_MAP:
+            repo_root = Path(__file__).resolve().parents[3]
+            delivery_map_path = (
+                repo_root
+                / "Real-Car-Data-And-Stats"
+                / "inverter_delivery_map.csv"
+            )
+            if delivery_map_path.exists():
+                inverter_delivery_map = InverterDeliveryMap.from_csv(
+                    delivery_map_path,
+                    inverter_torque_cap_nm=vehicle.powertrain.torque_limit_inverter_nm,
+                )
+            else:
+                warnings.warn(
+                    f"InverterDeliveryMap CSV not found at {delivery_map_path}; "
+                    "the sim will treat LVCU commands as if the inverter "
+                    "delivered them perfectly. Run "
+                    "scripts/build_inverter_delivery_map.py to regenerate.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        self.powertrain = PowertrainModel(
+            vehicle.powertrain,
+            efficiency_map=motor_map,
+            inverter_delivery_map=inverter_delivery_map,
+        )
 
         tire_cfg = getattr(vehicle, "tire", None)
         susp_cfg = getattr(vehicle, "suspension", None)
@@ -312,17 +349,22 @@ class SimulationEngine:
             seg_mid_distance_m: float,
         ) -> float:
             rpm = self.powertrain.motor_rpm_from_speed(op_speed_ms)
+            if is_replay:
+                torque = float(self.strategy.target_torque(seg_mid_distance_m))
+                if getattr(self.strategy, "torque_is_delivered", False):
+                    return torque
+                return self.powertrain.apply_inverter_delivery(rpm, torque)
             if command.action == ControlAction.THROTTLE:
-                if is_replay:
-                    return float(self.strategy.target_torque(seg_mid_distance_m))
                 if is_calibrated:
                     ceiling = self.powertrain.lvcu_torque_ceiling(
                         rpm, current_limit_a,
                     )
-                    return command.throttle_pct * ceiling
-                return float(self.powertrain.lvcu_torque_command(
-                    command.throttle_pct, rpm, current_limit_a,
-                ))
+                    lvcu = command.throttle_pct * ceiling
+                else:
+                    lvcu = float(self.powertrain.lvcu_torque_command(
+                        command.throttle_pct, rpm, current_limit_a,
+                    ))
+                return self.powertrain.apply_inverter_delivery(rpm, lvcu)
             return 0.0
 
         def command_forces(
@@ -339,13 +381,18 @@ class SimulationEngine:
             brake_force = 0.0
             regen_force = 0.0
 
-            if command.action == ControlAction.THROTTLE and torque > 0.0:
+            if torque > 0.0 and (is_replay or command.action == ControlAction.THROTTLE):
                 drive_force = self.powertrain.wheel_force(torque)
                 drive_force = min(
                     drive_force,
                     self.dynamics.max_traction_force(op_speed_ms),
                 )
-            elif command.action == ControlAction.BRAKE:
+            elif torque < 0.0 and is_replay:
+                regen_force = self.powertrain.wheel_force(torque)
+
+            if command.action == ControlAction.BRAKE or (
+                is_replay and command.brake_pct > 0.0
+            ):
                 brake_force = self.dynamics.mechanical_brake_force(
                     command.brake_pct, op_speed_ms,
                 )
@@ -415,8 +462,23 @@ class SimulationEngine:
                 violated,
             )
 
+        # Stitched per-lap tracks tag each Segment with its source lap
+        # index. When that's the case, the outer ``for lap in
+        # range(num_laps)`` loop lies — the segments themselves know
+        # which lap they belong to, and the loop counter would just
+        # repeat the same stitched track ``num_laps`` times. Detect this
+        # by checking the first segment, then read ``seg.lap_index`` for
+        # the recorded ``lap`` field below.
+        segments_carry_lap_index = (
+            len(segments) > 0
+            and getattr(segments[0], "lap_index", -1) >= 0
+        )
+
         for lap in range(num_laps):
             for seg_idx, segment in enumerate(segments):
+                effective_lap = (
+                    segment.lap_index if segments_carry_lap_index else lap
+                )
                 # Build SimState for driver strategy
                 sim_state = SimState(
                     time=time,
@@ -426,7 +488,7 @@ class SimulationEngine:
                     pack_voltage=pack_voltage,
                     pack_current=last_pack_current,  # D-11
                     cell_temp=temp,
-                    lap=lap,
+                    lap=effective_lap,
                     segment_idx=seg_idx,
                 )
 
@@ -465,133 +527,111 @@ class SimulationEngine:
                 # exceed the corner limit.
                 # BMS current limit for LVCU torque command
                 bms_current_limit = self.battery_model.max_discharge_current(temp, soc)
-                motor_rpm = self.powertrain.motor_rpm_from_speed(speed)
 
-                # 3. Compute forces based on driver action
-                #    ReplayStrategy: use recorded LVCU Torque Req directly
-                #    (already the final inverter command, no re-processing).
-                #    CalibratedStrategy: intensity is a torque fraction
-                #    (LVCU Torque Req / 85 Nm), already through the dead
-                #    zone remap. Use lvcu_torque_ceiling to apply power
-                #    limiting without double-processing the dead zone.
-                #    Other strategies: raw throttle through full LVCU model.
-                if cmd.action == ControlAction.THROTTLE:
-                    if is_replay:
-                        # D-15: replay torque is the measured delivered
-                        # torque — field-weakening is already baked in.
-                        seg_mid_dist = distance + segment.length_m / 2.0
-                        motor_torque = self.strategy.target_torque(seg_mid_dist)
-                    elif is_calibrated:
-                        ceiling = self.powertrain.lvcu_torque_ceiling(
-                            motor_rpm, bms_current_limit,
-                        )
-                        motor_torque = cmd.throttle_pct * ceiling
-                    else:
-                        motor_torque = self.powertrain.lvcu_torque_command(
-                            cmd.throttle_pct, motor_rpm, bms_current_limit,
-                        )
-                    drive_f = self.powertrain.wheel_force(motor_torque)
-                    drive_f = min(drive_f, self.dynamics.max_traction_force(speed))
-                    brake_f = 0.0
-                    regen_f = 0.0
-                elif cmd.action == ControlAction.BRAKE:
-                    # CT-16EV mechanical brakes: hydraulic pressure on
-                    # friction pads, sized to lock all four wheels at
-                    # peak — i.e., the only physical limit is tire-grip,
-                    # not pad capacity. Use ``mechanical_brake_force``
-                    # which scales the (per-speed) tire-limited maximum
-                    # by ``brake_pct``. The previous implementation used
-                    # ``powertrain.regen_force`` as a proxy and silently
-                    # capped braking at motor torque — about 0.5 g at
-                    # racing speeds, vs the ~1 g real drivers pull on
-                    # mechanical pads. That under-braking forced the
-                    # forward-backward speed envelope to start
-                    # decelerating ~13 m earlier than the real driver,
-                    # producing a 15 km/h sim-slow band before every
-                    # tight corner.
-                    drive_f = 0.0
-                    brake_f = self.dynamics.mechanical_brake_force(
-                        cmd.brake_pct, speed,
+                seg_mid_dist = distance + segment.length_m / 2.0
+
+                def resolve_at_operating_speed(
+                    op_speed_ms: float,
+                ) -> tuple[float, float, float, float, float, float, bool, bool]:
+                    motor_torque_n, drive_n, brake_n, regen_n = command_forces(
+                        op_speed_ms, cmd, bms_current_limit, seg_mid_dist,
                     )
-                    regen_f = 0.0
-                else:  # COAST
-                    drive_f = 0.0
-                    brake_f = 0.0
-                    regen_f = 0.0
+                    resist_n = self.dynamics.total_resistance(
+                        op_speed_ms, segment.grade, segment.curvature,
+                    )
+                    (
+                        exit_v,
+                        drive_n,
+                        brake_n,
+                        net_n,
+                        limited,
+                        violated,
+                    ) = enforce_speed_limit(
+                        speed,
+                        segment.length_m,
+                        drive_n,
+                        brake_n,
+                        regen_n,
+                        resist_n,
+                        speed_limit,
+                    )
+                    return (
+                        exit_v,
+                        motor_torque_n,
+                        drive_n,
+                        brake_n,
+                        regen_n,
+                        resist_n,
+                        limited,
+                        violated,
+                    )
 
-                # 4. Resistive forces
-                resist_f = self.dynamics.total_resistance(speed, segment.grade, segment.curvature)
-
-                # 5. Net force and speed resolution
-                net_force = drive_f + regen_f - brake_f - resist_f
-
+                # Predictor-corrector: estimate exit from entry-speed
+                # forces, then recompute forces at the segment operating
+                # speed. This keeps drag, field weakening, traction limits,
+                # and brake force tied to the speed where the segment is
+                # actually traversed.
                 (
                     exit_speed,
-                    drive_f,
-                    brake_f,
-                    net_force,
-                    speed_limited,
-                    speed_limit_violation,
-                ) = enforce_speed_limit(
-                    speed,
-                    segment.length_m,
+                    motor_torque,
                     drive_f,
                     brake_f,
                     regen_f,
                     resist_f,
-                    speed_limit,
+                    speed_limited,
+                    speed_limit_violation,
+                ) = resolve_at_operating_speed(speed)
+                op_speed = (speed + max(exit_speed, 0.0)) / 2.0
+                (
+                    exit_speed,
+                    motor_torque,
+                    drive_f,
+                    brake_f,
+                    regen_f,
+                    resist_f,
+                    corrected_limited,
+                    corrected_violation,
+                ) = resolve_at_operating_speed(op_speed)
+                speed_limited = speed_limited or corrected_limited
+                speed_limit_violation = (
+                    speed_limit_violation or corrected_violation
                 )
                 exit_speed = max(exit_speed, self._MIN_SPEED_MS)
-
-                # D-09: zone-level speed cap.  If the driver strategy
-                # attached ``max_speed_ms`` via metadata (observed peak
-                # speed for the current zone), clamp exit speed to it
-                # so the sim never carries more speed through a zone
-                # than the real driver demonstrated.  Strategies without
-                # metadata are unaffected (metadata defaults to None).
-                if cmd.metadata is not None and "max_speed_ms" in cmd.metadata:
-                    zone_cap = float(cmd.metadata["max_speed_ms"])
-                    if zone_cap > 0.0:
-                        (
-                            exit_speed,
-                            drive_f,
-                            brake_f,
-                            net_force,
-                            zone_limited,
-                            zone_violation,
-                        ) = enforce_speed_limit(
-                            speed,
-                            segment.length_m,
-                            drive_f,
-                            brake_f,
-                            regen_f,
-                            resist_f,
-                            zone_cap,
-                        )
-                        speed_limited = speed_limited or zone_limited
-                        speed_limit_violation = (
-                            speed_limit_violation or zone_violation
-                        )
+                net_force = drive_f + regen_f - brake_f - resist_f
 
                 avg_speed = (speed + exit_speed) / 2.0
                 seg_time = segment_time(speed, exit_speed, segment.length_m)
                 motor_rpm = self.powertrain.motor_rpm_from_speed(avg_speed)
 
-                # Recompute torque at resolved avg speed for accurate power calc
-                if cmd.action == ControlAction.THROTTLE:
-                    if is_replay:
-                        # D-15: replay torque is the measured delivered
-                        # torque — field-weakening is already baked in.
-                        seg_mid_dist = distance + segment.length_m / 2.0
-                        motor_torque = self.strategy.target_torque(seg_mid_dist)
-                    elif is_calibrated:
+                # Recompute torque at resolved avg speed for accurate
+                # power/state reporting. Replay always follows the
+                # recorded torque channel; the action label does not
+                # suppress torque during brake/throttle overlap.
+                if is_replay:
+                    seg_mid_dist = distance + segment.length_m / 2.0
+                    lvcu_command = self.strategy.target_torque(seg_mid_dist)
+                    if getattr(self.strategy, "torque_is_delivered", False):
+                        motor_torque = float(lvcu_command)
+                    else:
+                        motor_torque = self.powertrain.apply_inverter_delivery(
+                            motor_rpm, lvcu_command,
+                        )
+                elif cmd.action == ControlAction.THROTTLE:
+                    if is_calibrated:
                         ceiling = self.powertrain.lvcu_torque_ceiling(
                             motor_rpm, bms_current_limit,
                         )
-                        motor_torque = cmd.throttle_pct * ceiling
+                        lvcu_command = cmd.throttle_pct * ceiling
                     else:
-                        motor_torque = self.powertrain.lvcu_torque_command(
+                        lvcu_command = self.powertrain.lvcu_torque_command(
                             cmd.throttle_pct, motor_rpm, bms_current_limit,
+                        )
+                    if not is_replay:
+                        # Inverter delivery map translates LVCU request to
+                        # actually-delivered shaft torque, so wheel force and
+                        # electrical power stay consistent across paths.
+                        motor_torque = self.powertrain.apply_inverter_delivery(
+                            motor_rpm, lvcu_command,
                         )
                 elif cmd.action == ControlAction.BRAKE:
                     # Mechanical brake: motor stays off, decel is
@@ -606,7 +646,10 @@ class SimulationEngine:
 
                 # Keep electrical power consistent with the force actually
                 # delivered after traction and speed-limit resolution.
-                if cmd.action == ControlAction.THROTTLE and motor_torque > 0.0:
+                if (
+                    motor_torque > 0.0
+                    and (is_replay or cmd.action == ControlAction.THROTTLE)
+                ):
                     delivered_torque = (
                         self.powertrain.motor_torque_from_wheel_force(drive_f)
                     )
@@ -725,7 +768,7 @@ class SimulationEngine:
 
                 # 11. Record state
                 records.append({
-                    "lap": lap,
+                    "lap": effective_lap,
                     "segment_idx": seg_idx,
                     "time_s": time,
                     "distance_m": distance,
@@ -781,6 +824,9 @@ class SimulationEngine:
                 pack_voltage = new_voltage
                 last_pack_current = pack_current  # D-11
 
+                if segments_carry_lap_index:
+                    laps_completed = max(laps_completed, effective_lap + 1)
+
                 # Check termination conditions
                 if soc <= self.vehicle.battery.discharged_soc_pct:
                     return self._build_result(
@@ -793,7 +839,15 @@ class SimulationEngine:
                         discharge_energy_j, regen_energy_j,
                     )
 
-            laps_completed += 1
+            if segments_carry_lap_index:
+                # Stitched-per-lap track: the outer loop walked through
+                # all real laps in one pass, count them by unique tag.
+                laps_completed = max(
+                    laps_completed,
+                    len({s.lap_index for s in segments}),
+                )
+            else:
+                laps_completed += 1
 
         return self._build_result(
             records, time, total_energy_j, soc, laps_completed,

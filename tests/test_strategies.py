@@ -152,6 +152,85 @@ class TestReplayStrategy:
         strategy = ReplayStrategy.from_full_endurance(aim_df, lap_distance_m=100.0)
         assert strategy.target_torque(0.0) < -30.0
 
+    def test_replay_brake_action_threshold_uses_physical_pressure(self):
+        """Brake classification should ignore sub-2 bar pressure noise."""
+        import pandas as pd
+
+        n = 100
+        dist = np.linspace(0, 100, n)
+        brake = np.concatenate([np.full(50, 1.0), np.full(50, 3.0)])
+        aim_df = pd.DataFrame({
+            "Distance on GPS Speed": dist,
+            "GPS Speed": np.full(n, 30.0),
+            "Throttle Pos": np.zeros(n),
+            "FBrakePressure": brake,
+            "RBrakePressure": np.zeros(n),
+            "LVCU Torque Req": np.zeros(n),
+            "Pack Voltage": np.full(n, 400.0),
+            "Pack Current": np.zeros(n),
+        })
+
+        strategy = ReplayStrategy.from_full_endurance(aim_df, lap_distance_m=100.0)
+
+        low_pressure = SimState(0, 25.0, 10.0, 0.9, 440, 20, 30, 0, 0)
+        high_pressure = SimState(0, 75.0, 10.0, 0.9, 440, 20, 30, 0, 0)
+
+        assert strategy.decide(low_pressure, []).action == ControlAction.COAST
+        assert strategy.decide(high_pressure, []).action == ControlAction.BRAKE
+
+    def test_replay_preserves_brake_pressure_during_throttle_overlap(self):
+        """Replay should not drop measured brake pressure when torque is active."""
+        import pandas as pd
+
+        n = 100
+        dist = np.linspace(0, 100, n)
+        aim_df = pd.DataFrame({
+            "Distance on GPS Speed": dist,
+            "GPS Speed": np.full(n, 30.0),
+            "Throttle Pos": np.full(n, 40.0),
+            "FBrakePressure": np.full(n, -18.5),
+            "RBrakePressure": np.full(n, 4.0),
+            "LVCU Torque Req": np.full(n, 50.0),
+            "Pack Voltage": np.full(n, 400.0),
+            "Pack Current": np.zeros(n),
+        })
+
+        strategy = ReplayStrategy.from_full_endurance(aim_df, lap_distance_m=100.0)
+        state = SimState(0, 50.0, 10.0, 0.9, 440, 20, 30, 0, 0)
+
+        command = strategy.decide(state, [])
+
+        assert command.action == ControlAction.THROTTLE
+        assert command.throttle_pct == pytest.approx(0.4)
+        assert command.brake_pct > 0.0
+
+    def test_replay_prefers_delivered_torque_feedback(self):
+        """Replay validation should use actual inverter output when present."""
+        import pandas as pd
+
+        n = 20
+        dist = np.linspace(0, 100, n)
+        aim_df = pd.DataFrame({
+            "Distance on GPS Speed": dist,
+            "Throttle Pos": np.full(n, 50.0),
+            "FBrakePressure": np.zeros(n),
+            "RBrakePressure": np.zeros(n),
+            "LVCU Torque Req": np.full(n, 80.0),
+            "Torque Feedback": np.full(n, 55.0),
+            "Pack Voltage": np.full(n, 400.0),
+            "Pack Current": np.full(n, 10.0),
+        })
+
+        strategy = ReplayStrategy.from_aim_data(
+            aim_df, 0, n, lap_distance_m=100.0,
+            prefer_torque_feedback=True,
+        )
+
+        assert strategy.torque_is_delivered
+        assert strategy.target_torque(50.0) == pytest.approx(55.0)
+        assert strategy.has_electrical_power
+        assert strategy.measured_electrical_power(50.0) == pytest.approx(4000.0)
+
 
 # ---------------------------------------------------------------------------
 # CoastOnlyStrategy

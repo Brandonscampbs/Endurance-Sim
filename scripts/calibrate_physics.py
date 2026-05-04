@@ -22,8 +22,13 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
 from fsae_sim.analysis.telemetry_analysis import extract_tire_grip_scale  # noqa: E402
+from fsae_sim.analysis.validation import (  # noqa: E402
+    detect_lap_boundaries,
+    telemetry_speed_col,
+)
 from fsae_sim.data.loader import load_cleaned_csv  # noqa: E402
 from fsae_sim.physics_constants import AIR_DENSITY_KG_M3, GRAVITY_M_S2  # noqa: E402
+from fsae_sim.track.track import Track  # noqa: E402
 from fsae_sim.vehicle import VehicleConfig  # noqa: E402
 from fsae_sim.vehicle.tire_model import PacejkaTireModel  # noqa: E402
 
@@ -31,6 +36,29 @@ from fsae_sim.vehicle.tire_model import PacejkaTireModel  # noqa: E402
 REPO_ROOT = REPO
 TELEM = REPO / "Real-Car-Data-And-Stats" / "CleanedEndurance.csv"
 CONFIG = REPO / "configs" / "ct16ev.yaml"
+
+
+def closed_loop_grade_series(aim_df: pd.DataFrame) -> np.ndarray:
+    """Return simulator-grade samples interpolated onto telemetry rows."""
+    grade = np.zeros(len(aim_df), dtype=float)
+    laps = detect_lap_boundaries(aim_df)
+    if not laps:
+        return grade
+
+    track = Track.from_telemetry(df=aim_df)
+    seg_dist = np.array(
+        [seg.distance_start_m for seg in track.segments],
+        dtype=float,
+    )
+    seg_grade = np.array([seg.grade for seg in track.segments], dtype=float)
+    for _, (s_idx, e_idx, _) in enumerate(laps):
+        lap = aim_df.iloc[s_idx:e_idx]
+        lap_dist = (
+            lap["Distance on GPS Speed"].values
+            - lap["Distance on GPS Speed"].iloc[0]
+        )
+        grade[s_idx:e_idx] = np.interp(lap_dist, seg_dist, seg_grade)
+    return grade
 
 
 def derive_parasitic_drag(aim_df: pd.DataFrame, vehicle: VehicleConfig) -> dict:
@@ -49,7 +77,7 @@ def derive_parasitic_drag(aim_df: pd.DataFrame, vehicle: VehicleConfig) -> dict:
     in the AiM channel ``GPS LonAcc``, in g). Use median across all
     qualifying samples — robust to one-off transients.
     """
-    speed_kmh = aim_df["GPS Speed"].values
+    speed_kmh = aim_df[telemetry_speed_col(aim_df)].values
     speed_ms = speed_kmh * (1000.0 / 3600.0)
     throttle = aim_df["Throttle Pos"].values
     brake = np.maximum(
@@ -58,12 +86,7 @@ def derive_parasitic_drag(aim_df: pd.DataFrame, vehicle: VehicleConfig) -> dict:
     )
     lat_g = np.abs(aim_df["GPS LatAcc"].values)
     lon_g = aim_df["GPS LonAcc"].values  # signed; coast = negative
-    grade = (
-        np.tan(np.radians(aim_df["GPS Slope"].values))
-        if "GPS Slope" in aim_df.columns
-        else np.zeros(len(aim_df))
-    )
-    grade = np.nan_to_num(grade, nan=0.0)
+    grade = closed_loop_grade_series(aim_df)
 
     # Strict coast filter
     mask = (
@@ -105,11 +128,17 @@ def derive_parasitic_drag(aim_df: pd.DataFrame, vehicle: VehicleConfig) -> dict:
 
     # Drop pathological samples (could be coast-down with regen contribution).
     f_par = f_par[np.isfinite(f_par)]
+    winsor_lo = float(np.percentile(f_par, 5))
+    winsor_hi = float(np.percentile(f_par, 95))
+    f_par_winsor = np.clip(f_par, winsor_lo, winsor_hi)
 
     return {
         "n_samples": int(len(f_par)),
         "median_n": float(np.median(f_par)),
         "mean_n": float(np.mean(f_par)),
+        "winsor95_mean_n": float(np.mean(f_par_winsor)),
+        "winsor95_low_n": winsor_lo,
+        "winsor95_high_n": winsor_hi,
         "p25_n": float(np.percentile(f_par, 25)),
         "p75_n": float(np.percentile(f_par, 75)),
         "min_speed_ms": float(v.min()),

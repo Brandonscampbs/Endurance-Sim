@@ -45,6 +45,14 @@ from fsae_sim.analysis.telemetry_analysis import (
 # as throttle vs brake vs coast.
 _THROTTLE_ACTION_THRESHOLD = 0.05
 _BRAKE_ACTION_THRESHOLD = 0.05
+_BRAKE_ACTION_THRESHOLD_BAR = 2.0
+
+
+def _telemetry_speed_col(df: pd.DataFrame) -> str:
+    """Prefer the wheel-speed truth channel in cleaned telemetry."""
+    if "LFspeed" in df.columns:
+        return "LFspeed"
+    return "GPS Speed"
 
 
 class ReplayStrategy(DriverStrategy):
@@ -72,10 +80,19 @@ class ReplayStrategy(DriverStrategy):
         lap_distance_m: float,
         *,
         wrap: bool = True,
+        brake_action_threshold: float | None = None,
+        torque_is_delivered: bool = False,
+        electrical_power_w: np.ndarray | None = None,
     ) -> None:
         self._lap_distance_m = lap_distance_m
         self._total_distance_m = float(distances_m[-1])
         self._wrap = wrap
+        self._torque_is_delivered = bool(torque_is_delivered)
+        self._brake_action_threshold = (
+            float(brake_action_threshold)
+            if brake_action_threshold is not None
+            else _BRAKE_ACTION_THRESHOLD
+        )
         self._throttle_interp = interp1d(
             distances_m, throttle_pct, kind="linear",
             bounds_error=False, fill_value=(float(throttle_pct[0]), float(throttle_pct[-1])),
@@ -88,6 +105,29 @@ class ReplayStrategy(DriverStrategy):
             distances_m, torque_nm, kind="linear",
             bounds_error=False, fill_value=(float(torque_nm[0]), float(torque_nm[-1])),
         )
+        self._power_interp = None
+        if electrical_power_w is not None:
+            self._power_interp = interp1d(
+                distances_m, electrical_power_w, kind="linear",
+                bounds_error=False,
+                fill_value=(float(electrical_power_w[0]), float(electrical_power_w[-1])),
+            )
+
+    @property
+    def torque_is_delivered(self) -> bool:
+        return self._torque_is_delivered
+
+    @property
+    def has_electrical_power(self) -> bool:
+        return self._power_interp is not None
+
+    @staticmethod
+    def _clean_torque_channel(values: np.ndarray, limit_nm: float) -> np.ndarray:
+        """Interpolate finite torque samples and clip CAN dropouts."""
+        s = pd.Series(np.asarray(values, dtype=float))
+        s = s.where(np.isfinite(s) & (s.abs() <= limit_nm * 2.0))
+        s = s.interpolate(limit_direction="both").fillna(0.0)
+        return np.clip(s.to_numpy(), -limit_nm, limit_nm)
 
     @classmethod
     def from_aim_data(
@@ -96,6 +136,8 @@ class ReplayStrategy(DriverStrategy):
         lap_start_idx: int,
         lap_end_idx: int,
         lap_distance_m: float,
+        *,
+        prefer_torque_feedback: bool = False,
     ) -> ReplayStrategy:
         """Build single-lap replay from a slice of AiM DataFrame."""
         lap = aim_df.iloc[lap_start_idx:lap_end_idx].copy()
@@ -108,18 +150,41 @@ class ReplayStrategy(DriverStrategy):
         )
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
+        brake_action_threshold = min(
+            1.0, _BRAKE_ACTION_THRESHOLD_BAR / bmax,
+        )
 
         # S18: preserve regen. Previously clipped to [0, +limit] which
         # silently deleted negative torque commands (coast-regen). Keep
         # symmetric [-limit, +limit] so replay drives the true recorded
         # electrical profile.
         inverter_torque_limit = 85.0
-        torque = np.clip(
-            lap["LVCU Torque Req"].values,
-            -inverter_torque_limit, inverter_torque_limit,
+        torque_is_delivered = (
+            prefer_torque_feedback and "Torque Feedback" in lap.columns
         )
+        if torque_is_delivered:
+            torque = cls._clean_torque_channel(
+                lap["Torque Feedback"].values,
+                inverter_torque_limit,
+            )
+        else:
+            torque = np.clip(
+                lap["LVCU Torque Req"].values,
+                -inverter_torque_limit, inverter_torque_limit,
+            )
 
-        return cls(dist, throttle, brake, torque, lap_distance_m, wrap=True)
+        electrical_power = None
+        if {"Pack Voltage", "Pack Current"}.issubset(lap.columns):
+            electrical_power = (
+                lap["Pack Voltage"].values * lap["Pack Current"].values
+            )
+
+        return cls(
+            dist, throttle, brake, torque, lap_distance_m, wrap=True,
+            brake_action_threshold=brake_action_threshold,
+            torque_is_delivered=torque_is_delivered,
+            electrical_power_w=electrical_power,
+        )
 
     @classmethod
     def from_full_endurance(
@@ -127,6 +192,8 @@ class ReplayStrategy(DriverStrategy):
         aim_df: "pd.DataFrame",
         lap_distance_m: float,
         min_speed_kmh: float = 5.0,
+        *,
+        prefer_torque_feedback: bool = False,
     ) -> ReplayStrategy:
         """Build replay from the full AiM endurance recording.
 
@@ -155,7 +222,7 @@ class ReplayStrategy(DriverStrategy):
             aim_df = aim_df.iloc[start_row:].copy()
 
         # Filter to moving samples to cut driver change and stopped periods
-        moving = aim_df["GPS Speed"].values > min_speed_kmh
+        moving = aim_df[_telemetry_speed_col(aim_df)].values > min_speed_kmh
         clean = aim_df[moving].copy()
 
         dist = clean["Distance on GPS Speed"].values.copy()
@@ -170,15 +237,37 @@ class ReplayStrategy(DriverStrategy):
         )
         bmax = max(np.percentile(brake_raw[brake_raw > 0], 99), 1.0) if np.any(brake_raw > 0) else 1.0
         brake = np.clip(brake_raw / bmax, 0.0, 1.0)
+        brake_action_threshold = min(
+            1.0, _BRAKE_ACTION_THRESHOLD_BAR / bmax,
+        )
 
         # S18: preserve regen (see from_aim_data).
         inverter_torque_limit = 85.0
-        torque = np.clip(
-            clean["LVCU Torque Req"].values,
-            -inverter_torque_limit, inverter_torque_limit,
+        torque_is_delivered = (
+            prefer_torque_feedback and "Torque Feedback" in clean.columns
         )
+        if torque_is_delivered:
+            torque = cls._clean_torque_channel(
+                clean["Torque Feedback"].values,
+                inverter_torque_limit,
+            )
+        else:
+            torque = np.clip(
+                clean["LVCU Torque Req"].values,
+                -inverter_torque_limit, inverter_torque_limit,
+            )
+
+        electrical_power = None
+        if {"Pack Voltage", "Pack Current"}.issubset(clean.columns):
+            electrical_power = (
+                clean["Pack Voltage"].values * clean["Pack Current"].values
+            )
 
         mean_torque = float(np.mean(torque))
+        mean_power = (
+            float(np.mean(electrical_power))
+            if electrical_power is not None else None
+        )
 
         # Extend interpolation data with a point beyond the last distance
         # so extrapolation uses reasonable values if sim distance exceeds
@@ -188,9 +277,18 @@ class ReplayStrategy(DriverStrategy):
         throttle_ext = np.append(throttle, 0.5)
         brake_ext = np.append(brake, 0.0)
         torque_ext = np.append(torque, mean_torque)
+        power_ext = (
+            np.append(electrical_power, mean_power)
+            if electrical_power is not None else None
+        )
 
-        return cls(dist_ext, throttle_ext, brake_ext, torque_ext,
-                   lap_distance_m, wrap=False)
+        return cls(
+            dist_ext, throttle_ext, brake_ext, torque_ext,
+            lap_distance_m, wrap=False,
+            brake_action_threshold=brake_action_threshold,
+            torque_is_delivered=torque_is_delivered,
+            electrical_power_w=power_ext,
+        )
 
     def _resolve_distance(self, cumulative_distance_m: float) -> float:
         """Map cumulative sim distance to interpolation distance."""
@@ -202,17 +300,46 @@ class ReplayStrategy(DriverStrategy):
         """Recorded motor torque (Nm) at given cumulative distance."""
         return float(self._torque_interp(self._resolve_distance(distance_m)))
 
+    def measured_electrical_power(self, distance_m: float) -> float:
+        """Recorded pack electrical power (W) at given cumulative distance."""
+        if self._power_interp is None:
+            raise ValueError("ReplayStrategy has no electrical power channel")
+        return float(self._power_interp(self._resolve_distance(distance_m)))
+
     def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
         d = self._resolve_distance(state.distance)
         throttle = float(np.clip(self._throttle_interp(d), 0.0, 1.0))
         brake = float(np.clip(self._brake_interp(d), 0.0, 1.0))
 
-        if brake > _BRAKE_ACTION_THRESHOLD:
-            return ControlCommand(ControlAction.BRAKE, throttle_pct=0.0, brake_pct=brake)
+        # Replay is a measured-input mode: motor torque and hydraulic
+        # brake pressure are independent physical channels.  Preserve the
+        # brake fraction even when the action label is THROTTLE so the
+        # engine can model trail-braking/overlap instead of deleting one
+        # measured channel.
+        if brake > self._brake_action_threshold:
+            if throttle > _THROTTLE_ACTION_THRESHOLD:
+                return ControlCommand(
+                    ControlAction.THROTTLE,
+                    throttle_pct=throttle,
+                    brake_pct=brake,
+                )
+            return ControlCommand(
+                ControlAction.BRAKE,
+                throttle_pct=0.0,
+                brake_pct=brake,
+            )
         elif throttle > _THROTTLE_ACTION_THRESHOLD:
-            return ControlCommand(ControlAction.THROTTLE, throttle_pct=throttle, brake_pct=0.0)
+            return ControlCommand(
+                ControlAction.THROTTLE,
+                throttle_pct=throttle,
+                brake_pct=brake,
+            )
         else:
-            return ControlCommand(ControlAction.COAST, throttle_pct=0.0, brake_pct=0.0)
+            return ControlCommand(
+                ControlAction.COAST,
+                throttle_pct=0.0,
+                brake_pct=brake,
+            )
 
 
 class CoastOnlyStrategy(DriverStrategy):
@@ -579,7 +706,7 @@ class CalibratedStrategy(DriverStrategy):
         throttle_col: str = "Throttle Pos",
         front_brake_col: str = "FBrakePressure",
         rear_brake_col: str = "RBrakePressure",
-        speed_col: str = "GPS Speed",
+        speed_col: str | None = None,
         distance_col: str = "Distance on GPS Speed",
         throttle_threshold: float = 5.0,
         brake_threshold: float = 2.0,
@@ -626,6 +753,7 @@ class CalibratedStrategy(DriverStrategy):
 
         # D-19: plumb column-name kwargs through to the extractor.
         # Previously accepted but dropped on the floor.
+        resolved_speed_col = speed_col or _telemetry_speed_col(aim_df)
         seg_actions = extract_per_segment_actions(
             aim_df, track,
             laps=effective_laps,
@@ -635,7 +763,7 @@ class CalibratedStrategy(DriverStrategy):
             throttle_col=throttle_col,
             front_brake_col=front_brake_col,
             rear_brake_col=rear_brake_col,
-            speed_col=speed_col,
+            speed_col=resolved_speed_col,
             distance_col=distance_col,
         )
         zones = collapse_to_zones(seg_actions, track, merge_tolerance=merge_tolerance)
@@ -841,6 +969,7 @@ class PedalProfileStrategy(DriverStrategy):
         pedal_matrix = []
         brake_matrix = []
         speed_matrix = []
+        speed_col = _telemetry_speed_col(aim_df)
 
         for start_idx, end_idx, _ in selected:
             lap_df = aim_df.iloc[start_idx:end_idx]
@@ -857,7 +986,7 @@ class PedalProfileStrategy(DriverStrategy):
             else:
                 lap_d = lap_dist_raw - lap_dist_raw[0]
             lap_throttle_raw = lap_df["Throttle Pos"].values
-            lap_speed = lap_df["GPS Speed"].values
+            lap_speed = lap_df[speed_col].values
             lap_brake = np.maximum(
                 lap_df["FBrakePressure"].values,
                 lap_df["RBrakePressure"].values,

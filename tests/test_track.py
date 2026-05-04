@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from fsae_sim.track import Segment, Track
@@ -69,6 +70,52 @@ class TestSegmentDataclass:
         ]
         track = Track(name="test", segments=segs)
         assert track.num_segments == 7
+
+    def test_gps_radius_straight_sentinel_is_retained(self):
+        """AiM GPS Radius=10000 marks straights, not samples to drop."""
+        n = 20
+        df = pd.DataFrame({
+            "Distance on GPS Speed": np.linspace(0.0, 19.0, n),
+            "GPS Speed": np.full(n, 30.0),
+            "GPS PosAccuracy": np.zeros(n),
+            "GPS Radius": np.full(n, 10_000.0),
+            "GPS LatAcc": np.zeros(n),
+            "GPS Slope": np.zeros(n),
+        })
+
+        segments, provenance = Track._build_lap_segments(
+            df=df,
+            lap_idx=0,
+            lap_boundary=(0, n, 19.0),
+            bin_size_m=1.0,
+            smooth_distance_m=1.0,
+        )
+
+        assert provenance["lap_length_m"] == pytest.approx(19.0)
+        assert len(segments) == 19
+        assert all(abs(s.curvature) < 1e-9 for s in segments)
+
+    def test_gps_slope_is_closed_loop_debiased(self):
+        """A closed telemetry lap cannot accumulate net elevation."""
+        n = 100
+        df = pd.DataFrame({
+            "Distance on GPS Speed": np.linspace(0.0, 99.0, n),
+            "GPS Speed": np.full(n, 30.0),
+            "GPS PosAccuracy": np.zeros(n),
+            "GPS LatAcc": np.zeros(n),
+            "GPS Slope": np.full(n, 1.0),
+        })
+
+        segments, _ = Track._build_lap_segments(
+            df=df,
+            lap_idx=0,
+            lap_boundary=(0, n, 99.0),
+            bin_size_m=1.0,
+            smooth_distance_m=5.0,
+        )
+
+        net_elevation = sum(s.grade * s.length_m for s in segments)
+        assert net_elevation == pytest.approx(0.0, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------

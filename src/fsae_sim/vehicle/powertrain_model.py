@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional, Union
 from fsae_sim.vehicle.powertrain import PowertrainConfig
 
 if TYPE_CHECKING:
+    from fsae_sim.vehicle.inverter_delivery import InverterDeliveryMap
     from fsae_sim.vehicle.motor_efficiency import MotorEfficiencyMap
 
 
@@ -98,9 +99,11 @@ class PowertrainModel:
         self,
         config: PowertrainConfig,
         efficiency_map: "MotorEfficiencyMap | None" = None,
+        inverter_delivery_map: "InverterDeliveryMap | None" = None,
     ) -> None:
         self.config = config
         self._efficiency_map = efficiency_map
+        self._inverter_delivery_map = inverter_delivery_map
         self.rolling_radius_m = float(config.rolling_radius_m)
 
         # Pre-compute constants used in every call.  The effective torque
@@ -397,6 +400,31 @@ class PowertrainModel:
         if cfg.safety_torque_cap_nm is not None:
             torque_ceiling_nm = min(torque_ceiling_nm, cfg.safety_torque_cap_nm)
         return torque_ceiling_nm
+
+    # ------------------------------------------------------------------
+    # Inverter delivery
+    # ------------------------------------------------------------------
+
+    def apply_inverter_delivery(
+        self, motor_rpm: float, lvcu_command_nm: float,
+    ) -> float:
+        """Translate an LVCU torque request into delivered shaft torque.
+
+        The Cascadia inverter does not perfectly follow the LVCU's
+        command — at very low RPM (transient ramp) and above ~2800 RPM
+        (field weakening), delivered torque sits below the request. The
+        effect is captured by an :class:`InverterDeliveryMap` calibrated
+        from telemetry.
+
+        When no map is attached, returns the command unchanged so the
+        powertrain remains backward-compatible. Negative commands
+        (regen) pass through untouched; the map only models motoring.
+        """
+        if lvcu_command_nm <= 0.0 or self._inverter_delivery_map is None:
+            return lvcu_command_nm
+        return self._inverter_delivery_map.delivered_torque(
+            motor_rpm, lvcu_command_nm,
+        )
 
     # ------------------------------------------------------------------
     # Torque and force through drivetrain

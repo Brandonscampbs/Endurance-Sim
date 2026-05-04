@@ -314,11 +314,11 @@ class VehicleDynamics:
     # Michigan 2025 endurance recording: median 19 N (sign-flipped), mean
     # 31 N, p25-p75 spread ±90 N. The previous 70 N was an over-estimate
     # absorbing other physics gaps (track curvature smoothing, grip scale)
-    # that have since been re-derived independently. 30 N is the conservative
-    # mean — picks up bearing+chain+seal drag without compensating for
-    # downstream model errors.
+    # that have since been re-derived independently. After closed-loop
+    # grade de-biasing, the 95% winsorized coast-down mean is 35.5 N
+    # (the raw mean is dominated by a few stop/coast outliers).
     # See scripts/calibrate_physics.py.
-    _PARASITIC_DRAG_N: float = 30.0
+    _PARASITIC_DRAG_N: float = 35.0
 
     def parasitic_drag(self) -> float:
         """Mechanical parasitic drag (N) from drivetrain and bearings."""

@@ -312,6 +312,8 @@ class SpeedEnvelope:
             torque = self._powertrain.lvcu_torque_ceiling(
                 rpm, bms_current_limit_a,
             )
+            if hasattr(self._powertrain, "apply_inverter_delivery"):
+                torque = self._powertrain.apply_inverter_delivery(rpm, torque)
             f_drive = self._powertrain.wheel_force(torque)
         else:
             f_drive = self._powertrain.drive_force(1.0, speed)

@@ -258,7 +258,8 @@ class BatteryModel:
 
         Args:
             aim_df: Cleaned AiM telemetry DataFrame with ``State of Charge``,
-                ``Pack Voltage``, ``Pack Current``, ``GPS Speed``, ``Time``,
+                ``Pack Voltage``, ``Pack Current``, ``LFspeed`` or
+                ``GPS Speed``, ``Time``,
                 and optionally ``lap`` columns.
             holdout_laps: Optional iterable of lap indices to exclude from
                 the fit. When the validation harness holds out laps
@@ -298,7 +299,8 @@ class BatteryModel:
         soc = aim_df["State of Charge"].values
         voltage = aim_df["Pack Voltage"].values
         current = aim_df["Pack Current"].values
-        speed = aim_df["GPS Speed"].values
+        speed_col = "LFspeed" if "LFspeed" in aim_df.columns else "GPS Speed"
+        speed = aim_df[speed_col].values
 
         # Select low-current, moving samples for clean OCV extraction
         mask = (speed > 5) & (np.abs(current) < 3.0)

@@ -16,6 +16,26 @@ import pandas as pd
 from fsae_sim.data.loader import load_aim_csv
 
 
+TRUE_SPEED_COL = "LFspeed"
+LEGACY_SPEED_COL = "GPS Speed"
+
+
+def telemetry_speed_col(aim_df: pd.DataFrame) -> str:
+    """Return the telemetry speed truth column.
+
+    Cleaned endurance data stores true vehicle speed in ``LFspeed``, the
+    left-front wheel speed sensor. ``GPS Speed`` is only a loader-created
+    compatibility alias for older code and synthetic fixtures.
+    """
+    if TRUE_SPEED_COL in aim_df.columns:
+        return TRUE_SPEED_COL
+    if LEGACY_SPEED_COL in aim_df.columns:
+        return LEGACY_SPEED_COL
+    raise KeyError(
+        "Telemetry speed requires LFspeed (preferred) or GPS Speed fallback."
+    )
+
+
 @dataclass
 class ValidationMetric:
     """Result of one validation comparison."""
@@ -95,7 +115,7 @@ def detect_lap_boundaries(
     """
     dist = aim_df["Distance on GPS Speed"].values
     lat = aim_df["GPS Latitude"].values
-    speed = aim_df["GPS Speed"].values
+    speed = aim_df[telemetry_speed_col(aim_df)].values
 
     # Filter to moving samples
     moving = speed > min_speed_kmh
@@ -226,7 +246,7 @@ def validate_simulation(
     metrics.append(_metric("Mean speed", "km/h", telem_speed_kmh, sim_speed_kmh, target_pct))
 
     # --- Peak speed ---
-    telem_peak = float(lap_telem["GPS Speed"].max())
+    telem_peak = float(lap_telem[telemetry_speed_col(lap_telem)].max())
     sim_peak = float(sim_states["speed_kmh"].max())
     metrics.append(_metric("Peak speed", "km/h", telem_peak, sim_peak, 10.0))
 
@@ -383,7 +403,7 @@ def validate_full_endurance(
     # as driving — pre/post/DC periods are already removed. Otherwise fall
     # back to the >5 km/h heuristic for raw recordings.
     is_cleaned = "stint" in aim_df.columns
-    speed = aim_df["GPS Speed"].values
+    speed = aim_df[telemetry_speed_col(aim_df)].values
     dt_arr = np.diff(aim_df["Time"].values, prepend=aim_df["Time"].values[0])
     if is_cleaned:
         moving_mask = np.ones(len(aim_df), dtype=bool)
