@@ -33,6 +33,21 @@ _SEGMENT_BIN_M: float = 0.5
 # variance across laps without rounding off real hairpins.
 _CENTERLINE_SIGMA_M: float = 1.25
 
+# Single-lap GPS-coordinate derivatives need more smoothing than the
+# multi-lap averaged centerline. After the dynamics-based GPS outlier
+# repair below, 1.00 m keeps replay timing aligned to LFspeed telemetry
+# without speed caps.
+_PER_LAP_GPS_SIGMA_M: float = 1.00
+
+# Per-lap GPS coordinates occasionally contain one- or two-sample position
+# jitter that becomes a false 3-5 m radius after differentiation. Hampel
+# filtering rejects those isolated curvature impulses relative to the local
+# lat/lon-derived median; it does not cap speed or curvature globally.
+_GPS_CURVATURE_HAMPEL_WINDOW_M: float = 20.0
+_GPS_CURVATURE_HAMPEL_SIGMAS: float = 3.0
+_GPS_CURVATURE_DYNAMIC_MIN_DELTA: float = 0.012
+_GPS_CURVATURE_DYNAMIC_SIGMAS: float = 2.0
+
 # Earth's WGS-84 radius (m) used for the lat/lon -> local cartesian step.
 # A flat-earth approximation is fine for a 1 km circuit at 42 deg N: the
 # residual second-order error is sub-millimetre.
@@ -433,7 +448,7 @@ class Track:
         *,
         df: pd.DataFrame | None = None,
         bin_size_m: float = _SEGMENT_BIN_M,
-        smooth_distance_m: float = _CENTERLINE_SIGMA_M,
+        smooth_distance_m: float = _PER_LAP_GPS_SIGMA_M,
         name: str = "Michigan Endurance per-lap",
     ) -> "Track":
         """Build a stitched track where each lap uses its own GPS data.
@@ -476,6 +491,17 @@ class Track:
                 "per-lap track."
             )
 
+        try:
+            reference_track = cls._from_gps_centerline(
+                df=df,
+                lap_boundaries=lap_boundaries,
+                bin_size_m=bin_size_m,
+                centerline_sigma_m=_CENTERLINE_SIGMA_M,
+                name=f"{name} reference",
+            )
+        except Exception:
+            reference_track = None
+
         # Try a per-lap build for every detected lap, then patch any laps
         # that failed quality checks with the first lap that succeeded
         # (which itself acts as the fallback "average" lap for this car).
@@ -488,6 +514,7 @@ class Track:
                     lap_boundary=(s_idx, e_idx, _len),
                     bin_size_m=bin_size_m,
                     smooth_distance_m=smooth_distance_m,
+                    reference_track=reference_track,
                 )
             except ValueError:
                 try:
@@ -563,6 +590,283 @@ class Track:
         )
 
     @classmethod
+    def from_telemetry_full_recording(
+        cls,
+        aim_csv_path: str | Path | None = None,
+        *,
+        df: pd.DataFrame | None = None,
+        bin_size_m: float = _SEGMENT_BIN_M,
+        smooth_distance_m: float = _PER_LAP_GPS_SIGMA_M,
+        name: str = "Michigan Endurance full recording",
+    ) -> "Track":
+        """Build one GPS-coordinate path over the full cleaned recording.
+
+        This is the comparison path for ``CleanedEndurance.csv``. Unlike
+        ``from_telemetry_per_lap``, it keeps the pre-start and post-finish
+        portions of the cleaned file so simulation time and distance compare
+        against the complete endurance record.
+        """
+        if df is None:
+            if aim_csv_path is None:
+                raise ValueError("Either aim_csv_path or df must be supplied.")
+            df = pd.read_csv(aim_csv_path)
+
+        open_segments, provenance = cls._build_full_recording_segments_gps_coords(
+            df=df,
+            bin_size_m=bin_size_m,
+            smooth_distance_m=smooth_distance_m,
+        )
+        try:
+            from fsae_sim.analysis.validation import detect_lap_boundaries
+
+            lap_boundaries = detect_lap_boundaries(df)
+            lap_track = cls.from_telemetry_per_lap(
+                df=df,
+                bin_size_m=bin_size_m,
+                smooth_distance_m=smooth_distance_m,
+                name=f"{name} detected laps",
+            )
+        except Exception:
+            lap_boundaries = []
+            lap_track = None
+
+        if lap_boundaries and lap_track is not None:
+            start_dist = float(df["Distance on GPS Speed"].iloc[0])
+            first_lap_start = float(
+                df["Distance on GPS Speed"].iloc[lap_boundaries[0][0]]
+                - start_dist
+            )
+            last_lap_end = float(
+                df["Distance on GPS Speed"].iloc[lap_boundaries[-1][1] - 1]
+                - start_dist
+            )
+            stitched: list[Segment] = []
+            cumulative = 0.0
+
+            def append_segment(src: Segment, lap_index: int) -> None:
+                nonlocal cumulative
+                stitched.append(
+                    Segment(
+                        index=len(stitched),
+                        distance_start_m=float(cumulative),
+                        length_m=src.length_m,
+                        curvature=src.curvature,
+                        grade=src.grade,
+                        grip_factor=src.grip_factor,
+                        lap_index=lap_index,
+                    )
+                )
+                cumulative += src.length_m
+
+            for seg in open_segments:
+                center = seg.distance_start_m + seg.length_m / 2.0
+                if center < first_lap_start:
+                    append_segment(seg, -1)
+
+            for lap_idx in range(len(lap_boundaries)):
+                for seg in lap_track.segments:
+                    if seg.lap_index == lap_idx:
+                        append_segment(seg, lap_idx)
+
+            for seg in open_segments:
+                center = seg.distance_start_m + seg.length_m / 2.0
+                if center > last_lap_end:
+                    append_segment(seg, -1)
+
+            provenance = {
+                **provenance,
+                "curvature_source": (
+                    "GPS Lat/Lon full recording with per-lap detected "
+                    "sections"
+                ),
+                "total_distance_m": float(cumulative),
+                "detected_lap_distance_m": lap_track.total_distance_m,
+                "open_pre_tail_only": True,
+                "lap_track_provenance": lap_track.provenance,
+            }
+            segments = stitched
+        else:
+            segments = open_segments
+
+        return cls(
+            name=name,
+            segments=segments,
+            source="telemetry_full_recording_gps",
+            provenance=provenance,
+        )
+
+    @classmethod
+    def _build_full_recording_segments_gps_coords(
+        cls,
+        *,
+        df: pd.DataFrame,
+        bin_size_m: float,
+        smooth_distance_m: float,
+    ) -> tuple[list[Segment], dict]:
+        """Construct an open GPS-coordinate path for a full recording."""
+        if not {"GPS Latitude", "GPS Longitude"}.issubset(df.columns):
+            raise ValueError("GPS latitude/longitude columns are required.")
+        if "Distance on GPS Speed" not in df.columns:
+            raise ValueError("Distance on GPS Speed column is required.")
+
+        good_mask = (
+            np.isfinite(df["GPS Latitude"])
+            & np.isfinite(df["GPS Longitude"])
+            & np.isfinite(df["Distance on GPS Speed"])
+        )
+        if "GPS PosAccuracy" in df.columns:
+            good_mask = (
+                good_mask
+                & (df["GPS PosAccuracy"] != _GPS_POS_ACC_BAD)
+            )
+        good = df[good_mask].reset_index(drop=True)
+        if len(good) < 4:
+            raise ValueError("Too few valid GPS coordinate samples.")
+
+        lat = good["GPS Latitude"].values.astype(float)
+        lon = good["GPS Longitude"].values.astype(float)
+        dist = good["Distance on GPS Speed"].values.astype(float)
+        start_dist = float(dist[0])
+        s_raw = dist - start_dist
+        order = np.argsort(s_raw)
+        s_raw = s_raw[order]
+        lat = lat[order]
+        lon = lon[order]
+
+        keep = np.concatenate(([True], np.diff(s_raw) > 1e-6))
+        s_raw = s_raw[keep]
+        lat = lat[keep]
+        lon = lon[keep]
+        if len(s_raw) < 4:
+            raise ValueError("GPS coordinate distance is not monotonic.")
+
+        total_length = float(s_raw[-1])
+        if total_length <= 0.0:
+            raise ValueError("Full recording distance must be positive.")
+
+        lat_med = float(np.median(lat))
+        m_per_deg_lon = _M_PER_DEG_LAT * float(np.cos(np.radians(lat_med)))
+        lat0 = float(lat[0])
+        lon0 = float(lon[0])
+        x = (lon - lon0) * m_per_deg_lon
+        y = (lat - lat0) * _M_PER_DEG_LAT
+
+        n_grid = int(math.ceil(total_length / bin_size_m)) + 1
+        s_grid = np.linspace(0.0, total_length, n_grid)
+        x_g = np.interp(s_grid, s_raw, x)
+        y_g = np.interp(s_grid, s_raw, y)
+
+        ds = total_length / (n_grid - 1)
+        sigma_samples = max(smooth_distance_m / ds, 1e-6)
+        x_smooth = _open_gaussian_filter(x_g, sigma_samples)
+        y_smooth = _open_gaussian_filter(y_g, sigma_samples)
+
+        dx = np.gradient(x_smooth, ds)
+        dy = np.gradient(y_smooth, ds)
+        ddx = np.gradient(dx, ds)
+        ddy = np.gradient(dy, ds)
+        den = (dx * dx + dy * dy) ** 1.5
+        with np.errstate(invalid="ignore", divide="ignore"):
+            kappa_grid = np.where(
+                den > 1e-9, -(dx * ddy - dy * ddx) / den, 0.0,
+            )
+        kappa_grid = np.nan_to_num(
+            kappa_grid, nan=0.0, posinf=0.0, neginf=0.0,
+        )
+
+        if "GPS Slope" in good.columns:
+            slope_raw = np.nan_to_num(good["GPS Slope"].values, nan=0.0)
+            slope_raw = slope_raw[order][keep]
+            slope_grid = np.interp(s_grid, s_raw, slope_raw)
+            grade_grid = np.tan(slope_grid * (math.pi / 180.0))
+        else:
+            grade_grid = np.zeros(n_grid)
+        grade_grid = grade_grid - float(
+            np.trapz(grade_grid, s_grid) / total_length
+        )
+
+        n_bins = int(math.ceil(total_length / bin_size_m))
+        segment_lengths = [bin_size_m] * n_bins
+        residual = total_length - (n_bins - 1) * bin_size_m
+        if residual <= 0.0:
+            residual = bin_size_m
+        segment_lengths[-1] = residual
+        segment_centers = np.array([
+            sum(segment_lengths[:i]) + segment_lengths[i] / 2.0
+            for i in range(n_bins)
+        ])
+
+        seg_kappa = np.interp(segment_centers, s_grid, kappa_grid)
+        hampel_window = max(
+            3,
+            int(round(_GPS_CURVATURE_HAMPEL_WINDOW_M / bin_size_m)),
+        )
+        if hampel_window % 2 == 0:
+            hampel_window += 1
+        seg_kappa = _hampel_filter_1d(
+            seg_kappa,
+            window=hampel_window,
+            n_sigmas=_GPS_CURVATURE_HAMPEL_SIGMAS,
+            periodic=False,
+        )
+        seg_grade = np.interp(segment_centers, s_grid, grade_grid)
+        seg_grade = seg_grade - float(
+            np.average(seg_grade, weights=np.asarray(segment_lengths))
+        )
+
+        try:
+            from fsae_sim.analysis.validation import detect_lap_boundaries
+
+            lap_boundaries = detect_lap_boundaries(df)
+        except Exception:
+            lap_boundaries = []
+        lap_ranges = [
+            (
+                float(df["Distance on GPS Speed"].iloc[s_idx] - start_dist),
+                float(df["Distance on GPS Speed"].iloc[e_idx - 1] - start_dist),
+                lap_idx,
+            )
+            for lap_idx, (s_idx, e_idx, _length) in enumerate(lap_boundaries)
+        ]
+
+        segments: list[Segment] = []
+        cumulative = 0.0
+        for i, length in enumerate(segment_lengths):
+            center = cumulative + length / 2.0
+            lap_index = -1
+            for lap_start, lap_end, idx in lap_ranges:
+                if lap_start <= center <= lap_end:
+                    lap_index = idx
+                    break
+            segments.append(
+                Segment(
+                    index=i,
+                    distance_start_m=float(cumulative),
+                    length_m=float(length),
+                    curvature=float(seg_kappa[i]),
+                    grade=float(seg_grade[i]),
+                    lap_index=lap_index,
+                )
+            )
+            cumulative += length
+
+        provenance = {
+            "curvature_source": "GPS Lat/Lon full recording",
+            "bin_size_m": bin_size_m,
+            "smooth_distance_m": smooth_distance_m,
+            "total_distance_m": float(total_length),
+            "valid_gps_coord_samples": int(len(good)),
+            "num_detected_laps": len(lap_boundaries),
+            "pre_lap_distance_m": (
+                lap_ranges[0][0] if lap_ranges else 0.0
+            ),
+            "post_lap_distance_m": (
+                total_length - lap_ranges[-1][1] if lap_ranges else 0.0
+            ),
+        }
+        return segments, provenance
+
+    @classmethod
     def _build_lap_segments_gps_coords(
         cls,
         *,
@@ -571,6 +875,7 @@ class Track:
         lap_boundary: tuple[int, int, float],
         bin_size_m: float,
         smooth_distance_m: float,
+        reference_track: "Track | None" = None,
     ) -> tuple[list[Segment], dict]:
         """Construct one lap's segments from GPS latitude/longitude."""
         if not {"GPS Latitude", "GPS Longitude"}.issubset(df.columns):
@@ -685,7 +990,73 @@ class Track:
             for i in range(n_bins)
         ])
         seg_kappa = np.interp(segment_centers, s_grid, kappa_grid)
+        hampel_window = max(
+            3,
+            int(round(_GPS_CURVATURE_HAMPEL_WINDOW_M / bin_size_m)),
+        )
+        if hampel_window % 2 == 0:
+            hampel_window += 1
+        seg_kappa = _hampel_filter_1d(
+            seg_kappa,
+            window=hampel_window,
+            n_sigmas=_GPS_CURVATURE_HAMPEL_SIGMAS,
+        )
         seg_grade = np.interp(segment_centers, s_grid, grade_grid)
+        gps_outlier_replacements = 0
+        if reference_track is not None:
+            ref_mid = np.array([
+                s.distance_start_m + s.length_m / 2.0
+                for s in reference_track.segments
+            ])
+            ref_kappa = np.array([
+                s.curvature for s in reference_track.segments
+            ])
+            ref_grade = np.array([
+                s.grade for s in reference_track.segments
+            ])
+            ref_s = segment_centers * (
+                reference_track.total_distance_m / lap_length
+            )
+            seg_ref_kappa = np.interp(ref_s, ref_mid, ref_kappa)
+            seg_ref_grade = np.interp(ref_s, ref_mid, ref_grade)
+
+            dyn = _dynamic_curvature_samples(good, lap_start_dist)
+            if dyn is not None:
+                dyn_s, dyn_k = dyn
+                dyn_k_seg = np.interp(segment_centers, dyn_s, dyn_k)
+                dyn_k_seg = (
+                    pd.Series(dyn_k_seg)
+                    .rolling(
+                        window=hampel_window,
+                        center=True,
+                        min_periods=1,
+                    )
+                    .median()
+                    .to_numpy()
+                )
+
+                finite = np.isfinite(dyn_k_seg)
+                if finite.any():
+                    delta = seg_kappa[finite] - dyn_k_seg[finite]
+                    med = float(np.median(delta))
+                    mad = float(np.median(np.abs(delta - med)))
+                    robust_sigma = max(1.4826 * mad, 1e-6)
+                    threshold = max(
+                        _GPS_CURVATURE_DYNAMIC_MIN_DELTA,
+                        _GPS_CURVATURE_DYNAMIC_SIGMAS * robust_sigma,
+                    )
+                    outlier = np.zeros(len(seg_kappa), dtype=bool)
+                    outlier[finite] = (
+                        (np.abs(seg_kappa[finite] - dyn_k_seg[finite]) > threshold)
+                        & (
+                            np.abs(seg_kappa[finite])
+                            > np.abs(dyn_k_seg[finite]) + threshold
+                        )
+                    )
+                    gps_outlier_replacements = int(outlier.sum())
+                    if gps_outlier_replacements:
+                        seg_kappa[outlier] = seg_ref_kappa[outlier]
+                        seg_grade[outlier] = seg_ref_grade[outlier]
         if segment_lengths:
             seg_grade = seg_grade - float(
                 np.average(seg_grade, weights=np.asarray(segment_lengths))
@@ -712,6 +1083,7 @@ class Track:
             "smooth_distance_m": smooth_distance_m,
             "lap_length_m": float(lap_length),
             "valid_gps_coord_samples": int(len(good)),
+            "gps_outlier_replacements": gps_outlier_replacements,
         }
 
     @classmethod
@@ -1000,6 +1372,104 @@ def _periodic_gaussian_filter(arr: np.ndarray, sigma: float) -> np.ndarray:
         return arr.copy()
     from scipy.ndimage import gaussian_filter1d
     return gaussian_filter1d(arr, sigma=sigma, mode="wrap")
+
+
+def _open_gaussian_filter(arr: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian smoothing for an open recording path."""
+    from scipy.ndimage import gaussian_filter1d
+    return gaussian_filter1d(arr, sigma=sigma, mode="nearest")
+
+
+def _hampel_filter_1d(
+    arr: np.ndarray,
+    *,
+    window: int,
+    n_sigmas: float,
+    periodic: bool = True,
+) -> np.ndarray:
+    """Replace isolated impulses with the local median.
+
+    The median and MAD are computed with periodic wrap because the track is
+    closed. When a window has near-zero MAD, leave the original sample in
+    place unless it differs from the median by a numerically meaningful
+    amount.
+    """
+    x = np.asarray(arr, dtype=float)
+    n = len(x)
+    if n == 0 or window <= 1:
+        return x.copy()
+    if window % 2 == 0:
+        window += 1
+    half = window // 2
+    out = x.copy()
+    eps = 1e-9
+    for i in range(n):
+        if periodic:
+            idx = (np.arange(i - half, i + half + 1) % n).astype(int)
+        else:
+            lo = max(0, i - half)
+            hi = min(n, i + half + 1)
+            idx = np.arange(lo, hi).astype(int)
+        local = x[idx]
+        med = float(np.median(local))
+        mad = float(np.median(np.abs(local - med)))
+        scale = 1.4826 * mad
+        if scale <= eps:
+            continue
+        if abs(x[i] - med) > n_sigmas * scale:
+            out[i] = med
+    return out
+
+
+def _dynamic_curvature_samples(
+    lap_df: pd.DataFrame,
+    lap_start_dist: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return lap-relative curvature inferred from LFspeed and yaw/LatAcc.
+
+    This is not used to build the map directly. It is a quality reference
+    for rejecting isolated GPS-coordinate derivative impulses: if the
+    coordinate map says the car must follow a far tighter radius than the
+    wheel-speed plus dynamics channels support, the per-lap coordinate
+    sample is treated as GPS jitter.
+    """
+    speed_col = _telemetry_speed_col(lap_df)
+    if speed_col not in lap_df.columns:
+        return None
+
+    speed_ms = lap_df[speed_col].values.astype(float) / 3.6
+    dist = (
+        lap_df["Distance on GPS Speed"].values.astype(float)
+        - float(lap_start_dist)
+    )
+    valid_v = speed_ms > _V_MIN_FOR_CURVATURE_MS
+    k_dyn = np.full(len(lap_df), np.nan, dtype=float)
+
+    if "GPS LatAcc" in lap_df.columns:
+        lat_g = lap_df["GPS LatAcc"].values.astype(float)
+        lat_ok = valid_v & np.isfinite(lat_g)
+        k_dyn[lat_ok] = lat_g[lat_ok] * 9.81 / (speed_ms[lat_ok] ** 2)
+
+    if "YawRate" in lap_df.columns:
+        yaw = lap_df["YawRate"].values.astype(float) * (math.pi / 180.0)
+        yaw_ok = valid_v & np.isfinite(yaw) & ~np.isfinite(k_dyn)
+        k_dyn[yaw_ok] = yaw[yaw_ok] / speed_ms[yaw_ok]
+
+    mask = np.isfinite(dist) & np.isfinite(k_dyn)
+    if int(mask.sum()) < 20:
+        return None
+
+    dyn_s = dist[mask]
+    dyn_k = k_dyn[mask]
+    order = np.argsort(dyn_s)
+    dyn_s = dyn_s[order]
+    dyn_k = dyn_k[order]
+    keep = np.concatenate(([True], np.diff(dyn_s) > 1e-6))
+    dyn_s = dyn_s[keep]
+    dyn_k = dyn_k[keep]
+    if len(dyn_s) < 20:
+        return None
+    return dyn_s, dyn_k
 
 
 def _periodic_gradient(arr: np.ndarray, ds: float) -> np.ndarray:

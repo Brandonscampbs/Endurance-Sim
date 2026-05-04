@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 import warnings
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib
@@ -51,20 +52,33 @@ VOLTT = (
 )
 OUT = REPO / "results"
 OUT.mkdir(exist_ok=True)
+SPEED_TOLERANCE_KMH = 2.0 * 3.6
+TIME_TOLERANCE_S = 5.0
 
 
-def build_strategy(name, aim_df, track, speed_col: str):
+def build_strategy(
+    name,
+    aim_df,
+    track,
+    speed_col: str,
+    *,
+    trim_replay_to_lap_start: bool = True,
+):
     if name == "calibrated":
         return CalibratedStrategy.from_telemetry(
             aim_df, track, speed_col=speed_col,
         )
     if name == "replay":
-        return ReplayStrategy.from_full_endurance(aim_df, track.total_distance_m)
+        return ReplayStrategy.from_full_endurance(
+            aim_df,
+            track.total_distance_m,
+            trim_to_lap_start=trim_replay_to_lap_start,
+        )
     raise ValueError(f"Unknown strategy {name!r}")
 
 
-def per_lap_residuals(states, aim_df, laps, speed_col: str):
-    """Return DataFrame: lap, rmse_kmh, bias_kmh, p95_kmh."""
+def residual_samples(states, aim_df, laps, speed_col: str):
+    """Return telemetry-sampled sim residuals by lap and distance."""
     rows = []
     for i, (s_idx, e_idx, _) in enumerate(laps):
         telem_lap = aim_df.iloc[s_idx:e_idx]
@@ -76,17 +90,77 @@ def per_lap_residuals(states, aim_df, laps, speed_col: str):
         if len(sim_lap) < 2:
             continue
         sd = sim_lap["distance_m"].values - sim_lap["distance_m"].values[0]
+        st = sim_lap["time_s"].values - sim_lap["time_s"].iloc[0]
+        tt = telem_lap["Time"].values - telem_lap["Time"].iloc[0]
         sim_on_telem = np.interp(td, sd, sim_lap["speed_kmh"].values)
-        residual = sim_on_telem - telem_lap[speed_col].values
-        rows.append({
+        sim_time_on_telem = np.interp(td, sd, st)
+        rows.append(pd.DataFrame({
             "lap": i + 1,
+            "lap_distance_m": td,
+            "telem_elapsed_s": tt,
+            "sim_elapsed_s": sim_time_on_telem,
+            "telem_speed_kmh": telem_lap[speed_col].values,
+            "sim_speed_kmh": sim_on_telem,
+            "speed_residual_kmh": (
+                sim_on_telem - telem_lap[speed_col].values
+            ),
+            "time_residual_s": sim_time_on_telem - tt,
+        }))
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
+def per_lap_residuals(states, aim_df, laps, speed_col: str):
+    """Return lap-level speed and elapsed-time residual metrics."""
+    samples = residual_samples(states, aim_df, laps, speed_col)
+    rows = []
+    for lap_num, lap_samples in samples.groupby("lap", sort=True):
+        residual = lap_samples["speed_residual_kmh"].values
+        time_residual = lap_samples["time_residual_s"].values
+        s_idx, e_idx, _ = laps[int(lap_num) - 1]
+        telem_lap = aim_df.iloc[s_idx:e_idx]
+        sim_lap = states[states["lap"] == int(lap_num) - 1]
+        rows.append({
+            "lap": int(lap_num),
             "rmse_kmh": float(np.sqrt(np.mean(residual ** 2))),
             "bias_kmh": float(np.mean(residual)),
             "p95_kmh": float(np.percentile(np.abs(residual), 95)),
+            "max_abs_kmh": float(np.max(np.abs(residual))),
+            "within_2ms_pct": float(
+                100.0 * np.mean(np.abs(residual) <= SPEED_TOLERANCE_KMH)
+            ),
+            "time_abs_p95_s": float(
+                np.percentile(np.abs(time_residual), 95)
+            ),
+            "time_max_abs_s": float(np.max(np.abs(time_residual))),
             "telem_time_s": float(telem_lap["Time"].iloc[-1] - telem_lap["Time"].iloc[0]),
             "sim_time_s": float(sim_lap["segment_time_s"].sum()),
+            "time_delta_s": float(
+                sim_lap["segment_time_s"].sum()
+                - (telem_lap["Time"].iloc[-1] - telem_lap["Time"].iloc[0])
+            ),
         })
     return pd.DataFrame(rows)
+
+
+def overall_residual_metrics(samples: pd.DataFrame) -> dict[str, float]:
+    speed_resid = samples["speed_residual_kmh"].values
+    time_resid = samples["time_residual_s"].values
+    return {
+        "speed_rmse_kmh": float(np.sqrt(np.mean(speed_resid ** 2))),
+        "speed_bias_kmh": float(np.mean(speed_resid)),
+        "speed_p95_kmh": float(np.percentile(np.abs(speed_resid), 95)),
+        "speed_max_abs_kmh": float(np.max(np.abs(speed_resid))),
+        "speed_within_2ms_pct": float(
+            100.0 * np.mean(np.abs(speed_resid) <= SPEED_TOLERANCE_KMH)
+        ),
+        "time_abs_p95_s": float(np.percentile(np.abs(time_resid), 95)),
+        "time_max_abs_s": float(np.max(np.abs(time_resid))),
+        "time_within_5s_pct": float(
+            100.0 * np.mean(np.abs(time_resid) <= TIME_TOLERANCE_S)
+        ),
+    }
 
 
 def plot_lap_overlay(
@@ -137,6 +211,18 @@ def main():
     p.add_argument("--lap", type=int, default=5)
     p.add_argument("--label", default=None,
                    help="optional file prefix override (default = strategy name)")
+    p.add_argument(
+        "--track-smooth-m",
+        type=float,
+        default=None,
+        help="override per-lap GPS-coordinate smoothing distance for replay",
+    )
+    p.add_argument(
+        "--grip-scale",
+        type=float,
+        default=None,
+        help="override tire grip scale for replay/calibration sweeps",
+    )
     args = p.parse_args()
 
     label = args.label or args.strategy
@@ -144,20 +230,38 @@ def main():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # quiet calibration / clamp warnings
         vehicle = VehicleConfig.from_yaml(str(CONFIG))
+        if args.grip_scale is not None:
+            if vehicle.tire is None:
+                raise ValueError("--grip-scale requires a tire config")
+            vehicle = replace(
+                vehicle,
+                tire=replace(vehicle.tire, grip_scale=args.grip_scale),
+            )
         _, aim_df = load_cleaned_csv(str(TELEM))
         speed_col = telemetry_speed_col(aim_df)
         # Build the map from GPS latitude/longitude geometry. Replay uses
-        # the stitched per-lap map so each LFspeed distance trace is
-        # compared against that lap's own GPS-coordinate trajectory.
+        # the full cleaned recording so total distance/time compare against
+        # CleanedEndurance.csv rather than only the detected lap stitch.
         # Calibrated strategies remain lap-relative and use the averaged
         # GPS-coordinate centerline.
         if args.strategy == "replay":
-            track = Track.from_telemetry_per_lap(df=aim_df)
+            track_kwargs = {}
+            if args.track_smooth_m is not None:
+                track_kwargs["smooth_distance_m"] = args.track_smooth_m
+            track = Track.from_telemetry_full_recording(
+                df=aim_df, **track_kwargs,
+            )
         else:
             track = Track.from_telemetry(df=aim_df)
         battery = BatteryModel.from_config_and_data(vehicle.battery, str(VOLTT))
         battery.calibrate_pack_from_telemetry(aim_df)
-        strategy = build_strategy(args.strategy, aim_df, track, speed_col)
+        strategy = build_strategy(
+            args.strategy,
+            aim_df,
+            track,
+            speed_col,
+            trim_replay_to_lap_start=(args.strategy != "replay"),
+        )
         engine = SimulationEngine(vehicle, track, strategy, battery)
 
         # Use the real driver's lap-1 entry speed instead of 0 so the sim
@@ -170,10 +274,11 @@ def main():
             float(aim_df[speed_col].iloc[_laps[0][0]]) / 3.6
             if _laps else 0.0
         )
-        # Stitched replay tracks already contain every detected telemetry
-        # lap; single-lap centerline tracks are repeated for each lap.
+        # Replay tracks already contain the full cleaned recording; single-lap
+        # centerline tracks are repeated for each detected telemetry lap.
         is_stitched = track.source.startswith("telemetry_per_lap")
-        num_laps = 1 if is_stitched else (len(_laps) if _laps else 22)
+        is_full_recording = track.source.startswith("telemetry_full_recording")
+        num_laps = 1 if (is_stitched or is_full_recording) else (len(_laps) if _laps else 22)
 
         result = engine.run(
             num_laps=num_laps, initial_soc_pct=95.0, initial_temp_c=29.0,
@@ -191,10 +296,23 @@ def main():
     aim_df.to_parquet(OUT / "telemetry.parquet")
 
     laps = detect_lap_boundaries(aim_df)
+    samples = residual_samples(states, aim_df, laps, speed_col)
     per_lap = per_lap_residuals(states, aim_df, laps, speed_col)
+    overall = overall_residual_metrics(samples)
     print(per_lap.to_string(index=False))
     print(f"\nMean RMSE across laps: {per_lap['rmse_kmh'].mean():.2f} km/h")
     print(f"Mean bias across laps:  {per_lap['bias_kmh'].mean():+.2f} km/h")
+    print(
+        "Overall speed: "
+        f"RMSE={overall['speed_rmse_kmh']:.2f} km/h, "
+        f"p95={overall['speed_p95_kmh']:.2f} km/h, "
+        f"within 2 m/s={overall['speed_within_2ms_pct']:.1f}%"
+    )
+    print(
+        "Overall elapsed time by distance: "
+        f"p95={overall['time_abs_p95_s']:.2f}s, "
+        f"within 5s={overall['time_within_5s_pct']:.1f}%"
+    )
 
     # Validation
     report = validate_full_endurance(
@@ -235,14 +353,35 @@ def main():
     summary = {
         "strategy": label,
         "track_source": track.source,
+        "track_smooth_distance_m": (
+            args.track_smooth_m
+            if args.track_smooth_m is not None
+            else track.provenance.get("smooth_distance_m")
+        ),
+        "track_gps_outlier_replacements": int(sum(
+            lap.get("gps_outlier_replacements", 0)
+            for lap in track.provenance.get("per_lap", [])
+            if isinstance(lap, dict)
+        )),
+        "grip_scale": (
+            float(vehicle.tire.grip_scale)
+            if vehicle.tire is not None else None
+        ),
         "telemetry_speed_col": speed_col,
+        "speed_tolerance_kmh": SPEED_TOLERANCE_KMH,
+        "time_tolerance_s": TIME_TOLERANCE_S,
         "sim_total_time_s": result.total_time_s,
         "sim_final_soc_pct": result.final_soc,
         "sim_net_kwh": result.net_energy_kwh,
         "telem_total_time_s": float(aim_df["Time"].iloc[-1] - aim_df["Time"].iloc[0]),
+        "detected_telem_lap_time_s": float(per_lap["telem_time_s"].sum()),
+        "detected_time_delta_s": float(
+            result.total_time_s - per_lap["telem_time_s"].sum()
+        ),
         "telem_net_kwh": report.telem_net_j / 3.6e6,
         "mean_rmse_kmh": float(per_lap["rmse_kmh"].mean()),
         "mean_bias_kmh": float(per_lap["bias_kmh"].mean()),
+        "overall": overall,
         "per_lap": per_lap.to_dict(orient="records"),
         "validation_metrics": [
             {"name": m.name, "telem": m.telemetry_value, "sim": m.simulation_value,

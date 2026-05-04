@@ -194,6 +194,7 @@ class ReplayStrategy(DriverStrategy):
         min_speed_kmh: float = 5.0,
         *,
         prefer_torque_feedback: bool = False,
+        trim_to_lap_start: bool = True,
     ) -> ReplayStrategy:
         """Build replay from the full AiM endurance recording.
 
@@ -211,15 +212,16 @@ class ReplayStrategy(DriverStrategy):
         Without this trim, sim distance 200 m maps to pit-out throttle,
         not lap-1 driver inputs.
         """
-        # Trim to lap 1 start so the distance origin matches the sim's.
-        try:
-            from fsae_sim.analysis.validation import detect_lap_boundaries
-            laps = detect_lap_boundaries(aim_df)
-        except Exception:
-            laps = []
-        if laps:
-            start_row = laps[0][0]
-            aim_df = aim_df.iloc[start_row:].copy()
+        if trim_to_lap_start:
+            # Trim to lap 1 start so the distance origin matches the sim's.
+            try:
+                from fsae_sim.analysis.validation import detect_lap_boundaries
+                laps = detect_lap_boundaries(aim_df)
+            except Exception:
+                laps = []
+            if laps:
+                start_row = laps[0][0]
+                aim_df = aim_df.iloc[start_row:].copy()
 
         # Filter to moving samples to cut driver change and stopped periods
         moving = aim_df[_telemetry_speed_col(aim_df)].values > min_speed_kmh
@@ -262,6 +264,21 @@ class ReplayStrategy(DriverStrategy):
             electrical_power = (
                 clean["Pack Voltage"].values * clean["Pack Current"].values
             )
+
+        order = np.argsort(dist)
+        dist = dist[order]
+        throttle = throttle[order]
+        brake = brake[order]
+        torque = torque[order]
+        if electrical_power is not None:
+            electrical_power = electrical_power[order]
+        keep = np.concatenate(([True], np.diff(dist) > 1e-6))
+        dist = dist[keep]
+        throttle = throttle[keep]
+        brake = brake[keep]
+        torque = torque[keep]
+        if electrical_power is not None:
+            electrical_power = electrical_power[keep]
 
         mean_torque = float(np.mean(torque))
         mean_power = (

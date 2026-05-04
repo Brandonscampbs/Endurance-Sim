@@ -471,7 +471,7 @@ class SimulationEngine:
         # the recorded ``lap`` field below.
         segments_carry_lap_index = (
             len(segments) > 0
-            and getattr(segments[0], "lap_index", -1) >= 0
+            and any(getattr(s, "lap_index", -1) >= 0 for s in segments)
         )
 
         for lap in range(num_laps):
@@ -825,7 +825,8 @@ class SimulationEngine:
                 last_pack_current = pack_current  # D-11
 
                 if segments_carry_lap_index:
-                    laps_completed = max(laps_completed, effective_lap + 1)
+                    if effective_lap >= 0:
+                        laps_completed = max(laps_completed, effective_lap + 1)
 
                 # Check termination conditions
                 if soc <= self.vehicle.battery.discharged_soc_pct:
@@ -844,7 +845,10 @@ class SimulationEngine:
                 # all real laps in one pass, count them by unique tag.
                 laps_completed = max(
                     laps_completed,
-                    len({s.lap_index for s in segments}),
+                    len({
+                        s.lap_index for s in segments
+                        if getattr(s, "lap_index", -1) >= 0
+                    }),
                 )
             else:
                 laps_completed += 1
