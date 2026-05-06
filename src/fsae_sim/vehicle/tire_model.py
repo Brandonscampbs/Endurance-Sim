@@ -251,31 +251,33 @@ class PacejkaTireModel:
             (PDY1 < 0).
         """
         fz = max(normal_load_n, 1.0)  # guard against zero/negative load
+        lat_get = self.lateral.get
+        sc_get = self.scaling.get
 
         # Scaling factors
-        lfzo = self._sc("LFZO")
-        lcy = self._sc("LCY")
-        lmuy = self._sc("LMUY")
-        ley = self._sc("LEY")
-        lky = self._sc("LKY")
-        lhy = self._sc("LHY")
-        lvy = self._sc("LVY")
-        lkyg = self._sc("LKYG")
+        lfzo = sc_get("LFZO", 1.0)
+        lcy = sc_get("LCY", 1.0)
+        lmuy = sc_get("LMUY", 1.0)
+        ley = sc_get("LEY", 1.0)
+        lky = sc_get("LKY", 1.0)
+        lhy = sc_get("LHY", 1.0)
+        lvy = sc_get("LVY", 1.0)
+        lkyg = sc_get("LKYG", 1.0)
 
         # Nominal load and load increment
         fz0 = self.fnomin * lfzo
         dfz = (fz - fz0) / fz0 if fz0 > 0 else 0.0
 
         # Peak friction coefficient (muy)
-        pdy1 = self._lat("PDY1")
-        pdy2 = self._lat("PDY2")
-        pdy3 = self._lat("PDY3")
+        pdy1 = lat_get("PDY1", 0.0)
+        pdy2 = lat_get("PDY2", 0.0)
+        pdy3 = lat_get("PDY3", 0.0)
         muy = (pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2) * lmuy
 
         # Cornering stiffness (kya)
-        pky1 = self._lat("PKY1")
-        pky2 = self._lat("PKY2")
-        pky3 = self._lat("PKY3")
+        pky1 = lat_get("PKY1", 0.0)
+        pky2 = lat_get("PKY2", 0.0)
+        pky3 = lat_get("PKY3", 0.0)
 
         pky1_fz0 = pky1 * fz0
         pky2_fz0 = pky2 * fz0
@@ -293,22 +295,22 @@ class PacejkaTireModel:
         )
 
         # Shape factor (cy) and stiffness factor (by)
-        pcy1 = self._lat("PCY1")
+        pcy1 = lat_get("PCY1", 0.0)
         cy = pcy1 * lcy
         denom = cy * muy * fz + 1e-6
         by = kya / denom
 
         # Horizontal shift (shy)
-        phy1 = self._lat("PHY1")
-        phy2 = self._lat("PHY2")
-        phy3 = self._lat("PHY3")
+        phy1 = lat_get("PHY1", 0.0)
+        phy2 = lat_get("PHY2", 0.0)
+        phy3 = lat_get("PHY3", 0.0)
         shy = (phy1 + phy2 * dfz) * lhy + phy3 * camber_rad * lkyg
 
         # Vertical shift (svy)
-        pvy1 = self._lat("PVY1")
-        pvy2 = self._lat("PVY2")
-        pvy3 = self._lat("PVY3")
-        pvy4 = self._lat("PVY4")
+        pvy1 = lat_get("PVY1", 0.0)
+        pvy2 = lat_get("PVY2", 0.0)
+        pvy3 = lat_get("PVY3", 0.0)
+        pvy4 = lat_get("PVY4", 0.0)
         svy = fz * (
             (pvy1 + pvy2 * dfz) * lvy
             + (pvy3 + pvy4 * dfz) * camber_rad
@@ -318,10 +320,10 @@ class PacejkaTireModel:
         alpha_star = slip_angle_rad + shy
 
         # Curvature factor (ey), symmetrically clamped to [-1, 1] (NF-35)
-        pey1 = self._lat("PEY1")
-        pey2 = self._lat("PEY2")
-        pey3 = self._lat("PEY3")
-        pey4 = self._lat("PEY4")
+        pey1 = lat_get("PEY1", 0.0)
+        pey2 = lat_get("PEY2", 0.0)
+        pey3 = lat_get("PEY3", 0.0)
+        pey4 = lat_get("PEY4", 0.0)
         sign_a = 1.0 if alpha_star >= 0.0 else -1.0
         ey = (pey1 + pey2 * dfz) * (
             1.0 - (pey3 + pey4 * camber_rad) * sign_a
@@ -607,22 +609,25 @@ class PacejkaTireModel:
         (Fz > 2 Fz0) SV grows enough to meaningfully shift the peak.
         """
         fz = max(normal_load_n, 1.0)
-        fz0 = self.fnomin * self._sc("LFZO")
+        lat_get = self.lateral.get
+        sc_get = self.scaling.get
+
+        fz0 = self.fnomin * sc_get("LFZO", 1.0)
         dfz = (fz - fz0) / fz0 if fz0 > 0 else 0.0
 
-        lmuy = self._sc("LMUY")
-        lvy = self._sc("LVY")
+        lmuy = sc_get("LMUY", 1.0)
+        lvy = sc_get("LVY", 1.0)
 
-        pdy1 = self._lat("PDY1")
-        pdy2 = self._lat("PDY2")
-        pdy3 = self._lat("PDY3")
+        pdy1 = lat_get("PDY1", 0.0)
+        pdy2 = lat_get("PDY2", 0.0)
+        pdy3 = lat_get("PDY3", 0.0)
         muy = (pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2) * lmuy
         d_y = muy * fz
 
-        pvy1 = self._lat("PVY1")
-        pvy2 = self._lat("PVY2")
-        pvy3 = self._lat("PVY3")
-        pvy4 = self._lat("PVY4")
+        pvy1 = lat_get("PVY1", 0.0)
+        pvy2 = lat_get("PVY2", 0.0)
+        pvy3 = lat_get("PVY3", 0.0)
+        pvy4 = lat_get("PVY4", 0.0)
         sv_y = fz * (
             (pvy1 + pvy2 * dfz) * lvy
             + (pvy3 + pvy4 * dfz) * camber_rad
@@ -645,33 +650,37 @@ class PacejkaTireModel:
         the prior |D| by ~3×.
         """
         fz = max(normal_load_n, 1.0)
-        fz0 = self.fnomin * self._sc("LFZO")
+        lat_get = self.lateral.get
+        lon_get = self.longitudinal.get
+        sc_get = self.scaling.get
+
+        fz0 = self.fnomin * sc_get("LFZO", 1.0)
         dfz = (fz - fz0) / fz0 if fz0 > 0 else 0.0
 
-        lmux = self._sc("LMUX")
-        lvx = self._sc("LVX")
+        lmux = sc_get("LMUX", 1.0)
+        lvx = sc_get("LVX", 1.0)
 
-        pdx1 = self._lon("PDX1")
-        pdx2 = self._lon("PDX2")
-        pdx3 = self._lon("PDX3")
+        pdx1 = lon_get("PDX1", 0.0)
+        pdx2 = lon_get("PDX2", 0.0)
+        pdx3 = lon_get("PDX3", 0.0)
         if pdx1 != 0.0:
             mux = (pdx1 + pdx2 * dfz) * (1.0 - pdx3 * camber_rad ** 2) * lmux
             d_x = mux * fz
 
-            pvx1 = self._lon("PVX1")
-            pvx2 = self._lon("PVX2")
+            pvx1 = lon_get("PVX1", 0.0)
+            pvx2 = lon_get("PVX2", 0.0)
             sv_x = fz * (pvx1 + pvx2 * dfz) * lvx * lmux
 
             return abs(d_x) + abs(sv_x)
 
         # Fallback: TTC USE_MODE=2 has no transplanted PDX — mirror the
         # lateral mu so Fx envelope matches Fy.  No SV in the fallback.
-        pdy1 = self._lat("PDY1")
-        pdy2 = self._lat("PDY2")
-        pdy3 = self._lat("PDY3")
+        pdy1 = lat_get("PDY1", 0.0)
+        pdy2 = lat_get("PDY2", 0.0)
+        pdy3 = lat_get("PDY3", 0.0)
         mux = abs(
             (pdy1 + pdy2 * dfz) * (1.0 - pdy3 * camber_rad ** 2)
-        ) * self._sc("LMUY")
+        ) * sc_get("LMUY", 1.0)
         return mux * fz
 
     # ------------------------------------------------------------------

@@ -4,10 +4,12 @@
 - CoastOnlyStrategy: full throttle on straights, coast into corners
 - ThresholdBrakingStrategy: coast + brake when speed exceeds corner limit
 - CalibratedStrategy: zone-based model calibrated from telemetry
+- PreviewDriverStrategy: physics-envelope preview speed tracker
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -850,6 +852,333 @@ class DriverParams:
     brake_scale: float = 1.0
     max_throttle: float = 1.0
     max_brake: float = 1.0
+
+
+@dataclass(frozen=True)
+class PreviewDriverParams:
+    """Tunable parameters for the preview speed-tracking driver.
+
+    This is a compact approximation of the preview-control / minimum-lap-time
+    literature: the vehicle model supplies a feasible speed envelope, the
+    driver sees a finite preview window, and throttle/brake commands track a
+    target fraction of that envelope.
+    """
+
+    target_speed_ratio: float = 0.94
+    preview_time_s: float = 1.2
+    min_preview_segments: int = 2
+    max_preview_segments: int = 16
+    throttle_gain: float = 2.4
+    brake_gain: float = 1.2
+    throttle_margin_ms: float = 0.4
+    brake_margin_ms: float = 0.3
+    max_throttle: float = 1.0
+    max_brake: float = 1.0
+
+
+class PreviewDriverStrategy(DriverStrategy):
+    """Predictive driver model using finite preview and physics speed targets.
+
+    Unlike ``CalibratedStrategy``, this model does not store per-segment
+    observed speed caps.  Telemetry calibration only estimates global driver
+    parameters; runtime braking/throttle decisions come from the track,
+    speed envelope, and current state.
+    """
+
+    name = "preview_driver"
+    uses_observed_speed_caps = False
+
+    def __init__(
+        self,
+        track: Track,
+        dynamics: VehicleDynamics | None = None,
+        *,
+        params: PreviewDriverParams | None = None,
+        name: str = "preview_driver",
+    ) -> None:
+        self.name = name
+        self._track = track
+        self._dynamics = dynamics
+        self.params = params or PreviewDriverParams()
+        self._num_segments = track.num_segments
+        self._envelope_ms: np.ndarray | None = None
+        self._target_ms: np.ndarray | None = None
+        self._preview_target_cache: np.ndarray | None = None
+        self._preview_distance_cache: np.ndarray | None = None
+
+    def set_envelope(self, envelope_ms: np.ndarray) -> None:
+        """Receive the engine's forward/backward speed envelope."""
+        env = np.asarray(envelope_ms, dtype=np.float64)
+        if len(env) != self._num_segments:
+            raise ValueError(
+                f"Envelope length {len(env)} does not match track segments "
+                f"{self._num_segments}."
+            )
+        ratio = float(np.clip(self.params.target_speed_ratio, 0.2, 1.0))
+        self._envelope_ms = env.copy()
+        self._target_ms = env * ratio
+        self._build_preview_cache()
+
+    def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
+        idx = state.segment_idx % self._num_segments
+        target_ms, preview_distance_m = self._preview_target(idx, state.speed)
+        speed = max(float(state.speed), 0.0)
+
+        if math_isfinite(target_ms) and speed > target_ms + self.params.brake_margin_ms:
+            max_decel = self._max_brake_decel(speed)
+            desired_decel = (
+                (speed * speed - target_ms * target_ms)
+                / (2.0 * max(preview_distance_m, 1.0))
+            )
+            brake = self.params.brake_gain * desired_decel / max(max_decel, 1e-6)
+            brake = max(0.0, min(float(self.params.max_brake), float(brake)))
+            if brake > 1e-3:
+                return ControlCommand(
+                    ControlAction.BRAKE,
+                    throttle_pct=0.0,
+                    brake_pct=brake,
+                )
+
+        if not math_isfinite(target_ms):
+            return ControlCommand(
+                ControlAction.THROTTLE,
+                throttle_pct=max(0.0, min(1.0, float(self.params.max_throttle))),
+                brake_pct=0.0,
+            )
+
+        if speed < target_ms - self.params.throttle_margin_ms:
+            err = (target_ms - speed) / max(target_ms, 1.0)
+            throttle = self.params.throttle_gain * err
+            throttle = max(0.0, min(float(self.params.max_throttle), float(throttle)))
+            if throttle > 1e-3:
+                return ControlCommand(
+                    ControlAction.THROTTLE,
+                    throttle_pct=throttle,
+                    brake_pct=0.0,
+                )
+
+        return ControlCommand(ControlAction.COAST, throttle_pct=0.0, brake_pct=0.0)
+
+    def with_params(self, **kwargs) -> PreviewDriverStrategy:
+        return PreviewDriverStrategy(
+            self._track,
+            self._dynamics,
+            params=replace(self.params, **kwargs),
+            name=self.name,
+        )
+
+    @classmethod
+    def from_telemetry(
+        cls,
+        aim_df: pd.DataFrame,
+        track: Track,
+        dynamics: VehicleDynamics | None = None,
+        *,
+        laps: list[int] | None = None,
+        brake_max_pressure_bar: float = 60.0,
+        name: str = "preview_driver",
+    ) -> PreviewDriverStrategy:
+        """Fit global preview-driver parameters from telemetry.
+
+        The fit deliberately avoids per-segment speed caps.  It estimates:
+        - target speed ratio from observed corner speed vs physics corner limit
+        - max throttle from high-percentile throttle position
+        - max brake from high-percentile brake pressure
+        """
+        speed_col = _telemetry_speed_col(aim_df)
+        selected = cls._selected_lap_slices(aim_df, laps)
+        speed_ratios: list[float] = []
+
+        if dynamics is not None:
+            for start_idx, end_idx, _ in selected:
+                lap_df = aim_df.iloc[start_idx:end_idx]
+                lap_dist_raw = lap_df["Distance on GPS Speed"].values
+                if len(lap_dist_raw) < 2:
+                    continue
+                lap_span = float(lap_dist_raw[-1] - lap_dist_raw[0])
+                if lap_span <= 0.0:
+                    continue
+                lap_d = (lap_dist_raw - lap_dist_raw[0]) * (
+                    track.total_distance_m / lap_span
+                )
+                lap_speed_ms = lap_df[speed_col].values / 3.6
+                for seg in track.segments:
+                    if abs(seg.curvature) < 1e-6:
+                        continue
+                    limit = dynamics.max_cornering_speed(
+                        seg.curvature,
+                        seg.grip_factor,
+                    )
+                    if not math_isfinite(limit) or limit <= 1.0:
+                        continue
+                    mid = seg.distance_start_m + seg.length_m / 2.0
+                    nearest = int(np.argmin(np.abs(lap_d - mid)))
+                    ratio = float(lap_speed_ms[nearest] / limit)
+                    if math_isfinite(ratio):
+                        speed_ratios.append(ratio)
+
+        if speed_ratios:
+            # Use a high percentile rather than the median/mean.  The preview
+            # model's target speed ratio represents the driver's intended pace
+            # near the physics envelope; slower samples include traffic,
+            # driver-change laps, mistakes, and non-limit corner entries.
+            target_speed_ratio = float(
+                np.clip(np.nanpercentile(speed_ratios, 95), 0.90, 1.0)
+            )
+        else:
+            target_speed_ratio = PreviewDriverParams.target_speed_ratio
+
+        throttle = np.clip(aim_df["Throttle Pos"].values / 100.0, 0.0, 1.0)
+        max_throttle = float(np.clip(np.nanpercentile(throttle, 95), 0.35, 1.0))
+
+        brake_raw = np.maximum(
+            aim_df["FBrakePressure"].values,
+            aim_df["RBrakePressure"].values,
+        )
+        brake = np.clip(brake_raw / max(float(brake_max_pressure_bar), 1.0), 0.0, 1.0)
+        max_brake = float(np.clip(np.nanpercentile(brake, 95), 0.25, 1.0))
+
+        params = PreviewDriverParams(
+            target_speed_ratio=target_speed_ratio,
+            max_throttle=max_throttle,
+            max_brake=max_brake,
+        )
+        return cls(track, dynamics, params=params, name=name)
+
+    @staticmethod
+    def _selected_lap_slices(
+        aim_df: pd.DataFrame,
+        laps: list[int] | None,
+    ) -> list[tuple[int, int, float]]:
+        boundaries = _detect_lap_boundaries_safe(aim_df)
+        if boundaries:
+            if laps is not None:
+                selected = [boundaries[i] for i in laps if 0 <= i < len(boundaries)]
+                return selected or boundaries
+            try:
+                from fsae_sim.analysis.telemetry_analysis import _auto_select_laps
+
+                selected = _auto_select_laps(aim_df, boundaries)
+                return selected or boundaries
+            except Exception:
+                return boundaries
+        total_dist = aim_df["Distance on GPS Speed"].values
+        return [(0, len(aim_df), float(total_dist[-1] - total_dist[0]))]
+
+    def _preview_target(
+        self,
+        segment_idx: int,
+        speed_ms: float,
+    ) -> tuple[float, float]:
+        preview_segments = self._preview_segment_count(segment_idx, speed_ms)
+        if (
+            self._preview_target_cache is not None
+            and self._preview_distance_cache is not None
+        ):
+            cache_idx = min(
+                preview_segments,
+                self._preview_target_cache.shape[0],
+            ) - 1
+            return (
+                float(self._preview_target_cache[cache_idx, segment_idx]),
+                float(self._preview_distance_cache[cache_idx, segment_idx]),
+            )
+
+        targets: list[float] = []
+        distances: list[float] = []
+        cumulative = 0.0
+        target_array = self._target_ms
+
+        for offset in range(preview_segments):
+            idx = (segment_idx + offset) % self._num_segments
+            seg = self._track.segments[idx]
+            cumulative += seg.length_m
+            if target_array is not None:
+                target = float(target_array[idx])
+            elif self._dynamics is not None:
+                target = self._dynamics.max_cornering_speed(
+                    seg.curvature,
+                    seg.grip_factor,
+                )
+                if math_isfinite(target):
+                    target *= float(np.clip(self.params.target_speed_ratio, 0.2, 1.0))
+            else:
+                target = float("inf")
+            targets.append(float(target))
+            distances.append(cumulative)
+
+        finite = [
+            (target, dist) for target, dist in zip(targets, distances)
+            if math_isfinite(target)
+        ]
+        if not finite:
+            return float("inf"), cumulative
+        return min(finite, key=lambda item: item[0])
+
+    def _preview_segment_count(self, segment_idx: int, speed_ms: float) -> int:
+        target_distance = max(
+            self._track.segments[segment_idx].length_m * self.params.min_preview_segments,
+            max(speed_ms, 1.0) * self.params.preview_time_s,
+        )
+        total = 0.0
+        count = 0
+        max_count = max(
+            int(self.params.min_preview_segments),
+            int(self.params.max_preview_segments),
+        )
+        while count < min(max_count, self._num_segments):
+            idx = (segment_idx + count) % self._num_segments
+            total += self._track.segments[idx].length_m
+            count += 1
+            if count >= self.params.min_preview_segments and total >= target_distance:
+                break
+        return max(1, count)
+
+    def _max_brake_decel(self, speed_ms: float) -> float:
+        if self._dynamics is None:
+            return 0.55 * 9.81
+        return (
+            self._dynamics.mechanical_brake_force(1.0, speed_ms)
+            / max(self._dynamics.m_effective, 1e-6)
+        )
+
+    def _build_preview_cache(self) -> None:
+        target_array = self._target_ms
+        if target_array is None or self._num_segments <= 0:
+            self._preview_target_cache = None
+            self._preview_distance_cache = None
+            return
+
+        max_count = min(
+            max(
+                int(self.params.min_preview_segments),
+                int(self.params.max_preview_segments),
+            ),
+            self._num_segments,
+        )
+        target_cache = np.empty((max_count, self._num_segments), dtype=np.float64)
+        distance_cache = np.empty((max_count, self._num_segments), dtype=np.float64)
+
+        for start_idx in range(self._num_segments):
+            best_target = float("inf")
+            best_distance = 0.0
+            cumulative = 0.0
+            for offset in range(max_count):
+                idx = (start_idx + offset) % self._num_segments
+                cumulative += self._track.segments[idx].length_m
+                target = float(target_array[idx])
+                if target < best_target:
+                    best_target = target
+                    best_distance = cumulative
+                target_cache[offset, start_idx] = best_target
+                distance_cache[offset, start_idx] = best_distance
+
+        self._preview_target_cache = target_cache
+        self._preview_distance_cache = distance_cache
+
+
+def math_isfinite(value: float) -> bool:
+    return math.isfinite(float(value))
 
 
 class PedalProfileStrategy(DriverStrategy):

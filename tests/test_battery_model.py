@@ -1,6 +1,7 @@
 """Tests for the runtime battery model."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from fsae_sim.vehicle import BatteryConfig, DischargeLimitPoint
@@ -64,6 +65,40 @@ class TestBatteryModelInit:
     def test_pack_capacity(self, ct16ev_battery_config):
         model = BatteryModel(ct16ev_battery_config)
         assert model.pack_capacity_ah == 18.0
+
+
+class TestPackTelemetryHoldout:
+
+    def _telemetry_frame(self, *, include_lap: bool = True) -> pd.DataFrame:
+        n = 60
+        df = pd.DataFrame({
+            "State of Charge": np.linspace(95.0, 75.0, n),
+            "Pack Voltage": np.linspace(455.0, 410.0, n),
+            "Pack Current": np.zeros(n),
+            "LFspeed": np.full(n, 20.0),
+            "Time": np.arange(n, dtype=float),
+        })
+        if include_lap:
+            df["lap"] = np.where(np.arange(n) < n // 2, 1, 2)
+        return df
+
+    def test_holdout_requires_lap_column_or_detectable_boundaries(
+        self, ct16ev_battery_config,
+    ):
+        model = BatteryModel(ct16ev_battery_config)
+        with pytest.raises(ValueError, match="has no 'lap' column"):
+            model.calibrate_pack_from_telemetry(
+                self._telemetry_frame(include_lap=False),
+                holdout_laps=[2],
+            )
+
+    def test_holdout_must_match_rows(self, ct16ev_battery_config):
+        model = BatteryModel(ct16ev_battery_config)
+        with pytest.raises(ValueError, match="did not match any rows"):
+            model.calibrate_pack_from_telemetry(
+                self._telemetry_frame(include_lap=True),
+                holdout_laps=[3],
+            )
 
 
 # ---------------------------------------------------------------------------

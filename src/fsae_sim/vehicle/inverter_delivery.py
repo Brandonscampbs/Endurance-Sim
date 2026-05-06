@@ -22,10 +22,11 @@ delivery characteristics.
 
 from __future__ import annotations
 
+from bisect import bisect_right
+import math
 from pathlib import Path
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 
 
 class InverterDeliveryMap:
@@ -72,13 +73,12 @@ class InverterDeliveryMap:
         self._delivered_grid = delivered_grid
         self._inverter_cap = float(inverter_torque_cap_nm)
 
-        self._interp = RegularGridInterpolator(
-            (rpm_grid, command_grid),
-            delivered_grid,
-            method="linear",
-            bounds_error=False,
-            fill_value=None,
-        )
+        self._rpm_min = float(rpm_grid[0])
+        self._rpm_max = float(rpm_grid[-1])
+        self._command_min = float(command_grid[0])
+        self._command_max = float(command_grid[-1])
+        self._rpm_inv_step = self._uniform_inv_step(rpm_grid)
+        self._command_inv_step = self._uniform_inv_step(command_grid)
 
     @classmethod
     def from_csv(
@@ -140,19 +140,85 @@ class InverterDeliveryMap:
         if cmd <= 0.0:
             return 0.0
 
-        rpm = max(0.0, float(motor_rpm))
-        rpm = min(rpm, float(self._rpm_grid[-1]))
-        cmd_clamped = min(cmd, float(self._command_grid[-1]))
-        cmd_clamped = max(cmd_clamped, float(self._command_grid[0]))
+        rpm = max(self._rpm_min, min(self._rpm_max, float(motor_rpm)))
+        cmd_clamped = max(self._command_min, min(self._command_max, cmd))
 
-        delivered = float(self._interp((rpm, cmd_clamped)))
+        delivered = self._bilinear_lookup(rpm, cmd_clamped)
         delivered = min(delivered, cmd, self._inverter_cap)
         return max(0.0, delivered)
 
+    @staticmethod
+    def _uniform_inv_step(grid: np.ndarray) -> float | None:
+        if len(grid) < 2:
+            return None
+        step = float(grid[1] - grid[0])
+        if step <= 0.0:
+            return None
+        if np.allclose(np.diff(grid), step):
+            return 1.0 / step
+        return None
+
+    @staticmethod
+    def _bracket(grid: np.ndarray, value: float) -> tuple[int, int, float]:
+        if len(grid) == 1:
+            return 0, 0, 0.0
+        hi = bisect_right(grid, value)
+        if hi <= 0:
+            return 0, 1, 0.0
+        if hi >= len(grid):
+            return len(grid) - 2, len(grid) - 1, 1.0
+        lo = hi - 1
+        width = float(grid[hi] - grid[lo])
+        weight = 0.0 if width <= 0.0 else (value - float(grid[lo])) / width
+        return lo, hi, float(weight)
+
+    @staticmethod
+    def _uniform_bracket(
+        value: float,
+        grid_min: float,
+        inv_step: float,
+        size: int,
+    ) -> tuple[int, int, float]:
+        if size == 1:
+            return 0, 0, 0.0
+        position = (value - grid_min) * inv_step
+        lo = int(math.floor(position))
+        if lo <= 0:
+            if position <= 0.0:
+                return 0, 1, 0.0
+            lo = 0
+        if lo >= size - 1:
+            return size - 2, size - 1, 1.0
+        return lo, lo + 1, float(position - lo)
+
+    def _bilinear_lookup(self, rpm: float, command_nm: float) -> float:
+        if self._rpm_inv_step is not None:
+            ri0, ri1, rw = self._uniform_bracket(
+                rpm, self._rpm_min, self._rpm_inv_step, len(self._rpm_grid),
+            )
+        else:
+            ri0, ri1, rw = self._bracket(self._rpm_grid, rpm)
+        if self._command_inv_step is not None:
+            ci0, ci1, cw = self._uniform_bracket(
+                command_nm,
+                self._command_min,
+                self._command_inv_step,
+                len(self._command_grid),
+            )
+        else:
+            ci0, ci1, cw = self._bracket(self._command_grid, command_nm)
+        z00 = self._delivered_grid[ri0, ci0]
+        z01 = self._delivered_grid[ri0, ci1]
+        z10 = self._delivered_grid[ri1, ci0]
+        z11 = self._delivered_grid[ri1, ci1]
+        z0 = z00 + (z01 - z00) * cw
+        z1 = z10 + (z11 - z10) * cw
+        return float(z0 + (z1 - z0) * rw)
+
     @property
     def rpm_range(self) -> tuple[float, float]:
-        return float(self._rpm_grid[0]), float(self._rpm_grid[-1])
+        return self._rpm_min, self._rpm_max
 
     @property
     def command_range(self) -> tuple[float, float]:
-        return float(self._command_grid[0]), float(self._command_grid[-1])
+        return self._command_min, self._command_max

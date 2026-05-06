@@ -10,7 +10,11 @@ from backend.models.validation import (
     ValidationMetricResult,
     ValidationResponse,
 )
-from backend.services.sim_runner import get_baseline_result, get_track
+from backend.services.sim_runner import (
+    get_baseline_result,
+    get_track,
+    get_validation_lap_split,
+)
 from backend.services.telemetry_service import get_lap_boundaries, get_lap_data, get_telemetry
 from backend.services.track_service import detect_sectors, get_track_data
 from fsae_sim.analysis.validation import validate_full_endurance
@@ -350,10 +354,13 @@ def get_all_laps_summary() -> AllLapsResponse:
         ))
 
     # Aggregate metrics
+    calibration_laps, validation_laps = get_validation_lap_split(len(boundaries))
     report = validate_full_endurance(
         sim_states, aim_df,
         result.total_time_s, result.final_soc,
         result.total_energy_kwh, result.laps_completed,
+        calibration_laps=calibration_laps,
+        validation_laps=validation_laps,
     )
     metrics = [
         ValidationMetricResult(

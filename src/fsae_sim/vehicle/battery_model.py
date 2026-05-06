@@ -8,6 +8,7 @@ thermal model.
 from __future__ import annotations
 
 import warnings
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -95,6 +96,11 @@ class BatteryModel:
         # Discharge limit interpolator from BMS config
         temps = np.array([dl.temp_c for dl in config.discharge_limits])
         currents = np.array([dl.max_current_a for dl in config.discharge_limits])
+        self._discharge_limit_temps = temps.astype(float)
+        self._discharge_limit_currents = currents.astype(float)
+        self._discharge_limit_inv_step = self._uniform_inv_step(
+            self._discharge_limit_temps,
+        )
         self._discharge_limit_interp = interp1d(
             temps, currents, kind="linear",
             bounds_error=False,
@@ -104,6 +110,12 @@ class BatteryModel:
         # Calibration state (set by calibrate_from_voltt())
         self._ocv_interp: interp1d | None = None
         self._resistance_interp: interp1d | None = None
+        self._ocv_soc_grid: np.ndarray | None = None
+        self._ocv_grid: np.ndarray | None = None
+        self._ocv_inv_step: float | None = None
+        self._resistance_soc_grid: np.ndarray | None = None
+        self._resistance_grid: np.ndarray | None = None
+        self._resistance_inv_step: float | None = None
         self._ocv_soc_min: float | None = None  # for extrapolation floor
         self._ocv_soc_max: float | None = None
         self._ocv_extrap_warned: bool = False
@@ -112,6 +124,12 @@ class BatteryModel:
         # Pack-level calibration (set by calibrate_pack_from_telemetry())
         self._pack_ocv_interp: interp1d | None = None
         self._pack_resistance_interp: interp1d | None = None
+        self._pack_ocv_soc_grid: np.ndarray | None = None
+        self._pack_ocv_grid: np.ndarray | None = None
+        self._pack_ocv_inv_step: float | None = None
+        self._pack_resistance_soc_grid: np.ndarray | None = None
+        self._pack_resistance_grid: np.ndarray | None = None
+        self._pack_resistance_inv_step: float | None = None
         self._pack_calibrated = False
         self.calibration_sources: list[str] = []
         self.pack_calibration_holdout_laps: tuple[int, ...] | None = None
@@ -168,6 +186,9 @@ class BatteryModel:
             soc_grid, ocv_grid, kind="linear",
             bounds_error=False, fill_value="extrapolate",
         )
+        self._ocv_soc_grid = soc_grid.astype(float)
+        self._ocv_grid = ocv_grid.astype(float)
+        self._ocv_inv_step = self._uniform_inv_step(self._ocv_soc_grid)
         self._ocv_soc_min = float(soc_grid[0])
         self._ocv_soc_max = float(soc_grid[-1])
 
@@ -177,6 +198,11 @@ class BatteryModel:
             self._resistance_interp = interp1d(
                 [0, 100], [0.020, 0.020], kind="linear",
                 bounds_error=False, fill_value=0.020,
+            )
+            self._resistance_soc_grid = np.array([0.0, 100.0])
+            self._resistance_grid = np.array([0.020, 0.020])
+            self._resistance_inv_step = self._uniform_inv_step(
+                self._resistance_soc_grid,
             )
         else:
             i_discharge = np.abs(current[discharge_mask])
@@ -190,6 +216,11 @@ class BatteryModel:
                 self._resistance_interp = interp1d(
                     [0, 100], [0.020, 0.020], kind="linear",
                     bounds_error=False, fill_value=0.020,
+                )
+                self._resistance_soc_grid = np.array([0.0, 100.0])
+                self._resistance_grid = np.array([0.020, 0.020])
+                self._resistance_inv_step = self._uniform_inv_step(
+                    self._resistance_soc_grid,
                 )
             else:
                 r_valid = r_values[valid]
@@ -214,11 +245,21 @@ class BatteryModel:
                         bounds_error=False,
                         fill_value=(bin_r[0], bin_r[-1]),
                     )
+                    self._resistance_soc_grid = np.asarray(bin_centers, dtype=float)
+                    self._resistance_grid = np.asarray(bin_r, dtype=float)
+                    self._resistance_inv_step = self._uniform_inv_step(
+                        self._resistance_soc_grid,
+                    )
                 else:
                     median_r = float(np.median(r_valid))
                     self._resistance_interp = interp1d(
                         [0, 100], [median_r, median_r], kind="linear",
                         bounds_error=False, fill_value=median_r,
+                    )
+                    self._resistance_soc_grid = np.array([0.0, 100.0])
+                    self._resistance_grid = np.array([median_r, median_r])
+                    self._resistance_inv_step = self._uniform_inv_step(
+                        self._resistance_soc_grid,
                     )
 
         # S17: build a pack-level R(SOC) interpolator by scaling cell R
@@ -227,13 +268,20 @@ class BatteryModel:
         # telemetry calibration.
         soc_grid_pack = np.linspace(0.0, 100.0, 101)
         r_pack_grid = np.array([
-            float(self._resistance_interp(s)) * self.config.series / self.config.parallel
+            self._interp_clamped(s, self._resistance_soc_grid, self._resistance_grid)
+            * self.config.series
+            / self.config.parallel
             for s in soc_grid_pack
         ])
         self._pack_resistance_interp = interp1d(
             soc_grid_pack, r_pack_grid, kind="linear",
             bounds_error=False,
             fill_value=(float(r_pack_grid[0]), float(r_pack_grid[-1])),
+        )
+        self._pack_resistance_soc_grid = soc_grid_pack.astype(float)
+        self._pack_resistance_grid = r_pack_grid.astype(float)
+        self._pack_resistance_inv_step = self._uniform_inv_step(
+            self._pack_resistance_soc_grid,
         )
 
         self._calibrated = True
@@ -283,18 +331,46 @@ class BatteryModel:
                 "documented at the call site.",
                 stacklevel=2,
             )
+        # Apply holdout filter.  A requested holdout must actually remove
+        # samples; otherwise the validation comparison is circular while
+        # still looking like a train/test split.
+        if holdout_laps is not None and "lap" not in aim_df.columns:
+            try:
+                from fsae_sim.analysis.validation import detect_lap_boundaries
+
+                boundaries = detect_lap_boundaries(aim_df)
+            except Exception as exc:
+                raise ValueError(
+                    "holdout_laps were provided, but aim_df has no 'lap' "
+                    "column and lap boundaries could not be detected."
+                ) from exc
+            if not boundaries:
+                raise ValueError(
+                    "holdout_laps were provided, but aim_df has no 'lap' "
+                    "column and detect_lap_boundaries() found no laps."
+                )
+            labelled = aim_df.copy()
+            labelled["lap"] = 0
+            lap_col = labelled.columns.get_loc("lap")
+            for lap_idx, (start, end, _dist) in enumerate(boundaries, start=1):
+                labelled.iloc[start:end, lap_col] = lap_idx
+            aim_df = labelled
+
+        if holdout_laps is not None:
+            mask_keep = ~aim_df["lap"].isin(list(holdout_laps))
+            if bool(mask_keep.all()):
+                raise ValueError(
+                    "holdout_laps did not match any rows in aim_df['lap']; "
+                    "pack telemetry calibration would use the full validation run."
+                )
+            aim_df = aim_df.loc[mask_keep]
+
         self._pack_telemetry_calibrated = True
         self.pack_calibration_holdout_laps = (
             tuple(int(x) for x in holdout_laps)
             if holdout_laps is not None else None
         )
         self.calibration_sources.append("telemetry_pack")
-
-        # Apply holdout filter.  We look for a 'lap' column; if absent,
-        # we silently accept the full frame (no laps to hold out).
-        if holdout_laps is not None and "lap" in aim_df.columns:
-            mask_keep = ~aim_df["lap"].isin(list(holdout_laps))
-            aim_df = aim_df.loc[mask_keep]
 
         soc = aim_df["State of Charge"].values
         voltage = aim_df["Pack Voltage"].values
@@ -330,6 +406,11 @@ class BatteryModel:
                 bounds_error=False,
                 fill_value=(pack_ocv_pts[0], pack_ocv_pts[-1]),
             )
+            self._pack_ocv_soc_grid = np.asarray(pack_soc_pts, dtype=float)
+            self._pack_ocv_grid = np.asarray(pack_ocv_pts, dtype=float)
+            self._pack_ocv_inv_step = self._uniform_inv_step(
+                self._pack_ocv_soc_grid,
+            )
             self._pack_calibrated = True
 
             # S17: fit pack R(SOC) interpolator from high-current bins.
@@ -340,9 +421,13 @@ class BatteryModel:
                 soc_hi = soc[high_i_mask]
                 v_hi = voltage[high_i_mask]
                 i_hi = current[high_i_mask]
-                v_ocv_at_soc = np.array([
-                    float(self._pack_ocv_interp(s)) for s in soc_hi
-                ])
+                v_ocv_at_soc = np.interp(
+                    soc_hi,
+                    self._pack_ocv_soc_grid,
+                    self._pack_ocv_grid,
+                    left=float(self._pack_ocv_grid[0]),
+                    right=float(self._pack_ocv_grid[-1]),
+                )
                 r_pack = (v_ocv_at_soc - v_hi) / i_hi
                 valid_r = (r_pack > 0.05) & (r_pack < 5.0)
                 if np.sum(valid_r) > 20:
@@ -370,6 +455,15 @@ class BatteryModel:
                             bounds_error=False,
                             fill_value=(r_bin_vals[0], r_bin_vals[-1]),
                         )
+                        self._pack_resistance_soc_grid = np.asarray(
+                            r_bin_centers, dtype=float,
+                        )
+                        self._pack_resistance_grid = np.asarray(
+                            r_bin_vals, dtype=float,
+                        )
+                        self._pack_resistance_inv_step = self._uniform_inv_step(
+                            self._pack_resistance_soc_grid,
+                        )
 
         # C15: capacity is config-driven. We DO NOT rewrite
         # ``cell_capacity_ah`` here; do that only in the config.
@@ -389,6 +483,88 @@ class BatteryModel:
         model.calibrate_from_voltt(df)
         return model
 
+    @staticmethod
+    def _clip_pct(value: float) -> float:
+        return max(0.0, min(100.0, float(value)))
+
+    @staticmethod
+    def _uniform_inv_step(x_grid: np.ndarray | None) -> float | None:
+        if x_grid is None or len(x_grid) < 2:
+            return None
+        step = float(x_grid[1] - x_grid[0])
+        if step <= 0.0:
+            return None
+        if np.allclose(np.diff(x_grid), step):
+            return 1.0 / step
+        return None
+
+    @staticmethod
+    def _interp_uniform_clamped(
+        value: float,
+        x_grid: np.ndarray,
+        y_grid: np.ndarray,
+        inv_step: float,
+    ) -> float:
+        x = float(value)
+        if len(x_grid) == 1 or x <= float(x_grid[0]):
+            return float(y_grid[0])
+        if x >= float(x_grid[-1]):
+            return float(y_grid[-1])
+        position = (x - float(x_grid[0])) * inv_step
+        lo = int(position)
+        if lo < 0:
+            return float(y_grid[0])
+        if lo >= len(x_grid) - 1:
+            return float(y_grid[-1])
+        weight = position - lo
+        return float(y_grid[lo]) + (float(y_grid[lo + 1]) - float(y_grid[lo])) * weight
+
+    @staticmethod
+    def _interp_clamped(
+        value: float,
+        x_grid: np.ndarray | None,
+        y_grid: np.ndarray | None,
+        inv_step: float | None = None,
+    ) -> float:
+        assert x_grid is not None and y_grid is not None
+        if inv_step is not None:
+            return BatteryModel._interp_uniform_clamped(
+                value, x_grid, y_grid, inv_step,
+            )
+        x = float(value)
+        if len(x_grid) == 1 or x <= float(x_grid[0]):
+            return float(y_grid[0])
+        if x >= float(x_grid[-1]):
+            return float(y_grid[-1])
+        hi = bisect_right(x_grid, x)
+        lo = hi - 1
+        width = float(x_grid[hi] - x_grid[lo])
+        weight = 0.0 if width <= 0.0 else (x - float(x_grid[lo])) / width
+        return float(y_grid[lo]) + (float(y_grid[hi]) - float(y_grid[lo])) * weight
+
+    @staticmethod
+    def _interp_extrapolated(
+        value: float,
+        x_grid: np.ndarray | None,
+        y_grid: np.ndarray | None,
+        inv_step: float | None = None,
+    ) -> float:
+        assert x_grid is not None and y_grid is not None
+        x = float(value)
+        if len(x_grid) < 2:
+            return float(y_grid[0])
+        if x < float(x_grid[0]):
+            slope = (float(y_grid[1]) - float(y_grid[0])) / (
+                float(x_grid[1]) - float(x_grid[0])
+            )
+            return float(y_grid[0]) + slope * (x - float(x_grid[0]))
+        if x > float(x_grid[-1]):
+            slope = (float(y_grid[-1]) - float(y_grid[-2])) / (
+                float(x_grid[-1]) - float(x_grid[-2])
+            )
+            return float(y_grid[-1]) + slope * (x - float(x_grid[-1]))
+        return BatteryModel._interp_clamped(x, x_grid, y_grid, inv_step)
+
     # ------------------------------------------------------------------
     # Voltage model
     # ------------------------------------------------------------------
@@ -403,8 +579,10 @@ class BatteryModel:
         """
         if not self._calibrated:
             raise RuntimeError("Model must be calibrated before use")
-        soc_clipped = float(np.clip(soc_pct, 0, 100))
-        raw = float(self._ocv_interp(soc_clipped))
+        soc_clipped = self._clip_pct(soc_pct)
+        raw = self._interp_extrapolated(
+            soc_clipped, self._ocv_soc_grid, self._ocv_grid, self._ocv_inv_step,
+        )
 
         below = (
             self._ocv_soc_min is not None and soc_clipped < self._ocv_soc_min
@@ -427,7 +605,13 @@ class BatteryModel:
         """Cell internal resistance (Ohms) at given SOC."""
         if not self._calibrated:
             raise RuntimeError("Model must be calibrated before use")
-        return float(np.clip(self._resistance_interp(np.clip(soc_pct, 0, 100)), 0.001, 0.5))
+        resistance = self._interp_clamped(
+            self._clip_pct(soc_pct),
+            self._resistance_soc_grid,
+            self._resistance_grid,
+            self._resistance_inv_step,
+        )
+        return max(0.001, min(0.5, resistance))
 
     def pack_resistance(self, soc_pct: float) -> float:
         """Pack internal resistance (Ohms) at given SOC.
@@ -439,12 +623,13 @@ class BatteryModel:
         """
         if not self._calibrated:
             raise RuntimeError("Model must be calibrated before use")
-        assert self._pack_resistance_interp is not None
-        return float(np.clip(
-            self._pack_resistance_interp(np.clip(soc_pct, 0, 100)),
-            0.001,
-            50.0,
-        ))
+        resistance = self._interp_clamped(
+            self._clip_pct(soc_pct),
+            self._pack_resistance_soc_grid,
+            self._pack_resistance_grid,
+            self._pack_resistance_inv_step,
+        )
+        return max(0.001, min(50.0, resistance))
 
     def cell_voltage(
         self,
@@ -492,7 +677,12 @@ class BatteryModel:
         :class:`BatteryViolation` (S16).
         """
         if self._pack_calibrated:
-            pack_ocv = float(self._pack_ocv_interp(np.clip(soc_pct, 0, 100)))
+            pack_ocv = self._interp_clamped(
+                self._clip_pct(soc_pct),
+                self._pack_ocv_soc_grid,
+                self._pack_ocv_grid,
+                self._pack_ocv_inv_step,
+            )
             r_pack = self.pack_resistance(soc_pct)
             v_unclamped = pack_ocv - pack_current_a * r_pack
             floor = self.config.cell_voltage_min_v * self.config.series
@@ -532,7 +722,12 @@ class BatteryModel:
         3. Cell voltage floor (prevents cell voltage from going below minimum)
         """
         # Temperature limit
-        temp_limit = float(self._discharge_limit_interp(np.clip(temp_c, 0, 80)))
+        temp_limit = self._interp_clamped(
+            max(0.0, min(80.0, float(temp_c))),
+            self._discharge_limit_temps,
+            self._discharge_limit_currents,
+            self._discharge_limit_inv_step,
+        )
         temp_limit = max(0.0, temp_limit)
 
         # SOC taper: reduce by rate_a_per_pct for each % below threshold

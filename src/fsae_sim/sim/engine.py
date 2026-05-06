@@ -114,6 +114,16 @@ class SimulationEngine:
         self.battery_model = battery_model
         self.mode = SimulationMode.coerce(mode)
 
+        if (
+            self.mode in {SimulationMode.PREDICTION, SimulationMode.VALIDATION}
+            and getattr(strategy, "uses_observed_speed_caps", False)
+        ):
+            raise ValueError(
+                f"{self.mode.value} mode forbids telemetry-derived speed caps. "
+                "Use strategy.without_observed_speed_caps() or construct "
+                "the strategy with use_observed_speed_caps=False."
+            )
+
         if self.mode == SimulationMode.PREDICTION:
             vehicle.require_predictive_ready(
                 allow_empirical_grip=allow_empirical_grip,
@@ -126,13 +136,6 @@ class SimulationEngine:
                     "prediction mode requires an independent track model; "
                     f"track {track.name!r} was built from {track.source!r}."
                 )
-            if getattr(strategy, "uses_observed_speed_caps", False):
-                raise ValueError(
-                    "prediction mode forbids telemetry-derived speed caps. "
-                    "Use strategy.without_observed_speed_caps() or construct "
-                    "the strategy with use_observed_speed_caps=False."
-                )
-
         # Termination temperature comes from the config's discharge_limits:
         # the hottest point where max_current_a == 0 (battery can no longer
         # deliver power).  Avoids the earlier hardcoded 65 C.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
 from scipy.optimize import brentq, minimize_scalar
 
 from fsae_sim.physics_constants import AIR_DENSITY_KG_M3, GRAVITY_M_S2
@@ -78,6 +79,12 @@ class VehicleDynamics:
         self.load_transfer = load_transfer
         self.cornering_solver = cornering_solver
         self.cornering_stiffness_scale = float(cornering_stiffness_scale)
+        self._cornering_drag_cache: dict[tuple[int, int], float] = {}
+        self._slip_angle_cache: dict[tuple[int, int], float] = {}
+        self._peak_slip_cache: dict[int, tuple[float, float]] = {}
+        self._slip_lookup_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._traction_force_cache: dict[int, float] = {}
+        self._braking_force_cache: dict[int, float] = {}
 
         # Effective mass: bare mass + rotational inertia of spinning components.
         # Use the configured rolling radius so motor RPM, wheel force, and
@@ -161,7 +168,16 @@ class VehicleDynamics:
             self.tire_model is not None
             and self.load_transfer is not None
         ):
-            return self._cornering_drag_pacejka(speed_ms, curvature, f_lat_total)
+            cache_key = (
+                int(round(max(speed_ms, 0.0) * 20.0)),  # 0.05 m/s bins
+                int(round(abs(curvature) * 100_000.0)),  # 1e-5 1/m bins
+            )
+            cached = self._cornering_drag_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            drag = self._cornering_drag_pacejka(speed_ms, curvature, f_lat_total)
+            self._cornering_drag_cache[cache_key] = drag
+            return drag
 
         return self._cornering_drag_analytical(f_lat_total)
 
@@ -201,6 +217,14 @@ class VehicleDynamics:
         if normal_load < 1.0 or f_lat_needed < 1.0:
             return 0.0
 
+        slip_key = (
+            int(round(f_lat_needed * 0.5)),  # 2 N bins
+            int(round(normal_load * 0.2)),  # 5 N bins
+        )
+        cached = self._slip_angle_cache.get(slip_key)
+        if cached is not None:
+            return cached
+
         # Pacejka Fy is non-monotonic past its peak: it rises, hits
         # peak_Fy at alpha_peak, then decays.  Brentq over a non-monotonic
         # interval can pick either the pre-peak or post-peak root; we
@@ -219,20 +243,52 @@ class VehicleDynamics:
         # this are already satisfied at zero slip.
         fy_at_zero = abs(self.tire_model.lateral_force(0.0, normal_load))
         if f_lat_needed <= fy_at_zero:
+            self._slip_angle_cache[slip_key] = 0.0
             return 0.0
 
-        result = minimize_scalar(
-            lambda a: -abs(self.tire_model.lateral_force(a, normal_load)),
-            bounds=(0.001, _ALPHA_SEARCH_MAX),
-            method="bounded",
-        )
-        alpha_peak = abs(result.x)
-        peak_fy = abs(self.tire_model.lateral_force(alpha_peak, normal_load))
+        peak_key = int(round(normal_load * 0.2))  # 5 N bins
+        peak = self._peak_slip_cache.get(peak_key)
+        if peak is None:
+            result = minimize_scalar(
+                lambda a: -abs(self.tire_model.lateral_force(a, normal_load)),
+                bounds=(0.001, _ALPHA_SEARCH_MAX),
+                method="bounded",
+            )
+            alpha_peak = abs(result.x)
+            peak_fy = abs(self.tire_model.lateral_force(alpha_peak, normal_load))
+            peak = (alpha_peak, peak_fy)
+            self._peak_slip_cache[peak_key] = peak
+        else:
+            alpha_peak, peak_fy = peak
 
         if f_lat_needed >= peak_fy:
+            self._slip_angle_cache[slip_key] = alpha_peak
             return alpha_peak  # saturated — no pre-peak solution exists
 
-        return brentq(
+        if abs(self.tire_model.lateral_force(alpha_peak, normal_load)) <= f_lat_needed:
+            self._slip_angle_cache[slip_key] = alpha_peak
+            return alpha_peak
+
+        lookup = self._slip_lookup_cache.get(peak_key)
+        if lookup is None:
+            alpha_grid = np.linspace(0.0, alpha_peak, 192)
+            fy_grid = np.array([
+                abs(self.tire_model.lateral_force(alpha, normal_load))
+                for alpha in alpha_grid
+            ])
+            fy_grid = np.maximum.accumulate(fy_grid)
+            keep = np.concatenate(([True], np.diff(fy_grid) > 1e-9))
+            if np.count_nonzero(keep) >= 2:
+                lookup = (fy_grid[keep], alpha_grid[keep])
+                self._slip_lookup_cache[peak_key] = lookup
+
+        if lookup is not None:
+            fy_grid, alpha_grid = lookup
+            alpha = float(np.interp(f_lat_needed, fy_grid, alpha_grid))
+            self._slip_angle_cache[slip_key] = alpha
+            return alpha
+
+        alpha = brentq(
             lambda a: abs(
                 self.tire_model.lateral_force(a, normal_load)
             ) - f_lat_needed,
@@ -240,6 +296,8 @@ class VehicleDynamics:
             alpha_peak,
             xtol=1e-4,
         )
+        self._slip_angle_cache[slip_key] = alpha
+        return alpha
 
     def _cornering_drag_pacejka(
         self, speed_ms: float, curvature: float, f_lat_total: float,
@@ -411,6 +469,11 @@ class VehicleDynamics:
         if self.tire_model is None or self.load_transfer is None:
             return float("inf")
 
+        speed_key = int(round(max(speed_ms, 0.0) * 20.0))  # 0.05 m/s bins
+        cached = self._traction_force_cache.get(speed_key)
+        if cached is not None:
+            return cached
+
         mg = self.vehicle.mass_kg * GRAVITY_M_S2
         long_g = 0.3  # initial guess
         for _ in range(8):  # converges in 2-3 iters for physical values
@@ -423,6 +486,7 @@ class VehicleDynamics:
             if abs(long_g_new - long_g) < 1e-3:
                 break
             long_g = long_g_new
+        self._traction_force_cache[speed_key] = f_drive
         return f_drive
 
     # Maximum effective braking deceleration (g) at brake_pct=1.0.
@@ -483,6 +547,11 @@ class VehicleDynamics:
         if self.tire_model is None or self.load_transfer is None:
             return float("inf")
 
+        speed_key = int(round(max(speed_ms, 0.0) * 20.0))  # 0.05 m/s bins
+        cached = self._braking_force_cache.get(speed_key)
+        if cached is not None:
+            return cached
+
         mg = self.vehicle.mass_kg * GRAVITY_M_S2
         long_g = -1.0  # initial guess (hard braking)
         for _ in range(8):
@@ -495,6 +564,7 @@ class VehicleDynamics:
             if abs(long_g_new - long_g) < 1e-3:
                 break
             long_g = long_g_new
+        self._braking_force_cache[speed_key] = f_brake
         return f_brake
 
     # ------------------------------------------------------------------

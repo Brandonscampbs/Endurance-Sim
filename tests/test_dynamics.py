@@ -79,9 +79,9 @@ class TestTotalResistance:
     def test_at_rest_includes_parasitic_drag(self, dynamics):
         f = dynamics.total_resistance(0.0, 0.0)
         rr = dynamics.rolling_resistance_force()
-        # Total resistance at rest = rolling resistance + parasitic drag (30N)
+        # Total resistance at rest = rolling resistance + parasitic drag (35N)
         assert f > rr
-        assert abs(f - rr - 30.0) < 1e-6
+        assert abs(f - rr - 35.0) < 1e-6
 
     def test_increases_with_speed(self, dynamics):
         f10 = dynamics.total_resistance(10.0)

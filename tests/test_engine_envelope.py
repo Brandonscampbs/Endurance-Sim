@@ -156,6 +156,36 @@ class TestZoneMaxSpeedCap:
         )
 
 
+class TestSimulationModeGuards:
+    """Validation/prediction modes must not use telemetry speed-oracle caps."""
+
+    def test_validation_mode_rejects_observed_speed_caps(self):
+        track = make_simple_track()
+        config = make_minimal_config()
+
+        class ObservedCapStrategy(DriverStrategy):
+            name = "observed_cap"
+            uses_observed_speed_caps = True
+
+            def decide(self, state, upcoming):
+                return ControlCommand(
+                    action=ControlAction.THROTTLE,
+                    throttle_pct=1.0,
+                    metadata={"max_speed_ms": 10.0},
+                )
+
+        batt = MagicMock(spec=BatteryModel)
+
+        with pytest.raises(ValueError, match="validation mode forbids"):
+            SimulationEngine(
+                config,
+                track,
+                ObservedCapStrategy(),
+                batt,
+                mode="validation",
+            )
+
+
 class TestPackCurrentCarriedForward:
     """D-11: SimState.pack_current carries last segment's pack current."""
 

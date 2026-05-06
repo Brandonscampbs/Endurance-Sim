@@ -10,10 +10,11 @@ that is applied on top of the motor+inverter efficiency.
 
 from __future__ import annotations
 
+from bisect import bisect_right
+import math
 from pathlib import Path
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 
 
 class MotorEfficiencyMap:
@@ -71,16 +72,13 @@ class MotorEfficiencyMap:
             else:
                 eff_grid[i, :] = self._FLOOR_EFFICIENCY
 
-        self._interpolator = RegularGridInterpolator(
-            (rpm_vals.astype(float), torque_vals.astype(float)),
-            eff_grid,
-            method="linear",
-            bounds_error=False,
-            fill_value=None,  # extrapolate
-        )
-
+        self._rpm_grid = rpm_vals.astype(float)
+        self._torque_grid = torque_vals.astype(float)
+        self._eff_grid = eff_grid.astype(float)
         self._rpm_range = (float(rpm_vals[0]), float(rpm_vals[-1]))
         self._torque_range = (float(torque_vals[0]), float(torque_vals[-1]))
+        self._rpm_inv_step = self._uniform_inv_step(self._rpm_grid)
+        self._torque_inv_step = self._uniform_inv_step(self._torque_grid)
 
     def efficiency(self, motor_rpm: float, motor_torque_nm: float) -> float:
         """Combined motor + inverter efficiency at the given operating point.
@@ -102,8 +100,76 @@ class MotorEfficiencyMap:
         if rpm < 1.0 or torque < 1.0:
             return self._FLOOR_EFFICIENCY
 
-        eff = float(self._interpolator((rpm, torque)))
+        eff = self._bilinear_lookup(rpm, torque)
         return max(self._FLOOR_EFFICIENCY, min(1.0, eff))
+
+    @staticmethod
+    def _uniform_inv_step(grid: np.ndarray) -> float | None:
+        if len(grid) < 2:
+            return None
+        step = float(grid[1] - grid[0])
+        if step <= 0.0:
+            return None
+        if np.allclose(np.diff(grid), step):
+            return 1.0 / step
+        return None
+
+    @staticmethod
+    def _bracket(grid: np.ndarray, value: float) -> tuple[int, int, float]:
+        if len(grid) == 1:
+            return 0, 0, 0.0
+        hi = bisect_right(grid, value)
+        if hi <= 0:
+            return 0, 1, 0.0
+        if hi >= len(grid):
+            return len(grid) - 2, len(grid) - 1, 1.0
+        lo = hi - 1
+        width = float(grid[hi] - grid[lo])
+        weight = 0.0 if width <= 0.0 else (value - float(grid[lo])) / width
+        return lo, hi, float(weight)
+
+    @staticmethod
+    def _uniform_bracket(
+        value: float,
+        grid_min: float,
+        inv_step: float,
+        size: int,
+    ) -> tuple[int, int, float]:
+        if size == 1:
+            return 0, 0, 0.0
+        position = (value - grid_min) * inv_step
+        lo = int(math.floor(position))
+        if lo <= 0:
+            if position <= 0.0:
+                return 0, 1, 0.0
+            lo = 0
+        if lo >= size - 1:
+            return size - 2, size - 1, 1.0
+        return lo, lo + 1, float(position - lo)
+
+    def _bilinear_lookup(self, motor_rpm: float, motor_torque_nm: float) -> float:
+        if self._rpm_inv_step is not None:
+            ri0, ri1, rw = self._uniform_bracket(
+                motor_rpm, self._rpm_range[0], self._rpm_inv_step, len(self._rpm_grid),
+            )
+        else:
+            ri0, ri1, rw = self._bracket(self._rpm_grid, motor_rpm)
+        if self._torque_inv_step is not None:
+            ti0, ti1, tw = self._uniform_bracket(
+                motor_torque_nm,
+                self._torque_range[0],
+                self._torque_inv_step,
+                len(self._torque_grid),
+            )
+        else:
+            ti0, ti1, tw = self._bracket(self._torque_grid, motor_torque_nm)
+        z00 = self._eff_grid[ri0, ti0]
+        z01 = self._eff_grid[ri0, ti1]
+        z10 = self._eff_grid[ri1, ti0]
+        z11 = self._eff_grid[ri1, ti1]
+        z0 = z00 + (z01 - z00) * tw
+        z1 = z10 + (z11 - z10) * tw
+        return float(z0 + (z1 - z0) * rw)
 
     def total_efficiency(self, motor_rpm: float, motor_torque_nm: float) -> float:
         """Total drivetrain efficiency: motor+inverter × gearbox.

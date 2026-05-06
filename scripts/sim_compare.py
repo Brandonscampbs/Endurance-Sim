@@ -18,10 +18,6 @@ import warnings
 from dataclasses import replace
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -36,12 +32,14 @@ from fsae_sim.analysis.validation import (  # noqa: E402
 from fsae_sim.data.loader import load_cleaned_csv  # noqa: E402
 from fsae_sim.driver.strategies import (  # noqa: E402
     CalibratedStrategy,
+    PreviewDriverStrategy,
     ReplayStrategy,
 )
-from fsae_sim.sim.engine import SimulationEngine  # noqa: E402
+from fsae_sim.sim.engine import SimulationEngine, SimulationMode  # noqa: E402
 from fsae_sim.track.track import Track  # noqa: E402
 from fsae_sim.vehicle import VehicleConfig  # noqa: E402
 from fsae_sim.vehicle.battery_model import BatteryModel  # noqa: E402
+from fsae_sim.vehicle.dynamics import VehicleDynamics  # noqa: E402
 
 CONFIG = REPO / "configs" / "ct16ev.yaml"
 TELEM = REPO / "Real-Car-Data-And-Stats" / "CleanedEndurance.csv"
@@ -54,6 +52,16 @@ OUT = REPO / "results"
 OUT.mkdir(exist_ok=True)
 SPEED_TOLERANCE_KMH = 2.0 * 3.6
 TIME_TOLERANCE_S = 5.0
+VALIDATION_HOLDOUT_LAPS_ZERO_BASED = tuple(range(12, 22))
+
+
+def _pyplot():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 def build_strategy(
@@ -62,17 +70,32 @@ def build_strategy(
     track,
     speed_col: str,
     *,
+    dynamics: VehicleDynamics | None = None,
     trim_replay_to_lap_start: bool = True,
+    calibration_laps: list[int] | None = None,
+    holdout_laps: list[int] | None = None,
+    use_observed_speed_caps: bool = True,
 ):
     if name == "calibrated":
         return CalibratedStrategy.from_telemetry(
-            aim_df, track, speed_col=speed_col,
+            aim_df,
+            track,
+            speed_col=speed_col,
+            holdout_laps=holdout_laps,
+            use_observed_speed_caps=use_observed_speed_caps,
         )
     if name == "replay":
         return ReplayStrategy.from_full_endurance(
             aim_df,
             track.total_distance_m,
             trim_to_lap_start=trim_replay_to_lap_start,
+        )
+    if name == "preview":
+        return PreviewDriverStrategy.from_telemetry(
+            aim_df,
+            track,
+            dynamics,
+            laps=calibration_laps,
         )
     raise ValueError(f"Unknown strategy {name!r}")
 
@@ -166,6 +189,7 @@ def overall_residual_metrics(samples: pd.DataFrame) -> dict[str, float]:
 def plot_lap_overlay(
     states, aim_df, laps, lap_num, strategy_name, speed_col: str, outpath,
 ):
+    plt = _pyplot()
     s_idx, e_idx, _ = laps[lap_num - 1]
     telem_lap = aim_df.iloc[s_idx:e_idx]
     td = (
@@ -207,10 +231,19 @@ def plot_lap_overlay(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--strategy", default="calibrated", choices=["calibrated", "replay"])
+    p.add_argument(
+        "--strategy",
+        default="calibrated",
+        choices=["calibrated", "replay", "preview"],
+    )
     p.add_argument("--lap", type=int, default=5)
     p.add_argument("--label", default=None,
                    help="optional file prefix override (default = strategy name)")
+    p.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="skip PNG plot generation for faster iterative validation runs",
+    )
     p.add_argument(
         "--track-smooth-m",
         type=float,
@@ -223,9 +256,32 @@ def main():
         default=None,
         help="override tire grip scale for replay/calibration sweeps",
     )
+    p.add_argument(
+        "--mode",
+        choices=[m.value for m in SimulationMode],
+        default=None,
+        help=(
+            "simulation mode. Default is replay for --strategy replay and "
+            "validation for --strategy calibrated."
+        ),
+    )
+    p.add_argument(
+        "--use-observed-speed-caps",
+        action="store_true",
+        help=(
+            "allow calibrated strategy telemetry p95 speed caps. Intended for "
+            "calibration diagnostics; validation/prediction modes reject this."
+        ),
+    )
     args = p.parse_args()
 
     label = args.label or args.strategy
+    mode = SimulationMode.coerce(
+        args.mode or (
+            SimulationMode.REPLAY.value
+            if args.strategy == "replay" else SimulationMode.VALIDATION.value
+        )
+    )
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # quiet calibration / clamp warnings
@@ -239,6 +295,26 @@ def main():
             )
         _, aim_df = load_cleaned_csv(str(TELEM))
         speed_col = telemetry_speed_col(aim_df)
+        from fsae_sim.analysis.validation import detect_lap_boundaries
+        _laps = detect_lap_boundaries(aim_df)
+        validation_laps = [
+            lap for lap in VALIDATION_HOLDOUT_LAPS_ZERO_BASED
+            if lap < len(_laps)
+        ]
+        calibration_laps = [
+            lap for lap in range(len(_laps)) if lap not in set(validation_laps)
+        ]
+        strategy_holdout_laps = (
+            validation_laps if mode == SimulationMode.VALIDATION else None
+        )
+        battery_holdout_laps = (
+            [lap + 1 for lap in validation_laps]
+            if mode == SimulationMode.VALIDATION else None
+        )
+        use_observed_speed_caps = (
+            args.use_observed_speed_caps
+            if mode == SimulationMode.CALIBRATION else False
+        )
         # Build the map from GPS latitude/longitude geometry. Replay uses
         # the full cleaned recording so total distance/time compare against
         # CleanedEndurance.csv rather than only the detected lap stitch.
@@ -254,22 +330,33 @@ def main():
         else:
             track = Track.from_telemetry(df=aim_df)
         battery = BatteryModel.from_config_and_data(vehicle.battery, str(VOLTT))
-        battery.calibrate_pack_from_telemetry(aim_df)
+        if battery_holdout_laps is not None:
+            battery.calibrate_pack_from_telemetry(
+                aim_df,
+                holdout_laps=battery_holdout_laps,
+            )
+        else:
+            battery.calibrate_pack_from_telemetry(
+                aim_df,
+                allow_same_run_validation=True,
+            )
         strategy = build_strategy(
             args.strategy,
             aim_df,
             track,
             speed_col,
+            dynamics=VehicleDynamics(vehicle.vehicle),
             trim_replay_to_lap_start=(args.strategy != "replay"),
+            calibration_laps=calibration_laps if mode == SimulationMode.VALIDATION else None,
+            holdout_laps=strategy_holdout_laps,
+            use_observed_speed_caps=use_observed_speed_caps,
         )
-        engine = SimulationEngine(vehicle, track, strategy, battery)
+        engine = SimulationEngine(vehicle, track, strategy, battery, mode=mode)
 
         # Use the real driver's lap-1 entry speed instead of 0 so the sim
         # doesn't ramp from 0.5 m/s through the first 50 m of the lap. Real
         # endurance starts at the start/finish gate while the car is already
         # moving (rolling start). Match that.
-        from fsae_sim.analysis.validation import detect_lap_boundaries
-        _laps = detect_lap_boundaries(aim_df)
         initial_speed_ms = (
             float(aim_df[speed_col].iloc[_laps[0][0]]) / 3.6
             if _laps else 0.0
@@ -291,6 +378,7 @@ def main():
           f"final_soc={result.final_soc:.1f}% "
           f"net_kwh={result.net_energy_kwh:.3f}")
     print(f"track_source={track.source} speed_truth={speed_col}")
+    print(f"mode={mode.value} observed_speed_caps={use_observed_speed_caps}")
 
     states.to_parquet(OUT / f"{label}_sim.parquet")
     aim_df.to_parquet(OUT / "telemetry.parquet")
@@ -322,36 +410,48 @@ def main():
         sim_final_soc=result.final_soc,
         sim_total_energy_kwh=result.net_energy_kwh,
         sim_laps=result.laps_completed,
+        calibration_laps=calibration_laps if mode == SimulationMode.VALIDATION else None,
+        validation_laps=validation_laps if mode == SimulationMode.VALIDATION else None,
     )
     print()
     print(report.summary())
 
-    # Full overlay
-    fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(
-        aim_df["Distance on GPS Speed"].values, aim_df[speed_col].values,
-        color="#1f77b4", lw=0.7, alpha=0.6,
-        label=f"Telemetry ({speed_col})",
-    )
-    ax.plot(states["distance_m"].values, states["speed_kmh"].values,
-            color="#d62728", lw=0.7, alpha=0.85, label=f"Sim ({label})")
-    ax.set_xlabel("Distance (m)"); ax.set_ylabel("Speed (km/h)")
-    ax.set_title(f"Full endurance speed overlay  ({label})")
-    ax.legend(loc="upper right"); ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(OUT / f"{label}_speed_full.png", dpi=140)
-    plt.close(fig)
+    if not args.no_plots:
+        plt = _pyplot()
+        # Full overlay
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.plot(
+            aim_df["Distance on GPS Speed"].values, aim_df[speed_col].values,
+            color="#1f77b4", lw=0.7, alpha=0.6,
+            label=f"Telemetry ({speed_col})",
+        )
+        ax.plot(states["distance_m"].values, states["speed_kmh"].values,
+                color="#d62728", lw=0.7, alpha=0.85, label=f"Sim ({label})")
+        ax.set_xlabel("Distance (m)"); ax.set_ylabel("Speed (km/h)")
+        ax.set_title(f"Full endurance speed overlay  ({label})")
+        ax.legend(loc="upper right"); ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(OUT / f"{label}_speed_full.png", dpi=140)
+        plt.close(fig)
 
-    # Generate per-lap overlay+residual plots for a representative spread.
-    for lap_n in [1, 5, 10, 15, 20]:
-        if lap_n <= len(laps):
-            plot_lap_overlay(
-                states, aim_df, laps, lap_n, label, speed_col,
-                OUT / f"{label}_lap{lap_n}.png",
-            )
+        # Generate per-lap overlay+residual plots for a representative spread.
+        for lap_n in [1, 5, 10, 15, 20]:
+            if lap_n <= len(laps):
+                plot_lap_overlay(
+                    states, aim_df, laps, lap_n, label, speed_col,
+                    OUT / f"{label}_lap{lap_n}.png",
+                )
 
     summary = {
         "strategy": label,
+        "mode": mode.value,
+        "uses_observed_speed_caps": use_observed_speed_caps,
+        "calibration_laps_zero_based": (
+            calibration_laps if mode == SimulationMode.VALIDATION else None
+        ),
+        "validation_laps_zero_based": (
+            validation_laps if mode == SimulationMode.VALIDATION else None
+        ),
         "track_source": track.source,
         "track_smooth_distance_m": (
             args.track_smooth_m

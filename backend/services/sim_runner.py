@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from fsae_sim.analysis.validation import detect_lap_boundaries
 from fsae_sim.driver.strategies import CalibratedStrategy
 from fsae_sim.sim.engine import SimResult, SimulationEngine, SimulationMode
 from fsae_sim.track.track import Track
@@ -18,7 +19,19 @@ _VOLTT_CELL_PATH = (
     / "2025_Pack_cell.csv"
 )
 _VALIDATION_HOLDOUT_LAPS_ZERO_BASED = tuple(range(12, 22))
-_VALIDATION_HOLDOUT_LAPS_ONE_BASED = tuple(i + 1 for i in _VALIDATION_HOLDOUT_LAPS_ZERO_BASED)
+
+
+def get_validation_lap_split(num_laps: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return zero-based calibration and validation lap indices."""
+    validation_laps = tuple(
+        lap for lap in _VALIDATION_HOLDOUT_LAPS_ZERO_BASED
+        if 0 <= lap < num_laps
+    )
+    validation_set = set(validation_laps)
+    calibration_laps = tuple(
+        lap for lap in range(num_laps) if lap not in validation_set
+    )
+    return calibration_laps, validation_laps
 
 
 @lru_cache(maxsize=1)
@@ -42,35 +55,50 @@ def get_track() -> Track:
 @lru_cache(maxsize=1)
 def get_battery_model() -> BatteryModel:
     vehicle = get_vehicle_config()
+    aim_df = get_telemetry()
+    _, validation_laps = get_validation_lap_split(_detected_lap_count(aim_df))
     battery = BatteryModel.from_config_and_data(vehicle.battery, str(_VOLTT_CELL_PATH))
     battery.calibrate_pack_from_telemetry(
-        get_telemetry(),
-        holdout_laps=_VALIDATION_HOLDOUT_LAPS_ONE_BASED,
+        aim_df,
+        holdout_laps=tuple(lap + 1 for lap in validation_laps),
     )
     return battery
 
 
+def _detected_lap_count(aim_df) -> int:
+    boundaries = detect_lap_boundaries(aim_df)
+    if not boundaries:
+        raise ValueError(
+            "Could not detect telemetry lap boundaries; refusing to run "
+            "validation with a hardcoded endurance lap count."
+        )
+    return len(boundaries)
+
+
 @lru_cache(maxsize=1)
 def get_baseline_result() -> SimResult:
-    """Run baseline 22-lap simulation with CalibratedStrategy."""
+    """Run the held-out validation baseline with CalibratedStrategy."""
     vehicle = get_vehicle_config()
     track = get_track()
     battery = get_battery_model()
     aim_df = get_telemetry()
+    num_laps = _detected_lap_count(aim_df)
+    _, validation_laps = get_validation_lap_split(num_laps)
 
     strategy = CalibratedStrategy.from_telemetry(
         aim_df,
         track,
-        holdout_laps=list(_VALIDATION_HOLDOUT_LAPS_ZERO_BASED),
+        holdout_laps=list(validation_laps),
+        use_observed_speed_caps=False,
     )
     engine = SimulationEngine(
         vehicle,
         track,
         strategy,
         battery,
-        mode=SimulationMode.CALIBRATION,
+        mode=SimulationMode.VALIDATION,
     )
-    return engine.run(num_laps=22, initial_soc_pct=95.0, initial_temp_c=29.0)
+    return engine.run(num_laps=num_laps, initial_soc_pct=95.0, initial_temp_c=29.0)
 
 
 def run_single_lap_sim(lap_number: int = 1) -> SimResult:
@@ -84,21 +112,23 @@ def run_single_lap_sim(lap_number: int = 1) -> SimResult:
 
     # Use fresh battery (not calibrated-pack) for single-lap
     battery = BatteryModel.from_config_and_data(vehicle.battery, str(_VOLTT_CELL_PATH))
+    _, validation_laps = get_validation_lap_split(_detected_lap_count(aim_df))
     battery.calibrate_pack_from_telemetry(
         aim_df,
-        holdout_laps=_VALIDATION_HOLDOUT_LAPS_ONE_BASED,
+        holdout_laps=tuple(lap + 1 for lap in validation_laps),
     )
 
     strategy = CalibratedStrategy.from_telemetry(
         aim_df,
         track,
-        holdout_laps=list(_VALIDATION_HOLDOUT_LAPS_ZERO_BASED),
+        holdout_laps=list(validation_laps),
+        use_observed_speed_caps=False,
     )
     engine = SimulationEngine(
         vehicle,
         track,
         strategy,
         battery,
-        mode=SimulationMode.CALIBRATION,
+        mode=SimulationMode.VALIDATION,
     )
     return engine.run(num_laps=1, initial_soc_pct=95.0, initial_temp_c=29.0)

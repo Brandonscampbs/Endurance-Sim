@@ -6,10 +6,11 @@ import pytest
 from fsae_sim.driver.strategy import ControlAction, SimState
 from fsae_sim.driver.strategies import (
     CoastOnlyStrategy,
+    PreviewDriverStrategy,
     ReplayStrategy,
     ThresholdBrakingStrategy,
 )
-from fsae_sim.track.track import Segment
+from fsae_sim.track.track import Segment, Track
 from fsae_sim.vehicle.dynamics import VehicleDynamics
 from fsae_sim.vehicle.vehicle import VehicleParams
 
@@ -469,3 +470,63 @@ class TestCalibratedStrategyWithParams:
         state = SimState(0, 0.0, 10.0, 0.9, 400, 0, 25, 0, 3)
         cmd = capped.decide(state, [])
         assert cmd.throttle_pct == pytest.approx(0.3)
+
+
+class TestPreviewDriverStrategy:
+    """Preview driver tracks a physics speed target without observed caps."""
+
+    def _track(self) -> Track:
+        return Track(
+            name="preview_test",
+            segments=[
+                Segment(0, 0.0, 10.0, 0.0, 0.0),
+                Segment(1, 10.0, 10.0, 0.08, 0.0),
+                Segment(2, 20.0, 10.0, 0.0, 0.0),
+            ],
+        )
+
+    def test_brakes_for_future_envelope_target(self, dynamics):
+        track = self._track()
+        strategy = PreviewDriverStrategy(track, dynamics)
+        strategy.set_envelope(np.array([20.0, 8.0, 20.0]))
+
+        state = SimState(0, 0.0, 16.0, 0.9, 400, 0, 25, 0, 0)
+        cmd = strategy.decide(state, track.segments[:2])
+
+        assert cmd.action == ControlAction.BRAKE
+        assert cmd.brake_pct > 0.0
+        assert cmd.metadata is None
+        assert not strategy.uses_observed_speed_caps
+
+    def test_throttles_when_below_target(self, dynamics):
+        track = self._track()
+        strategy = PreviewDriverStrategy(track, dynamics)
+        strategy.set_envelope(np.array([20.0, 20.0, 20.0]))
+
+        state = SimState(0, 0.0, 8.0, 0.9, 400, 0, 25, 0, 0)
+        cmd = strategy.decide(state, track.segments)
+
+        assert cmd.action == ControlAction.THROTTLE
+        assert cmd.throttle_pct > 0.0
+
+    def test_from_telemetry_fits_global_limits_without_caps(self, dynamics):
+        import pandas as pd
+
+        track = self._track()
+        n = 60
+        dist = np.linspace(0.0, track.total_distance_m, n)
+        df = pd.DataFrame({
+            "Distance on GPS Speed": dist,
+            "GPS Speed": np.full(n, 30.0),
+            "GPS Latitude": np.sin(np.linspace(0.0, 2.0 * np.pi, n)),
+            "GPS Longitude": np.cos(np.linspace(0.0, 2.0 * np.pi, n)),
+            "Throttle Pos": np.linspace(0.0, 80.0, n),
+            "FBrakePressure": np.linspace(0.0, 30.0, n),
+            "RBrakePressure": np.zeros(n),
+        })
+
+        strategy = PreviewDriverStrategy.from_telemetry(df, track, dynamics)
+
+        assert 0.35 <= strategy.params.max_throttle <= 1.0
+        assert 0.25 <= strategy.params.max_brake <= 1.0
+        assert not strategy.uses_observed_speed_caps
