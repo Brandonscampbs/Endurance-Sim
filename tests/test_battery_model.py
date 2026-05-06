@@ -215,6 +215,53 @@ class TestPackVoltage:
             assert mean_err < 0.02, f"Mean pack voltage error {mean_err:.4f} > 2%"
 
 
+class TestTerminalPowerStepping:
+
+    def test_current_for_power_round_trip_discharge(self, calibrated_model):
+        soc = 82.0
+        current = 35.0
+        power = calibrated_model.pack_voltage(soc, current) * current
+
+        solved = calibrated_model.current_for_power(power, soc)
+
+        assert solved == pytest.approx(current, rel=1e-7, abs=1e-7)
+
+    def test_current_for_power_round_trip_regen(self, calibrated_model):
+        soc = 82.0
+        current = -8.0
+        power = calibrated_model.pack_voltage(soc, current) * current
+
+        solved = calibrated_model.current_for_power(power, soc)
+
+        assert solved == pytest.approx(current, rel=1e-7, abs=1e-7)
+
+    def test_step_power_matches_equivalent_current_step(self, calibrated_model):
+        soc = 78.0
+        temp = 31.0
+        dt = 0.25
+        current = 42.0
+        power = calibrated_model.pack_voltage(soc, current) * current
+
+        expected = calibrated_model.step(current, dt, soc, temp)
+        actual_soc, actual_temp, actual_voltage, actual_current = (
+            calibrated_model.step_power(power, dt, soc, temp)
+        )
+
+        assert actual_current == pytest.approx(current, rel=1e-7, abs=1e-7)
+        assert actual_soc == pytest.approx(expected[0])
+        assert actual_temp == pytest.approx(expected[1])
+        assert actual_voltage == pytest.approx(expected[2])
+
+    def test_step_power_aligns_terminal_power(self, calibrated_model):
+        soc = 80.0
+        power = 12_000.0
+
+        _, _, _, current = calibrated_model.step_power(power, 0.1, soc, 30.0)
+        terminal_voltage = calibrated_model.pack_voltage(soc, current)
+
+        assert terminal_voltage * current == pytest.approx(power, rel=1e-9)
+
+
 # ---------------------------------------------------------------------------
 # Discharge limits
 # ---------------------------------------------------------------------------

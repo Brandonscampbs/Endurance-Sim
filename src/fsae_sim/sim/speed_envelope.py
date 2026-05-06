@@ -258,7 +258,7 @@ class SpeedEnvelope:
         doubles and legacy callables may only accept ``(speed, grade)``
         or ``(speed,)``; introspect once and cache the result.
         """
-        if not hasattr(self, "_resist_kwargs"):
+        if not hasattr(self, "_resist_call_mode"):
             fn = getattr(
                 self._dynamics.total_resistance, "side_effect", None,
             ) or self._dynamics.total_resistance
@@ -266,16 +266,21 @@ class SpeedEnvelope:
                 params = inspect.signature(fn).parameters
             except (ValueError, TypeError):
                 params = {}
-            self._resist_kwargs = {
-                "grade": "grade" in params,
-                "curvature": "curvature" in params,
-            }
-        kwargs = {}
-        if self._resist_kwargs["grade"]:
-            kwargs["grade"] = grade
-        if self._resist_kwargs["curvature"]:
-            kwargs["curvature"] = curvature
-        return self._dynamics.total_resistance(speed, **kwargs)
+            has_grade = "grade" in params
+            has_curvature = "curvature" in params
+            if has_grade and has_curvature:
+                self._resist_call_mode = "grade_curvature"
+            elif has_grade:
+                self._resist_call_mode = "grade"
+            else:
+                self._resist_call_mode = "speed"
+        if self._resist_call_mode == "grade_curvature":
+            return self._dynamics.total_resistance(
+                speed, grade=grade, curvature=curvature,
+            )
+        if self._resist_call_mode == "grade":
+            return self._dynamics.total_resistance(speed, grade=grade)
+        return self._dynamics.total_resistance(speed)
 
     def _as_finite_float(self, value, fallback: float) -> float:
         try:

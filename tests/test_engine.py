@@ -140,6 +140,14 @@ class TestPhysicalSanity:
         assert (result.states["pack_voltage_v"] > 250).all()
         assert (result.states["pack_voltage_v"] < 470).all()
 
+    def test_power_current_voltage_are_aligned(self, engine_full_throttle):
+        result = engine_full_throttle.run(num_laps=1)
+        reconstructed_power = (
+            result.states["pack_voltage_v"] * result.states["pack_current_a"]
+        )
+        error = np.abs(reconstructed_power - result.states["electrical_power_w"])
+        assert error.max() < 1e-6
+
     def test_temperature_increases(self, engine_full_throttle):
         result = engine_full_throttle.run(num_laps=1, initial_temp_c=25.0)
         final_temp = result.states["cell_temp_c"].iloc[-1]

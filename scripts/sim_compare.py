@@ -117,7 +117,7 @@ def residual_samples(states, aim_df, laps, speed_col: str):
         tt = telem_lap["Time"].values - telem_lap["Time"].iloc[0]
         sim_on_telem = np.interp(td, sd, sim_lap["speed_kmh"].values)
         sim_time_on_telem = np.interp(td, sd, st)
-        rows.append(pd.DataFrame({
+        data = {
             "lap": i + 1,
             "lap_distance_m": td,
             "telem_elapsed_s": tt,
@@ -128,7 +128,20 @@ def residual_samples(states, aim_df, laps, speed_col: str):
                 sim_on_telem - telem_lap[speed_col].values
             ),
             "time_residual_s": sim_time_on_telem - tt,
-        }))
+        }
+        if (
+            "electrical_power_w" in sim_lap.columns
+            and {"Pack Voltage", "Pack Current"}.issubset(telem_lap.columns)
+        ):
+            real_power = (
+                telem_lap["Pack Voltage"].values
+                * telem_lap["Pack Current"].values
+            )
+            sim_power = np.interp(td, sd, sim_lap["electrical_power_w"].values)
+            data["telem_power_w"] = real_power
+            data["sim_power_w"] = sim_power
+            data["power_residual_w"] = sim_power - real_power
+        rows.append(pd.DataFrame(data))
     if not rows:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
@@ -170,7 +183,7 @@ def per_lap_residuals(states, aim_df, laps, speed_col: str):
 def overall_residual_metrics(samples: pd.DataFrame) -> dict[str, float]:
     speed_resid = samples["speed_residual_kmh"].values
     time_resid = samples["time_residual_s"].values
-    return {
+    metrics = {
         "speed_rmse_kmh": float(np.sqrt(np.mean(speed_resid ** 2))),
         "speed_bias_kmh": float(np.mean(speed_resid)),
         "speed_p95_kmh": float(np.percentile(np.abs(speed_resid), 95)),
@@ -184,6 +197,15 @@ def overall_residual_metrics(samples: pd.DataFrame) -> dict[str, float]:
             100.0 * np.mean(np.abs(time_resid) <= TIME_TOLERANCE_S)
         ),
     }
+    if "power_residual_w" in samples.columns:
+        power_resid = samples["power_residual_w"].values
+        metrics.update({
+            "power_rmse_w": float(np.sqrt(np.mean(power_resid ** 2))),
+            "power_mae_w": float(np.mean(np.abs(power_resid))),
+            "power_bias_w": float(np.mean(power_resid)),
+            "power_p95_w": float(np.percentile(np.abs(power_resid), 95)),
+        })
+    return metrics
 
 
 def plot_lap_overlay(
@@ -401,6 +423,13 @@ def main():
         f"p95={overall['time_abs_p95_s']:.2f}s, "
         f"within 5s={overall['time_within_5s_pct']:.1f}%"
     )
+    if "power_rmse_w" in overall:
+        print(
+            "Overall terminal power by distance: "
+            f"RMSE={overall['power_rmse_w'] / 1000.0:.2f} kW, "
+            f"MAE={overall['power_mae_w'] / 1000.0:.2f} kW, "
+            f"bias={overall['power_bias_w'] / 1000.0:+.2f} kW"
+        )
 
     # Validation
     report = validate_full_endurance(
@@ -479,6 +508,10 @@ def main():
             result.total_time_s - per_lap["telem_time_s"].sum()
         ),
         "telem_net_kwh": report.telem_net_j / 3.6e6,
+        "sim_power_alignment_max_abs_w": float(np.max(np.abs(
+            states["electrical_power_w"].values
+            - states["pack_voltage_v"].values * states["pack_current_a"].values
+        ))),
         "mean_rmse_kmh": float(per_lap["rmse_kmh"].mean()),
         "mean_bias_kmh": float(per_lap["bias_kmh"].mean()),
         "overall": overall,

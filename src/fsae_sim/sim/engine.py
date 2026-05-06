@@ -334,6 +334,15 @@ class SimulationEngine:
             except Exception:
                 pass
 
+        lookahead = 5
+        upcoming_by_segment = [
+            [
+                segments[(seg_idx + offset) % num_segments]
+                for offset in range(lookahead)
+            ]
+            for seg_idx in range(num_segments)
+        ]
+
         def solve_exit_speed(v0: float, length_m: float, net_force_n: float) -> float:
             if length_m <= 0.0:
                 return max(v0, 0.0)
@@ -495,15 +504,10 @@ class SimulationEngine:
                     segment_idx=seg_idx,
                 )
 
-                # Look ahead: upcoming segments (current + next few)
-                lookahead = 5
-                upcoming = []
-                for i in range(lookahead):
-                    idx = (seg_idx + i) % num_segments
-                    upcoming.append(segments[idx])
-
                 # 1. Driver decision
-                cmd = self.strategy.decide(sim_state, upcoming)
+                cmd = self.strategy.decide(
+                    sim_state, upcoming_by_segment[seg_idx],
+                )
 
                 # --- Force-based resolution (all strategies) ---
 
@@ -683,10 +687,17 @@ class SimulationEngine:
                     elec_power = self.powertrain.electrical_power(
                         motor_torque, motor_rpm, pack_voltage,
                     )
-                if pack_voltage > 0:
-                    pack_current = elec_power / pack_voltage
+                new_soc, new_temp, new_voltage, pack_current = (
+                    self.battery_model.step_power(
+                        elec_power, seg_time, soc, temp, time_s=time,
+                    )
+                )
+                if abs(pack_current) > 1e-9:
+                    terminal_voltage = elec_power / pack_current
                 else:
-                    pack_current = 0.0
+                    terminal_voltage = self.battery_model.pack_voltage(
+                        soc, 0.0, time_s=time,
+                    )
 
                 # BMS current limit is enforced upstream in
                 # lvcu_torque_command for non-replay paths.  Replay
@@ -709,11 +720,6 @@ class SimulationEngine:
                         stacklevel=2,
                     )
                     self._replay_bms_warned = True
-
-                # 8. Step battery state
-                new_soc, new_temp, new_voltage = self.battery_model.step(
-                    pack_current, seg_time, soc, temp,
-                )
 
                 # 10. Energy accounting.
                 # C8: keep discharge-only (positive pack power) for legacy
@@ -778,7 +784,7 @@ class SimulationEngine:
                     "speed_ms": avg_speed,
                     "speed_kmh": avg_speed * 3.6,
                     "soc_pct": soc,
-                    "pack_voltage_v": pack_voltage,
+                    "pack_voltage_v": terminal_voltage,
                     "pack_current_a": pack_current,
                     "cell_temp_c": temp,
                     "motor_rpm": motor_rpm,

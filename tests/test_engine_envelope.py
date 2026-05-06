@@ -79,6 +79,16 @@ def make_minimal_config() -> VehicleConfig:
     )
 
 
+def configure_battery_mock(batt: MagicMock) -> None:
+    batt.pack_voltage.return_value = 400.0
+    batt.max_discharge_current.return_value = 100.0
+    batt.step_power.side_effect = (
+        lambda power_w, _dt_s, _soc, _temp, time_s=None: (
+            90.0, 26.0, 395.0, power_w / 400.0,
+        )
+    )
+
+
 class TestEnvelopeIntegration:
     """Engine should use speed envelope for synthetic strategies."""
 
@@ -89,9 +99,7 @@ class TestEnvelopeIntegration:
         strategy = StubStrategy()
 
         batt = MagicMock(spec=BatteryModel)
-        batt.pack_voltage.return_value = 400.0
-        batt.max_discharge_current.return_value = 100.0
-        batt.step.return_value = (90.0, 26.0, 395.0)
+        configure_battery_mock(batt)
 
         engine = SimulationEngine(config, track, strategy, batt)
         result = engine.run(num_laps=1, initial_soc_pct=95.0)
@@ -141,9 +149,7 @@ class TestZoneMaxSpeedCap:
                 )
 
         batt = MagicMock(spec=BatteryModel)
-        batt.pack_voltage.return_value = 400.0
-        batt.max_discharge_current.return_value = 100.0
-        batt.step.return_value = (90.0, 26.0, 395.0)
+        configure_battery_mock(batt)
 
         engine = SimulationEngine(config, track, CappedStrategy(), batt)
         result = engine.run(num_laps=1, initial_soc_pct=95.0)
@@ -210,9 +216,7 @@ class TestPackCurrentCarriedForward:
                 )
 
         batt = MagicMock(spec=BatteryModel)
-        batt.pack_voltage.return_value = 400.0
-        batt.max_discharge_current.return_value = 100.0
-        batt.step.return_value = (90.0, 26.0, 395.0)
+        configure_battery_mock(batt)
 
         spy = SpyStrategy()
         engine = SimulationEngine(config, track, spy, batt)
@@ -238,9 +242,7 @@ class TestRollingStartFlag:
         config = make_minimal_config()
         strategy = StubStrategy()
         batt = MagicMock(spec=BatteryModel)
-        batt.pack_voltage.return_value = 400.0
-        batt.max_discharge_current.return_value = 100.0
-        batt.step.return_value = (90.0, 26.0, 395.0)
+        configure_battery_mock(batt)
         return SimulationEngine(config, track, strategy, batt)
 
     def test_standing_start_skips_clamp(self):
@@ -266,9 +268,7 @@ class TestRollingStartFlag:
                 )
 
         batt = MagicMock(spec=BatteryModel)
-        batt.pack_voltage.return_value = 400.0
-        batt.max_discharge_current.return_value = 100.0
-        batt.step.return_value = (90.0, 26.0, 395.0)
+        configure_battery_mock(batt)
 
         spy = SpyStrategy()
         engine = SimulationEngine(config, track, spy, batt)

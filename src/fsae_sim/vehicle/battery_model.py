@@ -7,6 +7,7 @@ thermal model.
 
 from __future__ import annotations
 
+import math
 import warnings
 from bisect import bisect_right
 from dataclasses import dataclass, field
@@ -92,6 +93,17 @@ class BatteryModel:
         else:
             self.cell_capacity_ah = float(config.cell_capacity_ah)
         self.pack_capacity_ah = self.cell_capacity_ah * config.parallel
+        self._num_cells = int(config.series * config.parallel)
+        self._inv_parallel = 1.0 / float(config.parallel)
+        self._soc_pct_per_cell_amp_second = (
+            100.0 / (self.cell_capacity_ah * 3600.0)
+        )
+        self._thermal_mass_j_per_k = (
+            self.CELL_MASS_KG
+            * self.CELL_SPECIFIC_HEAT_J_PER_KG_K
+            * self._num_cells
+            + config.pack_structural_thermal_mass_kj_per_k * 1000.0
+        )
 
         # Discharge limit interpolator from BMS config
         temps = np.array([dl.temp_c for dl in config.discharge_limits])
@@ -631,6 +643,24 @@ class BatteryModel:
         )
         return max(0.001, min(50.0, resistance))
 
+    def pack_open_circuit_voltage(self, soc_pct: float) -> float:
+        """Pack open-circuit voltage at given SOC.
+
+        Uses the telemetry-refined pack OCV curve when available; otherwise
+        falls back to the Voltt cell OCV scaled by series count.
+        """
+        if not self._calibrated:
+            raise RuntimeError("Model must be calibrated before use")
+        soc = self._clip_pct(soc_pct)
+        if self._pack_calibrated:
+            return self._interp_clamped(
+                soc,
+                self._pack_ocv_soc_grid,
+                self._pack_ocv_grid,
+                self._pack_ocv_inv_step,
+            )
+        return self.ocv(soc) * self.config.series
+
     def cell_voltage(
         self,
         soc_pct: float,
@@ -743,11 +773,11 @@ class BatteryModel:
         # ``cell_voltage_min_v + 0.01 V`` so ``v_headroom`` stays
         # non-negative (and ≥ 0.01 V).
         if self._calibrated:
-            cell_ocv = self.ocv(soc_pct)
-            r = self.internal_resistance(soc_pct)
-            if r > 0:
-                v_headroom = max(0.0, cell_ocv - self.config.cell_voltage_min_v)
-                voltage_limit_pack = (v_headroom / r) * self.config.parallel
+            pack_ocv = self.pack_open_circuit_voltage(soc_pct)
+            r_pack = self.pack_resistance(soc_pct)
+            if r_pack > 0:
+                v_headroom = max(0.0, pack_ocv - self.config.pack_voltage_min_v)
+                voltage_limit_pack = v_headroom / r_pack
             else:
                 voltage_limit_pack = float("inf")
         else:
@@ -777,18 +807,78 @@ class BatteryModel:
         compression plates, enclosure) via
         ``config.pack_structural_thermal_mass_kj_per_k``.
         """
-        num_cells = self.config.series * self.config.parallel
-        cell_j_per_k = (
-            self.CELL_MASS_KG * self.CELL_SPECIFIC_HEAT_J_PER_KG_K * num_cells
-        )
-        struct_j_per_k = (
-            self.config.pack_structural_thermal_mass_kj_per_k * 1000.0
-        )
-        return cell_j_per_k + struct_j_per_k
+        return self._thermal_mass_j_per_k
 
     # ------------------------------------------------------------------
     # State stepping
     # ------------------------------------------------------------------
+
+    def current_for_power(
+        self,
+        terminal_power_w: float,
+        soc_pct: float,
+        *,
+        time_s: float | None = None,
+    ) -> float:
+        """Solve pack current for requested terminal power.
+
+        Positive power/current discharges the pack. The equivalent circuit is
+        ``V = OCV(SOC) - I * R(SOC)`` and terminal power is ``P = V * I``.
+        This returns the low-current physical root so requested terminal
+        power, voltage, and current are aligned before the state is advanced.
+        """
+        power = float(terminal_power_w)
+        if abs(power) < 1e-9:
+            return 0.0
+
+        ocv = self.pack_open_circuit_voltage(soc_pct)
+        r_pack = max(self.pack_resistance(soc_pct), 1e-9)
+        floor_v = self.config.pack_voltage_min_v
+
+        if power > 0.0 and ocv > floor_v:
+            current_at_floor = (ocv - floor_v) / r_pack
+            max_floor_power = current_at_floor * floor_v
+            if power > max_floor_power:
+                self.violations.append(BatteryViolation(
+                    kind="voltage_floor",
+                    time_s=float(time_s) if time_s is not None else float("nan"),
+                    soc_pct=float(soc_pct),
+                    cell_voltage_v=float(floor_v / self.config.series),
+                    pack_current_a=float(power / floor_v),
+                    message=(
+                        f"Requested terminal power {power:.1f} W exceeds "
+                        f"voltage-floor-limited power {max_floor_power:.1f} W "
+                        f"at SOC={soc_pct:.2f}%"
+                    ),
+                ))
+                return power / floor_v
+
+        discriminant = ocv * ocv - 4.0 * r_pack * power
+        if discriminant < 0.0:
+            return power / max(floor_v, 1e-9)
+        return (ocv - math.sqrt(discriminant)) / (2.0 * r_pack)
+
+    def step_power(
+        self,
+        terminal_power_w: float,
+        dt_s: float,
+        soc_pct: float,
+        temp_c: float,
+        *,
+        time_s: float | None = None,
+    ) -> tuple[float, float, float, float]:
+        """Advance battery state from a terminal power trace.
+
+        Returns:
+            (new_soc_pct, new_mean_cell_temp_c, pack_voltage_v, pack_current_a)
+        """
+        pack_current = self.current_for_power(
+            terminal_power_w, soc_pct, time_s=time_s,
+        )
+        new_soc, new_temp, pack_voltage = self.step(
+            pack_current, dt_s, soc_pct, temp_c, time_s=time_s,
+        )
+        return new_soc, new_temp, pack_voltage, pack_current
 
     def step(
         self,
@@ -816,12 +906,12 @@ class BatteryModel:
         # don't recover 100% of the charge pushed into them — a small
         # fraction is lost to side reactions.  Discharge is 100% by
         # definition (electrons leaving the cell are counted).
-        cell_current = pack_current_a / self.config.parallel
+        cell_current = pack_current_a * self._inv_parallel
         if cell_current < 0.0:  # regen / charge
             effective_current = cell_current * self._COULOMBIC_EFFICIENCY
         else:
             effective_current = cell_current
-        dsoc = -(effective_current * dt_s) / (self.cell_capacity_ah * 3600) * 100
+        dsoc = -(effective_current * dt_s) * self._soc_pct_per_cell_amp_second
         new_soc = float(np.clip(soc_pct + dsoc, 0.0, 100.0))
 
         # Pack voltage at updated SOC
@@ -833,13 +923,12 @@ class BatteryModel:
         # during sustained discharge — without it the model has no
         # equilibrium and every long sim crosses the BMS kill temp.
         r_cell = self.internal_resistance(new_soc)
-        num_cells = self.config.series * self.config.parallel
-        heat_in_w = cell_current ** 2 * r_cell * num_cells
+        heat_in_w = cell_current ** 2 * r_cell * self._num_cells
         heat_out_w = self.config.thermal_conductance_w_per_k * (
             temp_c - self.config.ambient_temperature_c
         )
         net_heat_w = heat_in_w - heat_out_w
-        thermal_mass = self.thermal_mass_j_per_k
+        thermal_mass = self._thermal_mass_j_per_k
         dtemp = (net_heat_w * dt_s) / thermal_mass if thermal_mass > 0 else 0.0
         new_temp = temp_c + dtemp
 
