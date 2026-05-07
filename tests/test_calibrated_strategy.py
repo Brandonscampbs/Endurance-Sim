@@ -52,7 +52,7 @@ class TestConstruction:
         track = make_track()
         zones = make_zones()
         strategy = CalibratedStrategy(zones, num_segments=10)
-        assert strategy.name == "calibrated"
+        assert strategy.name == "driver"
         assert len(strategy.zones) == 3
 
     def test_from_zone_list(self):

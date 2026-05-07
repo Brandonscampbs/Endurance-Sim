@@ -32,7 +32,6 @@ from fsae_sim.analysis.validation import (  # noqa: E402
 from fsae_sim.data.loader import load_cleaned_csv  # noqa: E402
 from fsae_sim.driver.strategies import (  # noqa: E402
     CalibratedStrategy,
-    PreviewDriverStrategy,
     ReplayStrategy,
 )
 from fsae_sim.sim.engine import SimulationEngine, SimulationMode  # noqa: E402
@@ -76,7 +75,7 @@ def build_strategy(
     holdout_laps: list[int] | None = None,
     use_observed_speed_caps: bool = True,
 ):
-    if name == "calibrated":
+    if name == "driver":
         return CalibratedStrategy.from_telemetry(
             aim_df,
             track,
@@ -89,13 +88,6 @@ def build_strategy(
             aim_df,
             track.total_distance_m,
             trim_to_lap_start=trim_replay_to_lap_start,
-        )
-    if name == "preview":
-        return PreviewDriverStrategy.from_telemetry(
-            aim_df,
-            track,
-            dynamics,
-            laps=calibration_laps,
         )
     raise ValueError(f"Unknown strategy {name!r}")
 
@@ -255,8 +247,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--strategy",
-        default="calibrated",
-        choices=["calibrated", "replay", "preview"],
+        default="driver",
+        choices=["driver", "replay"],
     )
     p.add_argument("--lap", type=int, default=5)
     p.add_argument("--label", default=None,
@@ -284,20 +276,23 @@ def main():
         default=None,
         help=(
             "simulation mode. Default is replay for --strategy replay and "
-            "validation for --strategy calibrated."
+            "validation for --strategy driver."
         ),
     )
     p.add_argument(
         "--use-observed-speed-caps",
         action="store_true",
         help=(
-            "allow calibrated strategy telemetry p95 speed caps. Intended for "
+            "allow driver-strategy telemetry p95 speed caps. Intended for "
             "calibration diagnostics; validation/prediction modes reject this."
         ),
     )
     args = p.parse_args()
 
     label = args.label or args.strategy
+    # ``replay`` defaults to REPLAY mode (engine bypasses LVCU and uses
+    # recorded torque). ``driver`` is tune-aware so it runs in
+    # VALIDATION mode by default.
     mode = SimulationMode.coerce(
         args.mode or (
             SimulationMode.REPLAY.value
@@ -368,6 +363,9 @@ def main():
             track,
             speed_col,
             dynamics=VehicleDynamics(vehicle.vehicle),
+            # Both replay variants use the full-recording track and need
+            # their distance origin to match the track's (sample 0 of
+            # the recording, including pre-pit-out tail).
             trim_replay_to_lap_start=(args.strategy != "replay"),
             calibration_laps=calibration_laps if mode == SimulationMode.VALIDATION else None,
             holdout_laps=strategy_holdout_laps,
@@ -384,10 +382,20 @@ def main():
             if _laps else 0.0
         )
         # Replay tracks already contain the full cleaned recording; single-lap
-        # centerline tracks are repeated for each detected telemetry lap.
+        # centerline tracks are repeated for the FSAE Michigan endurance lap
+        # count (22 laps of ~1005 m each = ~22 km).
+        #
+        # ``detect_lap_boundaries`` only finds 21 intervals because the
+        # recording stops 14.9 s into lap 22 before the final crossing —
+        # the real event was 22 laps but lap 22 wasn't fully captured.
+        # Running 21 instead of 22 caused a ~1 km / ~70 s structural
+        # under-bid in canonical-lap strategies.
         is_stitched = track.source.startswith("telemetry_per_lap")
         is_full_recording = track.source.startswith("telemetry_full_recording")
-        num_laps = 1 if (is_stitched or is_full_recording) else (len(_laps) if _laps else 22)
+        if is_stitched or is_full_recording:
+            num_laps = 1  # the full-recording track encodes all laps in one pass
+        else:
+            num_laps = (len(_laps) + 1) if _laps else 22
 
         result = engine.run(
             num_laps=num_laps, initial_soc_pct=95.0, initial_temp_c=29.0,
@@ -397,7 +405,7 @@ def main():
     states = result.states
     print(f"[{label}] sim laps={result.laps_completed} "
           f"time={result.total_time_s:.1f}s "
-          f"final_soc={result.final_soc:.1f}% "
+          f"net_ah={result.net_charge_ah:.2f}Ah "
           f"net_kwh={result.net_energy_kwh:.3f}")
     print(f"track_source={track.source} speed_truth={speed_col}")
     print(f"mode={mode.value} observed_speed_caps={use_observed_speed_caps}")
@@ -501,6 +509,8 @@ def main():
         "time_tolerance_s": TIME_TOLERANCE_S,
         "sim_total_time_s": result.total_time_s,
         "sim_final_soc_pct": result.final_soc,
+        "sim_net_ah": result.net_charge_ah,
+        "telem_net_ah": report.telem_net_ah,
         "sim_net_kwh": result.net_energy_kwh,
         "telem_total_time_s": float(aim_df["Time"].iloc[-1] - aim_df["Time"].iloc[0]),
         "detected_telem_lap_time_s": float(per_lap["telem_time_s"].sum()),
@@ -518,7 +528,7 @@ def main():
         "per_lap": per_lap.to_dict(orient="records"),
         "validation_metrics": [
             {"name": m.name, "telem": m.telemetry_value, "sim": m.simulation_value,
-             "rel_err_pct": m.relative_error_pct, "passed": m.passed}
+             "rel_err_pct": m.relative_error_pct, "passed": bool(m.passed)}
             for m in report.metrics
         ],
     }

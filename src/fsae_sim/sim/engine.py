@@ -66,6 +66,9 @@ class SimResult:
     discharge_energy_kwh: float = 0.0
     regen_energy_kwh: float = 0.0
     net_energy_kwh: float = 0.0
+    discharge_charge_ah: float = 0.0
+    regen_charge_ah: float = 0.0
+    net_charge_ah: float = 0.0
 
 
 class SimulationMode(str, Enum):
@@ -366,12 +369,25 @@ class SimulationEngine:
                 if getattr(self.strategy, "torque_is_delivered", False):
                     return torque
                 return self.powertrain.apply_inverter_delivery(rpm, torque)
-            if command.action == ControlAction.THROTTLE:
+            # Non-replay: any positive throttle command produces motor
+            # torque, regardless of the action label. The label is a
+            # coaching descriptor; the pct fields are the source of
+            # truth (matching how replay always reads both pedals).
+            # This lets the calibrated lap-mean driver model emit
+            # simultaneous throttle+brake — physically real (trail-
+            # braking, mixed-action segments averaged across laps) and
+            # not modellable when action gates the torque path.
+            if command.throttle_pct > 0.0:
                 if is_calibrated:
-                    ceiling = self.powertrain.lvcu_torque_ceiling(
-                        rpm, current_limit_a,
+                    # The driver strategy calibrates to the firmware-
+                    # remapped pedal position (AiM "Throttle Pos" =
+                    # ``tmap_lut(tps_combined)``). Route through
+                    # ``torque_lut(tps)`` directly — no second deadzone
+                    # remap, no LVCU-side inverter cap (the inverter
+                    # delivery map handles the 85 Nm clip downstream).
+                    lvcu = self.powertrain.pedal_to_torque_request(
+                        command.throttle_pct, rpm, current_limit_a,
                     )
-                    lvcu = command.throttle_pct * ceiling
                 else:
                     lvcu = float(self.powertrain.lvcu_torque_command(
                         command.throttle_pct, rpm, current_limit_a,
@@ -393,7 +409,10 @@ class SimulationEngine:
             brake_force = 0.0
             regen_force = 0.0
 
-            if torque > 0.0 and (is_replay or command.action == ControlAction.THROTTLE):
+            # Drive force: any positive motor torque produces drive force,
+            # regardless of action label. Replay can also produce regen
+            # via a negative torque command.
+            if torque > 0.0:
                 drive_force = self.powertrain.wheel_force(torque)
                 drive_force = min(
                     drive_force,
@@ -402,9 +421,11 @@ class SimulationEngine:
             elif torque < 0.0 and is_replay:
                 regen_force = self.powertrain.wheel_force(torque)
 
-            if command.action == ControlAction.BRAKE or (
-                is_replay and command.brake_pct > 0.0
-            ):
+            # Brake force: any positive brake_pct produces brake force,
+            # regardless of action label. Lets calibrated lap-mean driver
+            # apply brake force on segments where some laps braked even
+            # if the segment's majority action is throttle / coast.
+            if command.brake_pct > 0.0:
                 brake_force = self.dynamics.mechanical_brake_force(
                     command.brake_pct, op_speed_ms,
                 )
@@ -612,8 +633,10 @@ class SimulationEngine:
 
                 # Recompute torque at resolved avg speed for accurate
                 # power/state reporting. Replay always follows the
-                # recorded torque channel; the action label does not
-                # suppress torque during brake/throttle overlap.
+                # recorded torque channel; non-replay strategies use
+                # whichever throttle command they sent regardless of
+                # action label, so simultaneous throttle+brake (the
+                # lap-mean driver model) integrates correctly.
                 if is_replay:
                     seg_mid_dist = distance + segment.length_m / 2.0
                     lvcu_command = self.strategy.target_torque(seg_mid_dist)
@@ -623,40 +646,24 @@ class SimulationEngine:
                         motor_torque = self.powertrain.apply_inverter_delivery(
                             motor_rpm, lvcu_command,
                         )
-                elif cmd.action == ControlAction.THROTTLE:
+                elif cmd.throttle_pct > 0.0:
                     if is_calibrated:
-                        ceiling = self.powertrain.lvcu_torque_ceiling(
-                            motor_rpm, bms_current_limit,
+                        lvcu_command = self.powertrain.pedal_to_torque_request(
+                            cmd.throttle_pct, motor_rpm, bms_current_limit,
                         )
-                        lvcu_command = cmd.throttle_pct * ceiling
                     else:
                         lvcu_command = self.powertrain.lvcu_torque_command(
                             cmd.throttle_pct, motor_rpm, bms_current_limit,
                         )
-                    if not is_replay:
-                        # Inverter delivery map translates LVCU request to
-                        # actually-delivered shaft torque, so wheel force and
-                        # electrical power stay consistent across paths.
-                        motor_torque = self.powertrain.apply_inverter_delivery(
-                            motor_rpm, lvcu_command,
-                        )
-                elif cmd.action == ControlAction.BRAKE:
-                    # Mechanical brake: motor stays off, decel is
-                    # dissipated as heat at the friction pads.  Any
-                    # electrical contribution during brake comes from
-                    # coasting back-EMF (handled via motor_torque=0 in
-                    # the electrical_power coast branch), not from
-                    # commanded motor regen.
-                    motor_torque = 0.0
+                    motor_torque = self.powertrain.apply_inverter_delivery(
+                        motor_rpm, lvcu_command,
+                    )
                 else:
                     motor_torque = 0.0
 
                 # Keep electrical power consistent with the force actually
                 # delivered after traction and speed-limit resolution.
-                if (
-                    motor_torque > 0.0
-                    and (is_replay or cmd.action == ControlAction.THROTTLE)
-                ):
+                if motor_torque > 0.0:
                     delivered_torque = (
                         self.powertrain.motor_torque_from_wheel_force(drive_f)
                     )
@@ -878,6 +885,17 @@ class SimulationEngine:
         regen_energy_j: float = 0.0,
     ) -> SimResult:
         states = pd.DataFrame(records)
+        discharge_charge_ah = 0.0
+        regen_charge_ah = 0.0
+        if {"pack_current_a", "segment_time_s"}.issubset(states.columns):
+            current = states["pack_current_a"].values
+            dt = states["segment_time_s"].values
+            discharge_charge_ah = float(
+                np.sum(np.maximum(current, 0.0) * dt) / 3600.0
+            )
+            regen_charge_ah = float(
+                np.sum(np.maximum(-current, 0.0) * dt) / 3600.0
+            )
         return SimResult(
             config_name=self.vehicle.name,
             strategy_name=self.strategy.name,
@@ -890,4 +908,7 @@ class SimulationEngine:
             discharge_energy_kwh=discharge_energy_j / 3.6e6,
             regen_energy_kwh=regen_energy_j / 3.6e6,
             net_energy_kwh=(discharge_energy_j - regen_energy_j) / 3.6e6,
+            discharge_charge_ah=discharge_charge_ah,
+            regen_charge_ah=regen_charge_ah,
+            net_charge_ah=discharge_charge_ah - regen_charge_ah,
         )

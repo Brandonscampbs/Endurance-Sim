@@ -4,7 +4,6 @@
 - CoastOnlyStrategy: full throttle on straights, coast into corners
 - ThresholdBrakingStrategy: coast + brake when speed exceeds corner limit
 - CalibratedStrategy: zone-based model calibrated from telemetry
-- PreviewDriverStrategy: physics-envelope preview speed tracker
 """
 
 from __future__ import annotations
@@ -518,15 +517,16 @@ class CalibratedStrategy(DriverStrategy):
     - from_zone_list(): build from manual zone definitions
     """
 
-    name = "calibrated"
+    name = "driver"
 
     def __init__(
         self,
         zones: list[DriverZone],
         num_segments: int,
-        name: str = "calibrated",
+        name: str = "driver",
         params: "DriverParams | None" = None,
         use_observed_speed_caps: bool = True,
+        segment_actions_df: pd.DataFrame | None = None,
     ) -> None:
         self.name = name
         self._zones = list(zones)
@@ -536,18 +536,30 @@ class CalibratedStrategy(DriverStrategy):
         # Defaults to an identity (all 1.0) so existing behavior is
         # unchanged. Applied in ``decide`` to zone intensity.
         self._params: DriverParams | None = params
+        # Per-segment telemetry table (action + intensity + lap fraction).
+        # When provided, runtime decisions read per-segment values so the
+        # natural lift-then-throttle taper survives instead of getting
+        # flatlined by zone-level intensity averaging. Saved here so
+        # ``with_zone_override`` / ``with_params`` / ``without_observed
+        # _speed_caps`` can thread it through derived strategies.
+        self._segment_actions_df: pd.DataFrame | None = segment_actions_df
 
-        # D-02: per-segment intensity override has been removed entirely.
-        # Zones are the unit of control: `decide()`, `to_driver_brief()`,
-        # and `to_dataframe()` all read `zone.intensity` exclusively. The
-        # previous two-pass init (write zone intensity, then overwrite
-        # from `segment_intensities`) created a three-way inconsistency
-        # between runtime behavior, exported dataframe, and driver brief.
-
-        # Build flat lookup: segment_idx -> (action, intensity, max_speed_ms)
+        # Build flat lookup: segment_idx -> (action, intensity, max_speed_ms).
+        # ``intensity`` here is the LEGACY single-action intensity used by
+        # the zone-only path (back-compat). The lap-mean force model below
+        # carries throttle and brake separately and supersedes this.
         self._segment_actions: list[tuple[ControlAction, float, float]] = [
             (ControlAction.COAST, 0.0, 0.0)
         ] * num_segments
+        # Lap-mean force commands per segment. ``_segment_throttle_pct[i]``
+        # is the time-averaged throttle the calibrated driver applies in
+        # segment ``i`` across the lap distribution; ``_segment_brake_pct``
+        # is the analogous lap-mean brake. Both can be non-zero in the
+        # same segment when the driver mixes throttle and brake across
+        # different laps. The engine sums forces from both at runtime
+        # (matching how it already handles replay's recorded inputs).
+        self._segment_throttle_pct: np.ndarray = np.zeros(num_segments, dtype=np.float64)
+        self._segment_brake_pct: np.ndarray = np.zeros(num_segments, dtype=np.float64)
         # D-25: O(1) segment→zone index map.  -1 means "no zone covers
         # this segment" (fallback behavior below matches the old linear
         # scan's ValueError path at the call site).
@@ -559,6 +571,80 @@ class CalibratedStrategy(DriverStrategy):
                         zone.action, zone.intensity, zone.max_speed_ms,
                     )
                     self._segment_to_zone[seg_idx] = z_pos
+                    # Mirror zone intensity into the per-segment force
+                    # arrays so zone-only construction (no df) keeps
+                    # matching its previous behavior.
+                    if zone.action == ControlAction.THROTTLE:
+                        self._segment_throttle_pct[seg_idx] = zone.intensity
+                    elif zone.action == ControlAction.BRAKE:
+                        self._segment_brake_pct[seg_idx] = zone.intensity
+
+        # When per-segment telemetry is provided, override the zone-derived
+        # action+intensity for each segment AND populate the lap-mean force
+        # arrays. The action label is set to whichever of throttle / brake
+        # is dominant (with intensity equal to that dominant value) so the
+        # engine's coaching-style branching still produces sane behavior;
+        # the lap-mean arrays are what the engine actually integrates.
+        if segment_actions_df is not None:
+            seg_idx_arr = segment_actions_df["segment_idx"].to_numpy()
+            has_throttle_mean = "throttle_lap_mean" in segment_actions_df.columns
+            has_brake_mean = "brake_lap_mean" in segment_actions_df.columns
+            throttle_mean_arr = (
+                segment_actions_df["throttle_lap_mean"].to_numpy()
+                if has_throttle_mean else None
+            )
+            brake_mean_arr = (
+                segment_actions_df["brake_lap_mean"].to_numpy()
+                if has_brake_mean else None
+            )
+            # Fall-back column for the action-label intensity when lap-mean
+            # columns aren't present (older callers / unit-test fixtures).
+            intensity_col = (
+                "effective_intensity"
+                if "effective_intensity" in segment_actions_df.columns
+                else "intensity"
+            )
+            action_arr = segment_actions_df["action"].to_numpy()
+            intensity_arr = segment_actions_df[intensity_col].to_numpy()
+            for k in range(len(seg_idx_arr)):
+                idx = int(seg_idx_arr[k])
+                if not (0 <= idx < num_segments):
+                    continue
+                _, _, max_speed_ms = self._segment_actions[idx]
+                if has_throttle_mean and has_brake_mean:
+                    t_mean = float(throttle_mean_arr[k])
+                    b_mean = float(brake_mean_arr[k])
+                    self._segment_throttle_pct[idx] = max(0.0, t_mean)
+                    self._segment_brake_pct[idx] = max(0.0, b_mean)
+                    if t_mean >= b_mean and t_mean > 0.0:
+                        action = ControlAction.THROTTLE
+                        intensity = t_mean
+                    elif b_mean > 0.0:
+                        action = ControlAction.BRAKE
+                        intensity = b_mean
+                    else:
+                        action = ControlAction.COAST
+                        intensity = 0.0
+                    self._segment_actions[idx] = (
+                        action, intensity, max_speed_ms,
+                    )
+                else:
+                    # Legacy path: set action and lap-mean force from the
+                    # single intensity column.
+                    action = action_arr[k]
+                    intensity = float(intensity_arr[k])
+                    self._segment_actions[idx] = (
+                        action, intensity, max_speed_ms,
+                    )
+                    if action == ControlAction.THROTTLE:
+                        self._segment_throttle_pct[idx] = intensity
+                        self._segment_brake_pct[idx] = 0.0
+                    elif action == ControlAction.BRAKE:
+                        self._segment_throttle_pct[idx] = 0.0
+                        self._segment_brake_pct[idx] = intensity
+                    else:
+                        self._segment_throttle_pct[idx] = 0.0
+                        self._segment_brake_pct[idx] = 0.0
 
     @property
     def zones(self) -> list[DriverZone]:
@@ -566,7 +652,7 @@ class CalibratedStrategy(DriverStrategy):
 
     def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
         idx = state.segment_idx % self._num_segments
-        action, intensity, max_speed_ms = self._segment_actions[idx]
+        action, _label_intensity, max_speed_ms = self._segment_actions[idx]
 
         # D-09: pass the zone's observed peak speed through metadata so
         # the engine can cap exit_speed. Only populated when a real cap
@@ -575,29 +661,40 @@ class CalibratedStrategy(DriverStrategy):
         if self._use_observed_speed_caps and max_speed_ms > 0.0:
             meta = {"max_speed_ms": float(max_speed_ms)}
 
-        # D-28: apply optional DriverParams scale/cap.  Multiplier
-        # applies to intensity, cap clamps the post-multiplier value.
+        # Lap-mean force model: emit BOTH throttle and brake commands
+        # from the per-segment lap-averaged forces. The action label is
+        # kept for diagnostics / coaching brief, but the engine uses the
+        # pct fields for force balance (matching how it handles replay).
+        throttle_value = float(self._segment_throttle_pct[idx])
+        brake_value = float(self._segment_brake_pct[idx])
+
+        # D-28: apply DriverParams scale/cap to the lap-mean values so
+        # sweeps remain consistent with PedalProfileStrategy semantics.
         p = self._params
-        if action == ControlAction.THROTTLE:
-            value = intensity
-            if p is not None:
-                value = min(value * p.throttle_scale, p.max_throttle)
-            value = max(0.0, min(1.0, value))
-            return ControlCommand(
-                action, throttle_pct=value, brake_pct=0.0, metadata=meta,
+        if p is not None:
+            throttle_value = min(
+                throttle_value * p.throttle_scale, p.max_throttle,
             )
-        elif action == ControlAction.BRAKE:
-            value = intensity
-            if p is not None:
-                value = min(value * p.brake_scale, p.max_brake)
-            value = max(0.0, min(1.0, value))
-            return ControlCommand(
-                action, throttle_pct=0.0, brake_pct=value, metadata=meta,
-            )
+            brake_value = min(brake_value * p.brake_scale, p.max_brake)
+
+        throttle_value = max(0.0, min(1.0, throttle_value))
+        brake_value = max(0.0, min(1.0, brake_value))
+
+        # Choose the descriptive action label from whichever pedal is
+        # dominant. Engine no longer routes on this; it's coaching info.
+        if throttle_value > brake_value and throttle_value > 0.0:
+            cmd_action = ControlAction.THROTTLE
+        elif brake_value > 0.0:
+            cmd_action = ControlAction.BRAKE
         else:
-            return ControlCommand(
-                ControlAction.COAST, throttle_pct=0.0, brake_pct=0.0, metadata=meta,
-            )
+            cmd_action = ControlAction.COAST
+
+        return ControlCommand(
+            cmd_action,
+            throttle_pct=throttle_value,
+            brake_pct=brake_value,
+            metadata=meta,
+        )
 
     def zone_for_segment(self, segment_idx: int) -> DriverZone:
         """Return the zone containing the given segment index.
@@ -652,10 +749,17 @@ class CalibratedStrategy(DriverStrategy):
         action: ControlAction,
         intensity: float,
     ) -> CalibratedStrategy:
-        """Return a new strategy with one zone's action/intensity changed."""
+        """Return a new strategy with one zone's action/intensity changed.
+
+        When per-segment telemetry is in use, the override broadcasts the
+        new ``action`` + ``intensity`` across every segment in the zone so
+        the runtime behavior matches the user's intent.
+        """
         new_zones = []
+        target_zone: DriverZone | None = None
         for z in self._zones:
             if z.zone_id == zone_id:
+                target_zone = z
                 new_zones.append(DriverZone(
                     zone_id=z.zone_id,
                     segment_start=z.segment_start,
@@ -670,12 +774,39 @@ class CalibratedStrategy(DriverStrategy):
                 ))
             else:
                 new_zones.append(z)
+
+        df_copy: pd.DataFrame | None = None
+        if self._segment_actions_df is not None and target_zone is not None:
+            df_copy = self._segment_actions_df.copy()
+            seg_mask = (
+                (df_copy["segment_idx"] >= target_zone.segment_start)
+                & (df_copy["segment_idx"] <= target_zone.segment_end)
+            )
+            df_copy.loc[seg_mask, "action"] = action
+            df_copy.loc[seg_mask, "intensity"] = float(intensity)
+            if "effective_intensity" in df_copy.columns:
+                df_copy.loc[seg_mask, "effective_intensity"] = float(intensity)
+            # Override the lap-mean force columns the runtime reads.
+            if "throttle_lap_mean" in df_copy.columns:
+                df_copy.loc[seg_mask, "throttle_lap_mean"] = (
+                    float(intensity) if action == ControlAction.THROTTLE else 0.0
+                )
+            if "brake_lap_mean" in df_copy.columns:
+                df_copy.loc[seg_mask, "brake_lap_mean"] = (
+                    float(intensity) if action == ControlAction.BRAKE else 0.0
+                )
+            if "lap_fraction" in df_copy.columns:
+                df_copy.loc[seg_mask, "lap_fraction"] = (
+                    0.0 if action == ControlAction.COAST else 1.0
+                )
+
         return CalibratedStrategy(
             new_zones,
             self._num_segments,
             name=self.name,
             params=self._params,
             use_observed_speed_caps=self._use_observed_speed_caps,
+            segment_actions_df=df_copy,
         )
 
     def with_params(self, params: "DriverParams") -> CalibratedStrategy:
@@ -691,6 +822,7 @@ class CalibratedStrategy(DriverStrategy):
             name=self.name,
             params=params,
             use_observed_speed_caps=self._use_observed_speed_caps,
+            segment_actions_df=self._segment_actions_df,
         )
 
     @property
@@ -712,6 +844,7 @@ class CalibratedStrategy(DriverStrategy):
             name=self.name,
             params=self._params,
             use_observed_speed_caps=False,
+            segment_actions_df=self._segment_actions_df,
         )
 
     @classmethod
@@ -731,7 +864,7 @@ class CalibratedStrategy(DriverStrategy):
         brake_threshold: float = 2.0,
         brake_max_pressure_bar: float | None = None,
         merge_tolerance: float = 0.15,
-        name: str = "calibrated",
+        name: str = "driver",
         use_observed_speed_caps: bool = True,
     ) -> CalibratedStrategy:
         """Calibrate from AiM telemetry.
@@ -787,13 +920,17 @@ class CalibratedStrategy(DriverStrategy):
         )
         zones = collapse_to_zones(seg_actions, track, merge_tolerance=merge_tolerance)
 
-        # D-02: no per-segment intensity passed — zone intensity is the
-        # single source of runtime truth.
+        # Per-segment data is what the runtime reads. Zones are a coaching
+        # artifact for plots / driver brief but no longer constrain
+        # runtime behavior. ``effective_intensity`` is duty-cycle weighted
+        # so ambiguous "barely throttle" segments command less torque than
+        # the median across throttle-laps suggests.
         return cls(
             zones,
             track.num_segments,
             name=name,
             use_observed_speed_caps=use_observed_speed_caps,
+            segment_actions_df=seg_actions,
         )
 
     @classmethod
@@ -801,7 +938,7 @@ class CalibratedStrategy(DriverStrategy):
         cls,
         zones: list[dict],
         track: Track,
-        name: str = "calibrated",
+        name: str = "driver",
     ) -> CalibratedStrategy:
         """Build from manual zone definitions.
 
@@ -852,333 +989,6 @@ class DriverParams:
     brake_scale: float = 1.0
     max_throttle: float = 1.0
     max_brake: float = 1.0
-
-
-@dataclass(frozen=True)
-class PreviewDriverParams:
-    """Tunable parameters for the preview speed-tracking driver.
-
-    This is a compact approximation of the preview-control / minimum-lap-time
-    literature: the vehicle model supplies a feasible speed envelope, the
-    driver sees a finite preview window, and throttle/brake commands track a
-    target fraction of that envelope.
-    """
-
-    target_speed_ratio: float = 0.94
-    preview_time_s: float = 1.2
-    min_preview_segments: int = 2
-    max_preview_segments: int = 16
-    throttle_gain: float = 2.4
-    brake_gain: float = 1.2
-    throttle_margin_ms: float = 0.4
-    brake_margin_ms: float = 0.3
-    max_throttle: float = 1.0
-    max_brake: float = 1.0
-
-
-class PreviewDriverStrategy(DriverStrategy):
-    """Predictive driver model using finite preview and physics speed targets.
-
-    Unlike ``CalibratedStrategy``, this model does not store per-segment
-    observed speed caps.  Telemetry calibration only estimates global driver
-    parameters; runtime braking/throttle decisions come from the track,
-    speed envelope, and current state.
-    """
-
-    name = "preview_driver"
-    uses_observed_speed_caps = False
-
-    def __init__(
-        self,
-        track: Track,
-        dynamics: VehicleDynamics | None = None,
-        *,
-        params: PreviewDriverParams | None = None,
-        name: str = "preview_driver",
-    ) -> None:
-        self.name = name
-        self._track = track
-        self._dynamics = dynamics
-        self.params = params or PreviewDriverParams()
-        self._num_segments = track.num_segments
-        self._envelope_ms: np.ndarray | None = None
-        self._target_ms: np.ndarray | None = None
-        self._preview_target_cache: np.ndarray | None = None
-        self._preview_distance_cache: np.ndarray | None = None
-
-    def set_envelope(self, envelope_ms: np.ndarray) -> None:
-        """Receive the engine's forward/backward speed envelope."""
-        env = np.asarray(envelope_ms, dtype=np.float64)
-        if len(env) != self._num_segments:
-            raise ValueError(
-                f"Envelope length {len(env)} does not match track segments "
-                f"{self._num_segments}."
-            )
-        ratio = float(np.clip(self.params.target_speed_ratio, 0.2, 1.0))
-        self._envelope_ms = env.copy()
-        self._target_ms = env * ratio
-        self._build_preview_cache()
-
-    def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
-        idx = state.segment_idx % self._num_segments
-        target_ms, preview_distance_m = self._preview_target(idx, state.speed)
-        speed = max(float(state.speed), 0.0)
-
-        if math_isfinite(target_ms) and speed > target_ms + self.params.brake_margin_ms:
-            max_decel = self._max_brake_decel(speed)
-            desired_decel = (
-                (speed * speed - target_ms * target_ms)
-                / (2.0 * max(preview_distance_m, 1.0))
-            )
-            brake = self.params.brake_gain * desired_decel / max(max_decel, 1e-6)
-            brake = max(0.0, min(float(self.params.max_brake), float(brake)))
-            if brake > 1e-3:
-                return ControlCommand(
-                    ControlAction.BRAKE,
-                    throttle_pct=0.0,
-                    brake_pct=brake,
-                )
-
-        if not math_isfinite(target_ms):
-            return ControlCommand(
-                ControlAction.THROTTLE,
-                throttle_pct=max(0.0, min(1.0, float(self.params.max_throttle))),
-                brake_pct=0.0,
-            )
-
-        if speed < target_ms - self.params.throttle_margin_ms:
-            err = (target_ms - speed) / max(target_ms, 1.0)
-            throttle = self.params.throttle_gain * err
-            throttle = max(0.0, min(float(self.params.max_throttle), float(throttle)))
-            if throttle > 1e-3:
-                return ControlCommand(
-                    ControlAction.THROTTLE,
-                    throttle_pct=throttle,
-                    brake_pct=0.0,
-                )
-
-        return ControlCommand(ControlAction.COAST, throttle_pct=0.0, brake_pct=0.0)
-
-    def with_params(self, **kwargs) -> PreviewDriverStrategy:
-        return PreviewDriverStrategy(
-            self._track,
-            self._dynamics,
-            params=replace(self.params, **kwargs),
-            name=self.name,
-        )
-
-    @classmethod
-    def from_telemetry(
-        cls,
-        aim_df: pd.DataFrame,
-        track: Track,
-        dynamics: VehicleDynamics | None = None,
-        *,
-        laps: list[int] | None = None,
-        brake_max_pressure_bar: float = 60.0,
-        name: str = "preview_driver",
-    ) -> PreviewDriverStrategy:
-        """Fit global preview-driver parameters from telemetry.
-
-        The fit deliberately avoids per-segment speed caps.  It estimates:
-        - target speed ratio from observed corner speed vs physics corner limit
-        - max throttle from high-percentile throttle position
-        - max brake from high-percentile brake pressure
-        """
-        speed_col = _telemetry_speed_col(aim_df)
-        selected = cls._selected_lap_slices(aim_df, laps)
-        speed_ratios: list[float] = []
-
-        if dynamics is not None:
-            for start_idx, end_idx, _ in selected:
-                lap_df = aim_df.iloc[start_idx:end_idx]
-                lap_dist_raw = lap_df["Distance on GPS Speed"].values
-                if len(lap_dist_raw) < 2:
-                    continue
-                lap_span = float(lap_dist_raw[-1] - lap_dist_raw[0])
-                if lap_span <= 0.0:
-                    continue
-                lap_d = (lap_dist_raw - lap_dist_raw[0]) * (
-                    track.total_distance_m / lap_span
-                )
-                lap_speed_ms = lap_df[speed_col].values / 3.6
-                for seg in track.segments:
-                    if abs(seg.curvature) < 1e-6:
-                        continue
-                    limit = dynamics.max_cornering_speed(
-                        seg.curvature,
-                        seg.grip_factor,
-                    )
-                    if not math_isfinite(limit) or limit <= 1.0:
-                        continue
-                    mid = seg.distance_start_m + seg.length_m / 2.0
-                    nearest = int(np.argmin(np.abs(lap_d - mid)))
-                    ratio = float(lap_speed_ms[nearest] / limit)
-                    if math_isfinite(ratio):
-                        speed_ratios.append(ratio)
-
-        if speed_ratios:
-            # Use a high percentile rather than the median/mean.  The preview
-            # model's target speed ratio represents the driver's intended pace
-            # near the physics envelope; slower samples include traffic,
-            # driver-change laps, mistakes, and non-limit corner entries.
-            target_speed_ratio = float(
-                np.clip(np.nanpercentile(speed_ratios, 95), 0.90, 1.0)
-            )
-        else:
-            target_speed_ratio = PreviewDriverParams.target_speed_ratio
-
-        throttle = np.clip(aim_df["Throttle Pos"].values / 100.0, 0.0, 1.0)
-        max_throttle = float(np.clip(np.nanpercentile(throttle, 95), 0.35, 1.0))
-
-        brake_raw = np.maximum(
-            aim_df["FBrakePressure"].values,
-            aim_df["RBrakePressure"].values,
-        )
-        brake = np.clip(brake_raw / max(float(brake_max_pressure_bar), 1.0), 0.0, 1.0)
-        max_brake = float(np.clip(np.nanpercentile(brake, 95), 0.25, 1.0))
-
-        params = PreviewDriverParams(
-            target_speed_ratio=target_speed_ratio,
-            max_throttle=max_throttle,
-            max_brake=max_brake,
-        )
-        return cls(track, dynamics, params=params, name=name)
-
-    @staticmethod
-    def _selected_lap_slices(
-        aim_df: pd.DataFrame,
-        laps: list[int] | None,
-    ) -> list[tuple[int, int, float]]:
-        boundaries = _detect_lap_boundaries_safe(aim_df)
-        if boundaries:
-            if laps is not None:
-                selected = [boundaries[i] for i in laps if 0 <= i < len(boundaries)]
-                return selected or boundaries
-            try:
-                from fsae_sim.analysis.telemetry_analysis import _auto_select_laps
-
-                selected = _auto_select_laps(aim_df, boundaries)
-                return selected or boundaries
-            except Exception:
-                return boundaries
-        total_dist = aim_df["Distance on GPS Speed"].values
-        return [(0, len(aim_df), float(total_dist[-1] - total_dist[0]))]
-
-    def _preview_target(
-        self,
-        segment_idx: int,
-        speed_ms: float,
-    ) -> tuple[float, float]:
-        preview_segments = self._preview_segment_count(segment_idx, speed_ms)
-        if (
-            self._preview_target_cache is not None
-            and self._preview_distance_cache is not None
-        ):
-            cache_idx = min(
-                preview_segments,
-                self._preview_target_cache.shape[0],
-            ) - 1
-            return (
-                float(self._preview_target_cache[cache_idx, segment_idx]),
-                float(self._preview_distance_cache[cache_idx, segment_idx]),
-            )
-
-        targets: list[float] = []
-        distances: list[float] = []
-        cumulative = 0.0
-        target_array = self._target_ms
-
-        for offset in range(preview_segments):
-            idx = (segment_idx + offset) % self._num_segments
-            seg = self._track.segments[idx]
-            cumulative += seg.length_m
-            if target_array is not None:
-                target = float(target_array[idx])
-            elif self._dynamics is not None:
-                target = self._dynamics.max_cornering_speed(
-                    seg.curvature,
-                    seg.grip_factor,
-                )
-                if math_isfinite(target):
-                    target *= float(np.clip(self.params.target_speed_ratio, 0.2, 1.0))
-            else:
-                target = float("inf")
-            targets.append(float(target))
-            distances.append(cumulative)
-
-        finite = [
-            (target, dist) for target, dist in zip(targets, distances)
-            if math_isfinite(target)
-        ]
-        if not finite:
-            return float("inf"), cumulative
-        return min(finite, key=lambda item: item[0])
-
-    def _preview_segment_count(self, segment_idx: int, speed_ms: float) -> int:
-        target_distance = max(
-            self._track.segments[segment_idx].length_m * self.params.min_preview_segments,
-            max(speed_ms, 1.0) * self.params.preview_time_s,
-        )
-        total = 0.0
-        count = 0
-        max_count = max(
-            int(self.params.min_preview_segments),
-            int(self.params.max_preview_segments),
-        )
-        while count < min(max_count, self._num_segments):
-            idx = (segment_idx + count) % self._num_segments
-            total += self._track.segments[idx].length_m
-            count += 1
-            if count >= self.params.min_preview_segments and total >= target_distance:
-                break
-        return max(1, count)
-
-    def _max_brake_decel(self, speed_ms: float) -> float:
-        if self._dynamics is None:
-            return 0.55 * 9.81
-        return (
-            self._dynamics.mechanical_brake_force(1.0, speed_ms)
-            / max(self._dynamics.m_effective, 1e-6)
-        )
-
-    def _build_preview_cache(self) -> None:
-        target_array = self._target_ms
-        if target_array is None or self._num_segments <= 0:
-            self._preview_target_cache = None
-            self._preview_distance_cache = None
-            return
-
-        max_count = min(
-            max(
-                int(self.params.min_preview_segments),
-                int(self.params.max_preview_segments),
-            ),
-            self._num_segments,
-        )
-        target_cache = np.empty((max_count, self._num_segments), dtype=np.float64)
-        distance_cache = np.empty((max_count, self._num_segments), dtype=np.float64)
-
-        for start_idx in range(self._num_segments):
-            best_target = float("inf")
-            best_distance = 0.0
-            cumulative = 0.0
-            for offset in range(max_count):
-                idx = (start_idx + offset) % self._num_segments
-                cumulative += self._track.segments[idx].length_m
-                target = float(target_array[idx])
-                if target < best_target:
-                    best_target = target
-                    best_distance = cumulative
-                target_cache[offset, start_idx] = best_target
-                distance_cache[offset, start_idx] = best_distance
-
-        self._preview_target_cache = target_cache
-        self._preview_distance_cache = distance_cache
-
-
-def math_isfinite(value: float) -> bool:
-    return math.isfinite(float(value))
 
 
 class PedalProfileStrategy(DriverStrategy):

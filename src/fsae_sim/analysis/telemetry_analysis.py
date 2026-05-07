@@ -310,14 +310,18 @@ def _extract_per_lap_then_aggregate(
     """
     num_segments = track.num_segments
 
-    # Check if we have LVCU torque data for better intensity calibration
-    has_torque = "LVCU Torque Req" in aim_df.columns
-
-    # Compute inverter torque limit for normalizing torque → throttle_pct
-    # The sim uses: drive_force = throttle_pct * max_motor_torque(rpm)
-    # where max_motor_torque = min(inverter, lvcu) = 85 Nm below brake_speed.
-    # So to match: throttle_pct = actual_torque / 85
-    _INVERTER_TORQUE_LIMIT = 85.0
+    # Throttle intensity is the FIRMWARE-REMAPPED pedal position from
+    # AiM "Throttle Pos" (= ``tmap_lut(tps_combined)`` output, see
+    # LVCU Code.txt line 499). We feed this directly into the sim's
+    # ``PowertrainModel.pedal_to_torque_request`` which mirrors the
+    # firmware's ``torque_lut(tps)`` step — no second deadzone remap,
+    # no LVCU-side inverter cap, the inverter delivery map handles
+    # the 85 Nm hardware clip downstream where it actually lives in
+    # the real car. The previous "intensity = LVCU torque / 85"
+    # normalization happened to cancel out for the current tune
+    # because the engine also inverter-capped the ceiling, but that
+    # cancellation breaks any tune sweep that changes the inverter or
+    # LVCU torque limits. Pedal position is the honest input.
 
     # Select which laps to use
     if laps is not None:
@@ -328,19 +332,43 @@ def _extract_per_lap_then_aggregate(
     if not selected:
         selected = lap_boundaries
 
-    # D-08: brake normalization is now data-independent. Prefer the
-    # DSS-derived `brake_max_pressure_bar` passed in by the caller;
-    # fall back to a 60 bar FSAE-typical constant. The old 99th-percentile
-    # approach made `brake_pct` depend on which laps were in `aim_df`.
+    # Brake normalization: pressure that maps to the sim's full-pedal
+    # brake force (calibrated to ``_MAX_BRAKE_DECEL_G = 0.55 g`` from
+    # GPS LonAcc 1st-percentile). The peak brake pressure reached in
+    # this same telemetry slice corresponds to that same peak decel
+    # event — using it keeps the pressure→force mapping self-consistent.
+    # Falling back to a 60 bar FSAE-typical constant when the driver
+    # never approaches 60 bar systematically under-brakes the sim
+    # (e.g. CT-16EV peak was ~21 bar, so brake_pct topped out at 0.35).
+    # An explicit ``brake_max_pressure_bar`` from the caller still wins,
+    # so DSS-measured master-cylinder peaks can override the empirical
+    # value when available.
     if brake_max_pressure_bar is not None:
         brake_norm = float(brake_max_pressure_bar)
     else:
-        brake_norm = 60.0
+        selected_brake_samples: list[np.ndarray] = []
+        for s_idx, e_idx, _ in selected:
+            lap_brake = np.maximum(
+                aim_df[front_brake_col].iloc[s_idx:e_idx].values,
+                aim_df[rear_brake_col].iloc[s_idx:e_idx].values,
+            )
+            selected_brake_samples.append(lap_brake)
+        if selected_brake_samples:
+            all_brake = np.concatenate(selected_brake_samples)
+            active = all_brake[all_brake > brake_threshold]
+            if len(active) >= 10:
+                brake_norm = float(np.percentile(active, 99))
+            else:
+                brake_norm = 60.0
+        else:
+            brake_norm = 60.0
     brake_norm = max(brake_norm, 1.0)
 
     # Per-lap, per-segment classification
     action_codes = []
     intensity_vals = []  # normalized intensity for the winning action
+    throttle_intensity_vals = []  # only set on throttle laps; 0 elsewhere
+    brake_intensity_vals = []     # only set on brake laps; 0 elsewhere
     throttle_vals = []   # raw throttle % for reporting
     brake_vals = []
     speed_vals = []
@@ -368,13 +396,13 @@ def _extract_per_lap_then_aggregate(
         lap_rbr = lap_df[rear_brake_col].values
         lap_brake = np.maximum(lap_fbr, lap_rbr)
 
-        if has_torque:
-            lap_torque = lap_df["LVCU Torque Req"].values
-        else:
-            lap_torque = None
-
         lap_actions = np.zeros(num_segments, dtype=int)
         lap_intensities = np.zeros(num_segments)
+        # Action-specific intensities: zero unless this lap voted that
+        # action on this segment. Cross-lap means of these capture
+        # time-averaged force across the lap distribution.
+        lap_throttle_intensities = np.zeros(num_segments)
+        lap_brake_intensities = np.zeros(num_segments)
         lap_throttles = np.zeros(num_segments)
         lap_brakes = np.zeros(num_segments)
         lap_speeds = np.zeros(num_segments)
@@ -403,32 +431,29 @@ def _extract_per_lap_then_aggregate(
 
             if seg_brake > brake_threshold:
                 lap_actions[seg.index] = 2
-                lap_intensities[seg.index] = float(np.clip(seg_brake / brake_norm, 0.0, 1.0))
+                brake_intensity_value = float(
+                    np.clip(seg_brake / brake_norm, 0.0, 1.0)
+                )
+                lap_intensities[seg.index] = brake_intensity_value
+                lap_brake_intensities[seg.index] = brake_intensity_value
             elif seg_throttle > throttle_threshold:
                 lap_actions[seg.index] = 1
-                # Use torque-based intensity if available — this is the
-                # effective torque fraction after LVCU processing.
-                if lap_torque is not None:
-                    # NF-25: LVCU Torque Req has sensor dropouts (NaN).
-                    # `np.median` propagates NaN; drop non-finite samples
-                    # before reducing. Fallback to throttle-based intensity
-                    # if no finite torque samples remain.
-                    raw_torque = np.clip(lap_torque[mask], 0, None)
-                    finite = raw_torque[np.isfinite(raw_torque)]
-                    if finite.size:
-                        seg_torque = float(np.median(finite))
-                        lap_intensities[seg.index] = float(np.clip(
-                            seg_torque / _INVERTER_TORQUE_LIMIT, 0.0, 1.0,
-                        ))
-                    else:
-                        lap_intensities[seg.index] = float(np.clip(
-                            seg_throttle / 100.0, 0.0, 1.0,
-                        ))
-                else:
-                    lap_intensities[seg.index] = float(np.clip(seg_throttle / 100.0, 0.0, 1.0))
+                # Pedal-position intensity (post-firmware-deadzone), in
+                # [0, 1]. Routed downstream through pedal_to_torque_
+                # request which mirrors torque_lut(tps) from LVCU
+                # Code.txt. Tune-faithful: when caller changes inverter
+                # cap / LVCU torque limit / current limit, the resulting
+                # torque scales correctly because the calibration is
+                # the driver's intended pedal travel, not LVCU output.
+                throttle_intensity_value = float(
+                    np.clip(seg_throttle / 100.0, 0.0, 1.0)
+                )
+                lap_intensities[seg.index] = throttle_intensity_value
+                lap_throttle_intensities[seg.index] = throttle_intensity_value
             else:
                 lap_actions[seg.index] = 0
                 lap_intensities[seg.index] = 0.0
+                # Both action-specific intensities stay at 0 for COAST laps.
 
             lap_throttles[seg.index] = seg_throttle
             lap_brakes[seg.index] = seg_brake
@@ -436,6 +461,8 @@ def _extract_per_lap_then_aggregate(
 
         action_codes.append(lap_actions)
         intensity_vals.append(lap_intensities)
+        throttle_intensity_vals.append(lap_throttle_intensities)
+        brake_intensity_vals.append(lap_brake_intensities)
         throttle_vals.append(lap_throttles)
         brake_vals.append(lap_brakes)
         speed_vals.append(lap_speeds)
@@ -443,11 +470,15 @@ def _extract_per_lap_then_aggregate(
     # Stack into arrays: (num_laps, num_segments)
     action_matrix = np.array(action_codes)
     intensity_matrix = np.array(intensity_vals)
+    throttle_intensity_matrix = np.array(throttle_intensity_vals)
+    brake_intensity_matrix = np.array(brake_intensity_vals)
     throttle_matrix = np.array(throttle_vals)
     brake_matrix = np.array(brake_vals)
     speed_matrix = np.array(speed_vals)
 
-    # Aggregate: majority vote for action, median for intensity
+    # Aggregate: majority vote for action, median for intensity, lap-fraction
+    # weighting for effective_intensity (the runtime command).
+    num_laps_used = action_matrix.shape[0]
     rows = []
     for seg in track.segments:
         i = seg.index
@@ -481,6 +512,57 @@ def _extract_per_lap_then_aggregate(
             action = ControlAction.COAST
             med_intensity = 0.0
 
+        # Lap-fraction duty cycle: what fraction of laps actually voted the
+        # winning action at this segment. Reported for diagnostic visibility
+        # but NOT applied to ``effective_intensity``.
+        #
+        # We considered weighting THROTTLE intensity by lap_fraction to
+        # model the real driver's pulsing as a time-averaged force, but
+        # the per-lap-then-aggregate pipeline already produces a
+        # time-averaged value: each segment carries ~1 telemetry sample
+        # per lap, so the per-lap "median" is really one sample, and the
+        # cross-lap median over throttle-voting laps produces the typical
+        # active-throttle command. Multiplying by lap_fraction on top of
+        # that double-counts the dilution and pushes time-averaged sim
+        # torque below the real driver's, breaking the energy budget.
+        #
+        # Per-segment + median (no duty-cycle correction) keeps the local
+        # intensity taper while leaving the integrated force right.
+        if num_laps_used == 0:
+            lap_fraction = 0.0
+        else:
+            lap_fraction = float(counts[winner]) / float(num_laps_used)
+
+        if winner == 0:  # COAST
+            effective_intensity = 0.0
+        else:
+            effective_intensity = float(med_intensity)
+
+        # Lap-averaged forces: per-segment mean across ALL laps of the
+        # action-specific intensity (zero on laps that didn't vote that
+        # action). This is the "average force the driver applied at this
+        # distance across the lap distribution" — the right driver-model
+        # input for endurance prediction. A segment that's brake on
+        # 8/21 laps at peak intensity 0.27 contributes a non-zero
+        # 8/21 * 0.27 = 0.103 brake_lap_mean, even though majority vote
+        # would have classified it COAST. Both fields can be non-zero
+        # in segments where the driver mixes throttle and brake across
+        # different laps; the engine sums the resulting forces.
+        if num_laps_used > 0:
+            throttle_col = throttle_intensity_matrix[:, i]
+            brake_col = brake_intensity_matrix[:, i]
+            throttle_finite = throttle_col[np.isfinite(throttle_col)]
+            brake_finite = brake_col[np.isfinite(brake_col)]
+            throttle_lap_mean = (
+                float(np.mean(throttle_finite)) if throttle_finite.size else 0.0
+            )
+            brake_lap_mean = (
+                float(np.mean(brake_finite)) if brake_finite.size else 0.0
+            )
+        else:
+            throttle_lap_mean = 0.0
+            brake_lap_mean = 0.0
+
         rows.append({
             "segment_idx": i,
             "distance_m": mid,
@@ -490,6 +572,10 @@ def _extract_per_lap_then_aggregate(
             "mean_speed_kmh": mean_speed,
             "action": action,
             "intensity": med_intensity,
+            "lap_fraction": lap_fraction,
+            "effective_intensity": effective_intensity,
+            "throttle_lap_mean": throttle_lap_mean,
+            "brake_lap_mean": brake_lap_mean,
         })
 
     return pd.DataFrame(rows)
@@ -520,11 +606,16 @@ def _extract_single_pass(
 
     telem_lap_dist = dist % lap_dist
 
-    # D-08: data-independent brake normalization (see _extract_per_lap_then_aggregate).
+    # Brake normalization: see _extract_per_lap_then_aggregate. Single-pass
+    # has no lap selection, so use the entire frame.
     if brake_max_pressure_bar is not None:
         brake_norm = float(brake_max_pressure_bar)
     else:
-        brake_norm = 60.0
+        active = brake_pressure[brake_pressure > brake_threshold]
+        if len(active) >= 10:
+            brake_norm = float(np.percentile(active, 99))
+        else:
+            brake_norm = 60.0
     brake_norm = max(brake_norm, 1.0)
 
     rows = []
@@ -558,6 +649,13 @@ def _extract_single_pass(
             action = ControlAction.COAST
             intensity = 0.0
 
+        # Single-pass mode has only one "lap" by construction; duty cycle
+        # is 1.0 wherever the action is non-coast.
+        lap_fraction = 0.0 if action == ControlAction.COAST else 1.0
+        effective_intensity = 0.0 if action == ControlAction.COAST else intensity
+        throttle_lap_mean = intensity if action == ControlAction.THROTTLE else 0.0
+        brake_lap_mean = intensity if action == ControlAction.BRAKE else 0.0
+
         rows.append({
             "segment_idx": seg.index,
             "distance_m": mid,
@@ -567,6 +665,10 @@ def _extract_single_pass(
             "mean_speed_kmh": mean_speed,
             "action": action,
             "intensity": intensity,
+            "lap_fraction": lap_fraction,
+            "effective_intensity": effective_intensity,
+            "throttle_lap_mean": throttle_lap_mean,
+            "brake_lap_mean": brake_lap_mean,
         })
 
     return pd.DataFrame(rows)

@@ -56,6 +56,7 @@ from backend.models.simulate import (
     SocCurrentPoint,
 )
 from backend.services.sim_runner import (
+    ENDURANCE_LAP_COUNT,
     _detected_lap_count,
     get_baseline_result,
     get_battery_model,
@@ -207,8 +208,8 @@ def run_overridden_simulation(req: SimulateRequest) -> tuple[SimResult, list[str
     track = get_track()
     battery_model = get_battery_model()
     aim_df = get_telemetry()
-    num_laps = _detected_lap_count(aim_df)
-    _, validation_laps = get_validation_lap_split(num_laps)
+    detected = _detected_lap_count(aim_df)
+    _, validation_laps = get_validation_lap_split(detected)
 
     new_powertrain = _apply_powertrain_overrides(
         base_vehicle.powertrain,
@@ -246,7 +247,13 @@ def run_overridden_simulation(req: SimulateRequest) -> tuple[SimResult, list[str
         overridden_battery_model,
         mode=SimulationMode.VALIDATION,
     )
-    result = engine.run(num_laps=num_laps, initial_soc_pct=95.0, initial_temp_c=29.0)
+    # Match get_baseline_result: run the FSAE-rule lap count so override
+    # vs baseline comparisons aren't biased by a lap-count mismatch.
+    result = engine.run(
+        num_laps=ENDURANCE_LAP_COUNT,
+        initial_soc_pct=95.0,
+        initial_temp_c=29.0,
+    )
 
     notes: list[str] = []
     if soc_note is not None:

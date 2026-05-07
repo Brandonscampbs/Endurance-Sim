@@ -109,6 +109,8 @@ class TestExtractPerSegmentActions:
             "segment_idx", "distance_m", "curvature",
             "mean_throttle_pct", "mean_brake_bar",
             "mean_speed_kmh", "action", "intensity",
+            "lap_fraction", "effective_intensity",
+            "throttle_lap_mean", "brake_lap_mean",
         }
         assert set(result.columns) == expected_cols
 

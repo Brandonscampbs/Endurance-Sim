@@ -75,6 +75,14 @@ def _detected_lap_count(aim_df) -> int:
     return len(boundaries)
 
 
+# FSAE Michigan endurance is a fixed-distance event (~22 km). With this
+# car's ~1005 m laps that's 22 timed laps. ``detect_lap_boundaries``
+# only finds 21 because the recording stops 14.9 s into lap 22 before
+# the final start/finish crossing — the real run was 22 laps but lap 22
+# wasn't fully captured by lap-detection, just by total distance.
+ENDURANCE_LAP_COUNT = 22
+
+
 @lru_cache(maxsize=1)
 def get_baseline_result() -> SimResult:
     """Run the held-out validation baseline with CalibratedStrategy."""
@@ -82,8 +90,8 @@ def get_baseline_result() -> SimResult:
     track = get_track()
     battery = get_battery_model()
     aim_df = get_telemetry()
-    num_laps = _detected_lap_count(aim_df)
-    _, validation_laps = get_validation_lap_split(num_laps)
+    detected = _detected_lap_count(aim_df)
+    _, validation_laps = get_validation_lap_split(detected)
 
     strategy = CalibratedStrategy.from_telemetry(
         aim_df,
@@ -98,7 +106,13 @@ def get_baseline_result() -> SimResult:
         battery,
         mode=SimulationMode.VALIDATION,
     )
-    return engine.run(num_laps=num_laps, initial_soc_pct=95.0, initial_temp_c=29.0)
+    # Run the FSAE-rule lap count (22), not the detected-boundary count
+    # (21) — see ENDURANCE_LAP_COUNT note above.
+    return engine.run(
+        num_laps=ENDURANCE_LAP_COUNT,
+        initial_soc_pct=95.0,
+        initial_temp_c=29.0,
+    )
 
 
 def run_single_lap_sim(lap_number: int = 1) -> SimResult:

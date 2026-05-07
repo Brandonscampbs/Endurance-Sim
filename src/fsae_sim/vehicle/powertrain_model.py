@@ -401,6 +401,47 @@ class PowertrainModel:
             torque_ceiling_nm = min(torque_ceiling_nm, cfg.safety_torque_cap_nm)
         return torque_ceiling_nm
 
+    def pedal_to_torque_request(
+        self, pedal_remapped: float, motor_rpm: float, bms_current_limit_a: float,
+    ) -> float:
+        """Firmware-faithful LVCU torque request for an already-remapped pedal.
+
+        Mirrors the LVCU's ``torque_lut(tps)`` step exactly:
+        - Power-cap from BMS current and motor speed
+        - LVCU torque limit (firmware setpoint, e.g. 220 Nm)
+        - Overspeed override
+        - Optional safety cap
+
+        Crucially, this does NOT apply the inverter's hardware torque cap.
+        The real LVCU sends the request as computed; the inverter clips
+        it downstream during delivery (modeled by
+        :meth:`apply_inverter_delivery`). Capping at the LVCU layer
+        produces a request that's too low whenever the LVCU was over-
+        requesting on purpose — the recorded telemetry shows real LVCU
+        Torque Req routinely exceeds 85 Nm at high pedal because the
+        firmware doesn't know about the inverter's IQ setting.
+
+        ``pedal_remapped`` is expected to be the firmware's
+        ``tmap_lut(tps_combined)`` output — i.e. the AiM "Throttle Pos"
+        channel, which is already deadzone-remapped per LVCU Code.txt
+        line 499 (``TxData[7] = (int)(tmap_lut(tps_combined) * 100)``).
+        Use this for pedal-replay strategies that play back recorded
+        post-deadzone pedal values.
+        """
+        cfg = self.config
+        bms_limit_effective = max(
+            0.0, bms_current_limit_a - cfg.lvcu_bms_current_offset_a
+        )
+        omega_term = max(cfg.lvcu_omega_floor, motor_rpm * cfg.lvcu_rpm_scale)
+        power_ceiling_nm = cfg.lvcu_power_constant * bms_limit_effective / omega_term
+        torque_ceiling_nm = min(cfg.torque_limit_lvcu_nm, power_ceiling_nm)
+        if motor_rpm >= cfg.lvcu_overspeed_rpm:
+            torque_ceiling_nm = cfg.lvcu_overspeed_torque_nm
+        # No inverter cap here — see docstring.
+        if cfg.safety_torque_cap_nm is not None:
+            torque_ceiling_nm = min(torque_ceiling_nm, cfg.safety_torque_cap_nm)
+        return max(0.0, float(pedal_remapped)) * torque_ceiling_nm
+
     # ------------------------------------------------------------------
     # Inverter delivery
     # ------------------------------------------------------------------
