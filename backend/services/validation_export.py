@@ -17,7 +17,7 @@ from backend.services.sim_runner import (
 )
 from backend.services.telemetry_service import get_lap_boundaries, get_lap_data, get_telemetry
 from backend.services.track_service import detect_sectors, get_track_data
-from fsae_sim.analysis.validation import validate_full_endurance
+from fsae_sim.analysis.validation import charge_counters_ah, validate_full_endurance
 
 _GRAVITY = 9.81
 
@@ -110,15 +110,23 @@ def _compute_per_lap_metrics(
     real_peak = float(real_lap[real_speed_col].max()) if len(real_lap) > 0 else 0.0
     metrics.append(_lap_metric("Peak speed", "km/h", real_peak, sim_peak, target_pct=10.0))
 
-    # --- SOC consumed ---
-    if len(sim_lap) > 0 and len(real_lap) > 0:
-        sim_dsoc = float(sim_lap["soc_pct"].iloc[0] - sim_lap["soc_pct"].iloc[-1])
-        real_dsoc = float(
-            real_lap["State of Charge"].iloc[0] - real_lap["State of Charge"].iloc[-1]
+    # --- Charge used (net Ah: discharge - regen) ---
+    if len(sim_lap) > 0 and len(real_lap) > 1:
+        _, _, sim_charge_ah = charge_counters_ah(
+            sim_lap["pack_current_a"].values,
+            sim_lap["segment_time_s"].values,
         )
-        if real_dsoc > 0.1:
+        _, _, real_charge_ah = charge_counters_ah(
+            real_lap["Pack Current"].values,
+            real_lap["Time"].diff().fillna(0.0).values,
+        )
+        if abs(real_charge_ah) > 0.01:
             metrics.append(
-                _lap_metric("SOC consumed", "%", real_dsoc, sim_dsoc, target_pct=15.0)
+                _lap_metric(
+                    "Charge used (net)", "Ah",
+                    real_charge_ah, sim_charge_ah,
+                    target_pct=10.0,
+                )
             )
 
     # --- Mean pack voltage ---
@@ -262,9 +270,17 @@ def get_validation_data(lap_number: int) -> ValidationResponse:
         sim_dist_in_lap, sim_lap["electrical_power_w"].values,
         real_dist, (real_df["Pack Voltage"].values * real_df["Pack Current"].values),
     )
-    soc = align_traces(
-        sim_dist_in_lap, sim_lap["soc_pct"].values,
-        real_dist, real_df["State of Charge"].values,
+    sim_charge_ah = np.cumsum(
+        sim_lap["pack_current_a"].values
+        * sim_lap["segment_time_s"].values
+    ) / 3600.0
+    real_charge_ah = np.cumsum(
+        real_df["Pack Current"].values
+        * real_df["Time"].diff().fillna(0.0).values
+    ) / 3600.0
+    charge_ah = align_traces(
+        sim_dist_in_lap, sim_charge_ah,
+        real_dist, real_charge_ah,
     )
 
     # Lateral acceleration: sim = v^2 * curvature / g, real = GPS LatAcc
@@ -296,7 +312,7 @@ def get_validation_data(lap_number: int) -> ValidationResponse:
         throttle=throttle,
         brake=brake,
         power=power,
-        soc=soc,
+        charge_ah=charge_ah,
         lat_accel=lat_accel,
         track_sim_speed=[round(float(v), 1) for v in track_sim_speed],
         track_real_speed=[round(float(v), 1) for v in track_real_speed],
@@ -337,6 +353,19 @@ def get_all_laps_summary() -> AllLapsResponse:
         real_energy = float(np.sum(real_power * real_dt)) / 3_600_000
         energy_err = abs(sim_energy - real_energy) / abs(real_energy) * 100 if real_energy != 0 else 0
 
+        _, _, sim_charge = charge_counters_ah(
+            sim_lap["pack_current_a"].values,
+            sim_lap["segment_time_s"].values,
+        )
+        _, _, real_charge = charge_counters_ah(
+            real_lap["Pack Current"].values,
+            real_dt,
+        )
+        charge_err = (
+            abs(sim_charge - real_charge) / abs(real_charge) * 100
+            if real_charge != 0 else 0
+        )
+
         sim_mean_speed = float(sim_lap["speed_kmh"].mean())
         # (C2) Use LFspeed when available.
         real_mean_speed = float(real_lap[real_speed_col].mean())
@@ -347,6 +376,9 @@ def get_all_laps_summary() -> AllLapsResponse:
             sim_time_s=round(sim_time, 2),
             real_time_s=round(real_time, 2),
             time_error_pct=round(time_err, 1),
+            sim_charge_ah=round(sim_charge, 3),
+            real_charge_ah=round(real_charge, 3),
+            charge_error_pct=round(charge_err, 1),
             sim_energy_kwh=round(sim_energy, 4),
             real_energy_kwh=round(real_energy, 4),
             energy_error_pct=round(energy_err, 1),
@@ -358,7 +390,7 @@ def get_all_laps_summary() -> AllLapsResponse:
     report = validate_full_endurance(
         sim_states, aim_df,
         result.total_time_s, result.final_soc,
-        result.total_energy_kwh, result.laps_completed,
+        result.net_energy_kwh, result.laps_completed,
         calibration_laps=calibration_laps,
         validation_laps=validation_laps,
     )
@@ -369,7 +401,7 @@ def get_all_laps_summary() -> AllLapsResponse:
             real_value=round(m.telemetry_value, 3),
             error_pct=round(m.relative_error_pct, 2),
             threshold_pct=m.target_pct,
-            passed=m.passed,
+            passed=bool(m.passed),
         )
         for m in report.metrics
     ]

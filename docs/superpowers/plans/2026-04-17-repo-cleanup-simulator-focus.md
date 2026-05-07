@@ -1,5 +1,10 @@
 # Repo Cleanup: Simulator Focus Implementation Plan
 
+> **Historical note:** Older versions of this plan treated displayed SOC as
+> an energy comparison. That is superseded. Current validation uses net pack
+> amp-hours and net V*I energy; displayed BMS/AiM SOC is not a scored
+> sim-vs-telemetry metric.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Strip this repo to an accurate FSAE EV endurance simulator for CT-16EV plus a linked 3-page webapp (Verification / Visualization / Simulate). Remove optimization/sweep/Pareto code, the `archive/` folder, 6 diagnostic scripts, 5 obsolete top-level docs, the obsidian vault, and all historical superpowers specs/plans. Condense `docs/SIMULATOR_ISSUES.md`. Rewrite `README.md` and `CLAUDE.md` to match the reduced scope.
@@ -698,7 +703,7 @@ Three pages, each answering one question about the simulator:
 
 1. **Verification** — how close is the baseline sim to real Michigan 2025 telemetry?
 2. **Visualization** — 3D playback of the car driving the track (real or sim).
-3. **Simulate** — one-shot what-if: change max RPM, max torque, SOC discharge map; see how endurance time and energy change vs baseline.
+3. **Simulate** — one-shot what-if: change max RPM, max torque, and current-limit assumptions; see how endurance time, net Ah, and energy change vs baseline.
 
 ## Quick Start
 
@@ -838,7 +843,7 @@ FSAE EV endurance simulation for UConn Formula SAE Electric (car CT-16EV).
 
 1. **Verification** — how close is the baseline simulator to reality? (compare sim vs Michigan 2025 telemetry, per-channel residuals, energy budget reconciliation).
 2. **Visualization** — a 3D playback of the car so physics bugs become visible.
-3. **Simulate** — a what-if tool with three knobs only: **max motor RPM, max motor torque, SOC discharge map**. Run one sim with those overrides, see how endurance changes.
+3. **Simulate** — a what-if tool for **max motor RPM, max motor torque, and current-limit assumptions**. Run one sim with those overrides, see how endurance time, net Ah, and energy change.
 
 **Out of scope for this repo.** Parameter sweeps, Pareto optimization, multi-run comparison, driver-strategy search, coaching output. Those will live in a separate repo that imports this one as a library. Do not add sweep runners, sweep-results pages, or sweep storage schemas here.
 

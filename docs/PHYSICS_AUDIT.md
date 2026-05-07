@@ -14,7 +14,7 @@ Reviewed areas:
 - Speed envelope construction.
 - Segment integration and vehicle dynamics.
 - Tire, load transfer, aero, braking, and powertrain models.
-- Battery and SOC model.
+- Battery, current, voltage, charge, and thermal model.
 - Validation metrics and existing result files.
 - Backend simulation runner and visualization export path.
 - Configs for CT16EV and CT17EV.
@@ -32,7 +32,7 @@ This simulator should not yet be used to answer engineering questions like:
 
 - How much faster will CT17EV be than CT16EV?
 - How much energy will an endurance run consume?
-- How much SOC margin do we need?
+- How many net pack amp-hours and how much energy margin do we need?
 - What is the benefit of a different aero package, tire, torque map, battery, or driver strategy?
 - What is the fastest feasible lap time?
 
@@ -52,11 +52,11 @@ Existing result files indicate that the tuned models still miss key endurance me
 - Current calibrated summary: sim total time about 1495.3 s vs telemetry driving time about 1608.8 s. The sim is roughly 7 percent too fast.
 - Current replay summary: sim total time about 1516.0 s vs telemetry driving time about 1608.8 s. Even replay-style inputs are roughly 6 percent too fast.
 - Calibrated energy: sim net energy about 3.221 kWh vs telemetry about 3.271 kWh, which looks close.
-- Calibrated SOC: sim SOC consumption about 44.3 percent vs telemetry about 34.0 percent, which is about 30 percent high relative error.
-- Replay SOC: sim SOC consumption about 46.8 percent vs telemetry about 34.0 percent, which is about 38 percent high relative error.
+- Current calibrated charge: sim net charge about 7.79 Ah vs telemetry about 8.04 Ah, roughly 3.2 percent low.
+- Current replay charge: sim net charge about 8.11 Ah vs telemetry about 8.04 Ah, roughly 0.8 percent high.
 - Calibrated lap behavior repeats nearly identical laps while the real endurance data has substantial lap-to-lap variation.
 
-The energy agreement is therefore not enough to trust the model. A pack model can match integrated kWh while still producing wrong current, voltage, temperature, SOC, and limiting behavior.
+The charge and energy agreement are encouraging, but still not enough by themselves to trust the model as a tune optimizer. A pack model can match integrated Ah and kWh while still producing wrong current timing, voltage sag, temperature, and limiting behavior.
 
 A `pytest -q` run produced real failures in effective inertia, load transfer, and configuration expectations, plus sandbox-related temp directory errors. The repo is not internally self-consistent at the test level either.
 
@@ -310,9 +310,9 @@ Minimum fix:
 - Validate lap length against known event distance.
 - Validate curvature against video, map, or lateral acceleration independent of the same speed signal used in the sim.
 
-### 7. Battery and SOC Model Are Not Validated Enough
+### 7. Battery Charge, Voltage, and Thermal Model Need More Validation
 
-The battery model may produce plausible voltage and energy trends, but SOC is clearly wrong in current result files.
+The battery model now validates against net pack amp-hours and net V*I energy, not the displayed AiM/BMS SOC channel. That is the right scoring-oriented target, but the model still needs stronger validation of current timing, voltage sag, and thermal behavior.
 
 Relevant files:
 
@@ -328,11 +328,11 @@ Specific problems:
 - Parallel cell sharing is assumed ideal.
 - OCV hysteresis is not modeled.
 - The thermal model is lumped and does not represent module gradients or airflow.
-- SOC percent conventions between measured BMS SOC and simulated coulomb counting appear mismatched.
+- Displayed BMS/AiM SOC is an estimator and should not be used as a sim-vs-telemetry energy metric.
 
 Why this is wrong:
 
-Endurance viability depends on current limits, voltage sag, thermal derating, and usable SOC. Matching net kWh alone does not validate those states.
+Endurance viability depends on amp-hours used, current limits, voltage sag, and thermal derating. Matching net kWh alone does not validate those states.
 
 What this breaks:
 
@@ -346,7 +346,7 @@ What this breaks:
 Minimum fix:
 
 - Validate the battery model on independent current/voltage/temperature logs.
-- Explicitly define measured BMS SOC convention vs simulated SOC convention.
+- Treat displayed BMS/AiM SOC as diagnostic only; use integrated current for scored charge usage.
 - Add temperature dependence for resistance and capacity where needed.
 - Validate pack current limits against actual BMS behavior.
 - Track energy, charge, voltage, current, and temperature errors separately.
@@ -687,12 +687,12 @@ Impact:
 
 ### Battery
 
-Primary concern: current, voltage, temperature, and SOC are not jointly validated.
+Primary concern: current, voltage, charge, and temperature are not jointly validated strongly enough.
 
 Issues:
 
 - Same telemetry used for calibration and validation.
-- SOC error is large in current results.
+- Displayed SOC disagreement is not a scoring metric; net Ah and net kWh are the validation targets.
 - Lumped thermal model.
 - Ideal parallel-cell sharing.
 - No hysteresis.
@@ -724,7 +724,7 @@ Impact:
 The current summaries show a typical symptom of an overfit simulator:
 
 - Net kWh looks close.
-- SOC is badly wrong.
+- Displayed SOC is not a trusted energy estimator and is ignored for validation.
 - Lap time is badly fast.
 - Replay is still fast.
 - Speed RMSE remains material.
@@ -795,8 +795,8 @@ This is the most important physics correction.
 ### Phase 6: Validate Battery and Thermal Model
 
 - Fit battery on one dataset.
-- Validate voltage/current/temp/SOC on another.
-- Separate coulomb-counted SOC from BMS displayed SOC.
+- Validate voltage, current, charge, and temperature on another dataset.
+- Keep internal coulomb-counted SOC separate from displayed BMS/AiM SOC and do not score against displayed SOC.
 - Add temperature-dependent resistance if needed.
 - Add module/cell gradients only after the lumped model is proven insufficient.
 
@@ -814,8 +814,8 @@ Before calling the simulator predictive, require something like:
 - Track lap length error under 1 percent against independent measurement.
 - Holdout lap time error under 2 percent without observed speed caps.
 - Speed trace RMSE under 3 to 4 km/h on holdout laps.
+- Net charge error under 5 percent on holdout endurance data, measured in Ah.
 - Net energy error under 5 percent on holdout endurance data.
-- SOC consumption error under 5 percent absolute SOC points or a team-defined equivalent.
 - Pack voltage RMSE and bias within validated electrical-model limits.
 - Peak current and current-limit timing aligned with logs.
 - Tire-limited corner speeds validated on at least several corners not used for grip fitting.
@@ -838,7 +838,7 @@ High:
 
 - Driver strategy is not predictive.
 - Track curvature and distance are derived from weak telemetry preprocessing.
-- SOC model does not match telemetry despite close kWh.
+- Current, voltage, and thermal states still need stronger holdout validation despite close Ah/kWh.
 - Combined-slip is mostly absent from runtime force limits.
 - Mechanical brake model is not hardware-based.
 
@@ -861,7 +861,7 @@ Low but still important:
 
 Treat current outputs as "debuggable estimates," not engineering truth.
 
-If the sim says CT17EV is faster, uses less energy, or can finish endurance with a certain SOC margin, that result should be considered unproven until:
+If the sim says CT17EV is faster, uses less charge, or can finish endurance with a certain Ah/energy margin, that result should be considered unproven until:
 
 - CT16EV can validate on holdout data.
 - The engine conserves energy and time through braking/cornering events.
@@ -919,7 +919,7 @@ The most dangerous failure mode is false confidence. The simulator has enough de
 
 `src/fsae_sim/vehicle/battery_model.py`
 
-- Needs independent validation for SOC, voltage, current, and temperature.
+- Needs independent validation for charge, voltage, current, and temperature.
 - Same-run calibration makes current validation weak.
 
 `src/fsae_sim/track/track.py`

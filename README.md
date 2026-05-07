@@ -1,6 +1,12 @@
 # FSAE EV Endurance Simulation
 
-Endurance simulation for UConn Formula SAE Electric (CT-16EV). Predicts lap time and energy for the Michigan endurance event; includes an FSAE scoring library for downstream tooling. Calibrated against real AiM telemetry from the 2025 Michigan endurance event.
+Endurance simulation for UConn Formula SAE Electric (CT-16EV). Predicts lap time, pack amp-hours, and electrical energy for the Michigan endurance event; includes an FSAE scoring library for downstream tooling. Calibrated against real AiM telemetry from the 2025 Michigan endurance event.
+
+Validation uses pack current integration as the primary energy metric:
+
+- **Charge used (net Ah)** = integral of pack current over time, with regen subtracted.
+- **Energy consumed (net kWh)** = integral of pack voltage times pack current over time, with regen subtracted.
+- The AiM/BMS `State of Charge` channel is a displayed estimator, not a true validation target. Do not use SOC percent error to judge endurance energy accuracy.
 
 ## Cars
 
@@ -41,7 +47,7 @@ Three pages, each answering one question about the simulator:
 
 1. **Verification** — how close is the baseline sim to real Michigan 2025 telemetry?
 2. **Visualization** — 3D playback of the car driving the track (real or sim).
-3. **Simulate** — one-shot what-if: change max RPM, max torque, SOC discharge map; see how endurance time and energy change vs baseline.
+3. **Simulate** — one-shot what-if: change max RPM, max torque, and current-limit assumptions; see how endurance time, net Ah, and energy change vs baseline.
 
 ## Quick Start
 
@@ -109,7 +115,7 @@ pytest -v
 
 - **AiM telemetry:** `2025 Endurance Data.csv` — 20 Hz Michigan endurance (~22 km, 21 laps).
 - **Voltt battery sim:** `..._cell.csv` + `..._pack.csv` for OCV-SOC and resistance calibration.
-- **BMS tune:** `Endurance Tune2.txt` — discharge limits, SOC taper.
+- **BMS tune:** `Endurance Tune2.txt` — discharge limits and pack-protection taper. SOC remains an internal battery-model state for voltage/current limits, not a telemetry validation metric.
 - **Motor map:** `emrax228_hv_cc_motor_map_long.csv` — 2D efficiency lookup.
 - **Tires:** `Round_8_Hoosier_LC0_16x7p5_10_on_8in_10psi_PAC02_UM2.tir` (PAC2002, Fx transplanted from R25B donor).
 

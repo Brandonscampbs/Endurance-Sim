@@ -193,3 +193,12 @@ class TestValidationRegenAccounting:
         assert energy_metric.telemetry_value == pytest.approx(
             expected_net_kwh, rel=1e-6,
         )
+        charge_metric = next(
+            (m for m in report.metrics if "Charge" in m.name), None,
+        )
+        expected_net_ah = (4 * 250.0 * 10.0 - 5 * 125.0 * 10.0) / 3600.0
+        assert charge_metric is not None, "Charge metric missing from report"
+        assert charge_metric.unit == "Ah"
+        assert charge_metric.telemetry_value == pytest.approx(
+            expected_net_ah, rel=1e-6,
+        )

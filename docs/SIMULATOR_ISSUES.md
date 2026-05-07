@@ -2,6 +2,10 @@
 
 Current open physics/code gaps. Detail and fix history live in git; this file is a working list of what's still wrong, intended to stay small enough to live in CLAUDE.md context.
 
+Energy validation is based on net pack amp-hours and net V*I energy. Displayed
+BMS/AiM SOC is not a scored sim-vs-telemetry metric; SOC references below are
+internal battery-model state or current-limit/taper issues.
+
 For the accuracy snapshot and the journey from the original 16.87 km/h
 RMSE down to the current 2.96 km/h on lap-1 replay, see
 [`docs/SIM_ACCURACY.md`](SIM_ACCURACY.md).

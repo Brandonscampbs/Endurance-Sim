@@ -8,7 +8,7 @@ FSAE EV endurance simulation
 
 1. **Verification** — how close is the baseline simulator to reality? (compare sim vs Michigan 2025 telemetry, per-channel residuals, energy budget reconciliation).
 2. **Visualization** — a 3D playback of the car so physics bugs become visible.
-3. **Simulate** — a what-if tool with three knobs only: **max motor RPM, max motor torque, SOC discharge map**. Run one sim with those overrides, see how endurance changes.
+3. **Simulate** — a what-if tool for **max motor RPM, max motor torque, and current-limit assumptions**. Run one sim with those overrides, see how endurance time, net Ah, and energy change.
 
 
 The repo starts with real telemetry and battery simulation data from Michigan 2025.
@@ -17,8 +17,8 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 
 ### Real-Car-Data-And-Stats/
 - **DSS spreadsheet** (`301_Univ_of_Connecticut-DSS-2025-05-05_1957.xlsx`): **Primary source of truth** for vehicle parameters. Contains measured mass, dimensions, suspension geometry, aero coefficients, motor/inverter specs, accumulator details, drivetrain ratios, and brake system data. Always use DSS values over estimates.
-- **AiM telemetry** (`CleanedEndurance.csv`): 20Hz CSV export from AiM Evo 5 data logger. Full Michigan endurance (~22 km, 21 laps, 1859s including driver change). Key channels: GPS Speed, GPS Lat/Lon, GPS LatAcc/LonAcc, RPM, Torque Feedback, Pack Voltage/Current, State of Charge, Pack Temp, Throttle Pos, Brake Pressure, LVCU Torque Req. Binary logs (`.xrk`, `.xrz`, `.drk`, `.rrk`) require AiM Race Studio.
-- **Endurance Tune2.txt**: BMS discharge limits, SOC taper, cell voltage bounds, inverter/motor parameter settings.
+- **AiM telemetry** (`CleanedEndurance.csv`): 20Hz CSV export from AiM Evo 5 data logger. Full Michigan endurance (~22 km, 21 laps, 1859s including driver change). Key channels: GPS Speed, GPS Lat/Lon, GPS LatAcc/LonAcc, RPM, Torque Feedback, Pack Voltage/Current, State of Charge, Pack Temp, Throttle Pos, Brake Pressure, LVCU Torque Req. Binary logs (`.xrk`, `.xrz`, `.drk`, `.rrk`) require AiM Race Studio. For validation, use Pack Current integrated over time (net Ah) and V*I integrated over time (net kWh); do not score against displayed SOC.
+- **Endurance Tune2.txt**: BMS discharge limits, internal SOC taper, cell voltage bounds, inverter/motor parameter settings.
 - **About-Energy-Volt-Simulations/**: Voltt battery simulation export (110S4P, Molicel P45B). Two CSVs -- `_cell.csv` (single-cell level) and `_pack.csv` (pack-scaled). Used for battery model calibration (OCV-SOC curve, internal resistance).
 - **LVCU Code.txt**: LVCU firmware source — the torque command chain (`PowertrainModel.lvcu_torque_command()` and related methods) is a faithful translation of this file. Source of truth for `lvcu_power_constant`, `lvcu_rpm_scale`, `lvcu_omega_floor`, and pedal deadzone parameters in `PowertrainConfig`.
 - **emrax228_hv_cc_motor_map_long.csv**: EMRAX 228 motor efficiency map (speed_rpm, torque_Nm, efficiency_pct). Loaded by `MotorEfficiencyMap` for 2D operating-point-dependent motor+inverter efficiency. Falls back to constant `drivetrain_efficiency` if missing.
@@ -47,7 +47,7 @@ The repo starts with real telemetry and battery simulation data from Michigan 20
 | Pack energy | 7.128 kWh nominal | DSS |
 | Cell voltage range | 2.55 -- 4.20 V | DSS + Endurance Tune |
 | Max discharge | 100 A @ 30°C, tapers to 0 A @ 65°C | Endurance Tune |
-| SOC taper | 1 A per 1% below 85% SOC | Endurance Tune |
+| Internal SOC taper | 1 A per 1% below 85% internal SOC | Endurance Tune |
 | Tires | Hoosier 16x7.5-10 LC0 (10" wheel) | DSS |
 | CG height | 279.4 mm | DSS |
 

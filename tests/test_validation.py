@@ -251,11 +251,11 @@ class TestFullEndurance:
                 print(f"  Driving time: telem={m.telemetry_value:.0f}s, "
                       f"sim={m.simulation_value:.0f}s, err={m.relative_error_pct:.1f}%")
 
-    def test_soc_consumed(self, full_report):
+    def test_charge_used(self, full_report):
         for m in full_report.metrics:
-            if m.name == "SOC consumed":
-                print(f"  SOC consumed: telem={m.telemetry_value:.1f}%, "
-                      f"sim={m.simulation_value:.1f}%, err={m.relative_error_pct:.1f}%")
+            if m.name == "Charge used (net)":
+                print(f"  Charge used: telem={m.telemetry_value:.2f}Ah, "
+                      f"sim={m.simulation_value:.2f}Ah, err={m.relative_error_pct:.1f}%")
 
     def test_final_temperature(self, full_report):
         for m in full_report.metrics:
@@ -319,6 +319,9 @@ class TestTwoCounterEnergyAccounting:
         assert hasattr(rep, "telem_discharge_j")
         assert hasattr(rep, "telem_regen_j")
         assert hasattr(rep, "telem_net_j")
+        assert hasattr(rep, "telem_discharge_ah")
+        assert hasattr(rep, "telem_regen_ah")
+        assert hasattr(rep, "telem_net_ah")
         # Discharge: 4 intervals * 400V * 50A * 0.1s = 8000 J
         # (first sample has dt=0 by the prepend convention)
         assert rep.telem_discharge_j == pytest.approx(8000.0, rel=0.1)
@@ -327,6 +330,11 @@ class TestTwoCounterEnergyAccounting:
         assert rep.telem_regen_j == pytest.approx(4000.0, rel=0.1)
         # Net: discharge - regen
         assert rep.telem_net_j == pytest.approx(rep.telem_discharge_j - rep.telem_regen_j, rel=0.01)
+        assert rep.telem_discharge_ah == pytest.approx(8000.0 / 400.0 / 3600.0, rel=0.1)
+        assert rep.telem_regen_ah == pytest.approx(4000.0 / 400.0 / 3600.0, rel=0.1)
+        assert rep.telem_net_ah == pytest.approx(
+            rep.telem_discharge_ah - rep.telem_regen_ah, rel=0.01,
+        )
 
 
 # ---------------------------------------------------------------------------

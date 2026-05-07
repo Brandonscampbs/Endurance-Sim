@@ -35,6 +35,9 @@ class LapSummary(BaseModel):
     sim_time_s: float
     real_time_s: float
     time_error_pct: float
+    sim_charge_ah: float
+    real_charge_ah: float
+    charge_error_pct: float
     sim_energy_kwh: float
     real_energy_kwh: float
     energy_error_pct: float
@@ -47,7 +50,7 @@ class ValidationResponse(BaseModel):
     throttle: TraceData
     brake: TraceData
     power: TraceData
-    soc: TraceData
+    charge_ah: TraceData
     lat_accel: TraceData
     track_sim_speed: list[float]  # per-centerline-point speed for track map coloring
     track_real_speed: list[float]

@@ -53,18 +53,29 @@ class ValidationMetric:
 class ValidationReport:
     """Summary of all validation metrics.
 
-    Telemetry energy accounting uses two separate integrators (C8):
+    Telemetry charge and energy accounting use separate discharge/regen
+    integrators:
+    - ``telem_discharge_ah``: integral of pack current where I > 0
+    - ``telem_regen_ah``: integral of pack |current| where I < 0
+    - ``telem_net_ah``: discharge minus regen
     - ``telem_discharge_j``: integral of V*I where I > 0 (pack sourcing energy)
     - ``telem_regen_j``: integral of V*|I| where I < 0 (regen back into pack)
     - ``telem_net_j``: discharge minus regen (net electrical energy out)
 
-    The pre-fix implementation summed only ``power > 0``, silently dropping
-    regen. Three counters keep the accounting honest.
+    Amp-hours are the primary sim-vs-telemetry endurance validation target.
+    The AiM/BMS ``State of Charge`` channel is a displayed estimate and is not
+    used as a pass/fail metric.
 
     ``stints`` optionally carries per-stint sub-reports when the input
     telemetry frame has a ``stint`` column (C16).
     """
     metrics: list[ValidationMetric]
+    telem_discharge_ah: float = 0.0
+    telem_regen_ah: float = 0.0
+    telem_net_ah: float = 0.0
+    sim_discharge_ah: float = 0.0
+    sim_regen_ah: float = 0.0
+    sim_net_ah: float = 0.0
     telem_discharge_j: float = 0.0
     telem_regen_j: float = 0.0
     telem_net_j: float = 0.0
@@ -176,6 +187,18 @@ def assert_calibration_validation_split(
         )
 
 
+def charge_counters_ah(
+    current_a: Sequence[float] | np.ndarray,
+    dt_s: Sequence[float] | np.ndarray,
+) -> tuple[float, float, float]:
+    """Return discharge, regen, and net charge in pack amp-hours."""
+    current = np.asarray(current_a, dtype=float)
+    dt = np.asarray(dt_s, dtype=float)
+    discharge = float(np.sum(np.maximum(current, 0.0) * dt) / 3600.0)
+    regen = float(np.sum(np.maximum(-current, 0.0) * dt) / 3600.0)
+    return discharge, regen, discharge - regen
+
+
 def extract_lap_telemetry(
     aim_df: pd.DataFrame,
     start_idx: int,
@@ -250,17 +273,19 @@ def validate_simulation(
     sim_peak = float(sim_states["speed_kmh"].max())
     metrics.append(_metric("Peak speed", "km/h", telem_peak, sim_peak, 10.0))
 
-    # --- SOC change ---
-    telem_soc_start = float(aim_df["State of Charge"].iloc[lap_start_idx])
-    telem_soc_end = float(aim_df["State of Charge"].iloc[lap_end_idx])
-    telem_dsoc = telem_soc_start - telem_soc_end
-
-    sim_soc_start = float(sim_states["soc_pct"].iloc[0])
-    sim_soc_end = float(sim_states["soc_pct"].iloc[-1])
-    sim_dsoc = sim_soc_start - sim_soc_end
-
-    if telem_dsoc > 0.5:  # only compare if meaningful SOC change
-        metrics.append(_metric("SOC consumed", "%", telem_dsoc, sim_dsoc, 15.0))
+    # --- Pack charge used (net Ah: discharge - regen) ---
+    telem_dt = lap_telem["Time"].diff().fillna(0.0).values
+    _, _, telem_net_ah = charge_counters_ah(
+        lap_telem["Pack Current"].values, telem_dt,
+    )
+    sim_dt = sim_states["segment_time_s"].values
+    _, _, sim_net_ah = charge_counters_ah(
+        sim_states["pack_current_a"].values, sim_dt,
+    )
+    if abs(telem_net_ah) > 0.01:
+        metrics.append(
+            _metric("Charge used (net)", "Ah", telem_net_ah, sim_net_ah, 10.0)
+        )
 
     # --- Pack voltage (mean during lap) ---
     telem_v = float(lap_telem["Pack Voltage"].mean())
@@ -421,12 +446,11 @@ def validate_full_endurance(
     sim_dist = float(sim_states["distance_m"].iloc[-1])
     metrics.append(_metric("Total distance", "m", telem_dist, sim_dist, target_pct))
 
-    # --- Final SOC ---
-    telem_soc_start = float(aim_df["State of Charge"].iloc[0])
-    telem_soc_end = float(aim_df["State of Charge"].iloc[-1])
-    telem_soc_consumed = telem_soc_start - telem_soc_end
-    sim_soc_consumed = float(sim_states["soc_pct"].iloc[0]) - sim_final_soc
-    metrics.append(_metric("SOC consumed", "%", telem_soc_consumed, sim_soc_consumed, 10.0))
+    # --- Pack charge used (net Ah: discharge - regen) ---
+    sim_discharge_ah, sim_regen_ah, sim_net_ah = charge_counters_ah(
+        sim_states["pack_current_a"].values,
+        sim_states["segment_time_s"].values,
+    )
 
     # --- Final temperature ---
     telem_temp_end = float(aim_df["Pack Temp"].iloc[-1])
@@ -455,6 +479,14 @@ def validate_full_endurance(
     voltage = aim_df["Pack Voltage"].values
     current = aim_df["Pack Current"].values
     dt = np.diff(aim_df["Time"].values, prepend=aim_df["Time"].values[0])
+    telem_discharge_ah, telem_regen_ah, telem_net_ah = charge_counters_ah(
+        current, dt,
+    )
+    if abs(telem_net_ah) > 0.01:
+        metrics.append(
+            _metric("Charge used (net)", "Ah", telem_net_ah, sim_net_ah, 10.0)
+        )
+
     discharge_mask = current > 0
     regen_mask = current < 0
     telem_discharge_j = float(
@@ -471,6 +503,12 @@ def validate_full_endurance(
 
     return ValidationReport(
         metrics=metrics,
+        telem_discharge_ah=telem_discharge_ah,
+        telem_regen_ah=telem_regen_ah,
+        telem_net_ah=telem_net_ah,
+        sim_discharge_ah=sim_discharge_ah,
+        sim_regen_ah=sim_regen_ah,
+        sim_net_ah=sim_net_ah,
         telem_discharge_j=telem_discharge_j,
         telem_regen_j=telem_regen_j,
         telem_net_j=telem_net_j,
