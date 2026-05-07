@@ -1,0 +1,93 @@
+/*
+ * Design tokens for the FSAE EV Endurance Simulator webapp.
+ *
+ * Palette intent: cool slate base (not pure black), restrained motorsport
+ * accent (deep racing green), scientific status colors (muted not fluorescent).
+ * Inspired by the dark dashboard work of Vercel, Linear, PostHog, and the
+ * Anthropic Console: high information density, surfaces stepped by elevation,
+ * single saturated accent reserved for primary action and key data series.
+ *
+ * Tokens are consumed via Tailwind arbitrary values, e.g.:
+ *   bg-[var(--surface-1)]  border-[var(--border-subtle)]
+ * No tailwind.config extension needed (Tailwind 4 + Vite plugin).
+ */
+
+@layer base {
+  :root {
+    /* ---------- Surfaces (elevation: lower index = further back) ---------- */
+    /* slate-950-ish, but a hair cooler so it doesn't read as pure black */
+    --surface-0: #0a0d12;
+    /* slate-900 — default card */
+    --surface-1: #11151c;
+    /* raised card / popover / hovered surface */
+    --surface-2: #161b24;
+    /* input / interactive control resting state */
+    --surface-3: #1d232d;
+
+    /* ---------- Borders ---------- */
+    /* default 1px hairline on cards; sits ~1 step above the surface */
+    --border-subtle: #1f2530;
+    /* hover, focus, selected state — slightly cooler and brighter */
+    --border-strong: #2c3340;
+
+    /* ---------- Text ---------- */
+    --text-primary: #e6e9ef;
+    --text-secondary: #a4acba;
+    --text-tertiary: #6f7787;
+    --text-muted: #4b5161;
+
+    /* ---------- Accent: deep racing green ---------- *
+     * Hue-shifted toward British racing green (cooler than emerald-500).
+     * Saturation pulled back so the accent doesn't fight the data series.
+     */
+    --accent: #14a36a;
+    --accent-strong: #17b977;
+    --accent-soft: rgba(20, 163, 106, 0.12);
+
+    /* ---------- Data series ---------- *
+     * Sim is the same green family as the accent (this is *our* output).
+     * Real telemetry is a calm steel-blue. Baseline reference is amber.
+     * All three are co-luminous so overlay charts read evenly.
+     */
+    --data-sim: #2ec27e;
+    --data-real: #5b9dd9;
+    --data-baseline: #d6a85a;
+
+    /* ---------- Status (foreground + 15%-alpha background) ---------- *
+     * Tuned to feel scientific, not stoplight. Amber over yellow. Coral
+     * over fire-engine red. Steel blue for info. Same green family as accent.
+     */
+    --ok: #2ec27e;
+    --ok-bg: rgba(46, 194, 126, 0.15);
+    --warn: #d6a85a;
+    --warn-bg: rgba(214, 168, 90, 0.15);
+    --error: #e0635c;
+    --error-bg: rgba(224, 99, 92, 0.15);
+    --info: #5b9dd9;
+    --info-bg: rgba(91, 157, 217, 0.15);
+
+    /* ---------- Typography ---------- *
+     * System stacks by default — fast, no FOUT, looks native on every OS.
+     * Display stack matches body (we use weight + tracking for hierarchy,
+     * not a separate display face).
+     */
+    --font-display:
+      ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+      Arial, "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+    --font-mono:
+      ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+      monospace;
+  }
+
+  /* Skeleton shimmer — the only motion we introduce in the primitive layer.
+   * Single ~1.6s pass-through. Background-position drives the highlight band
+   * across a horizontally-tiled gradient sized 200% of the element width. */
+  @keyframes shimmer {
+    0% {
+      background-position: 200% 0;
+    }
+    100% {
+      background-position: -200% 0;
+    }
+  }
+}

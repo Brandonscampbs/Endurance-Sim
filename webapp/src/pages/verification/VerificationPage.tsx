@@ -7,7 +7,8 @@ import {
   useLaps,
   ApiError,
 } from '../../api/client'
-import LoadingSpinner from '../../components/LoadingSpinner'
+import { EmptyState, Skeleton } from '../../components/ui'
+import AccuracyBanner from './AccuracyBanner'
 import SectorTable from './SectorTable'
 import LapTable from './LapTable'
 import MetricCards from './MetricCards'
@@ -34,6 +35,93 @@ function parseLapParam(raw: string | null): number | null | undefined {
   const n = Number(raw)
   if (!Number.isInteger(n) || n < 1) return undefined
   return n
+}
+
+/** Skeleton stand-ins reserved while data loads — preserves page height. */
+function MetricCardsSkeleton() {
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      {Array.from({ length: 4 }).map((_, i) => (
+        <Skeleton key={i} h="h-[112px]" w="w-full" rounded="rounded-lg" />
+      ))}
+    </div>
+  )
+}
+
+function ChartPanelSkeleton() {
+  return <Skeleton h="h-[290px]" w="w-full" rounded="rounded-lg" />
+}
+
+function TrackMapsSkeleton() {
+  return (
+    <div className="grid grid-cols-2 gap-4">
+      <Skeleton h="h-[440px]" w="w-full" rounded="rounded-lg" />
+      <Skeleton h="h-[440px]" w="w-full" rounded="rounded-lg" />
+    </div>
+  )
+}
+
+function OverlayChartsSkeleton() {
+  return (
+    <div className="space-y-4">
+      {Array.from({ length: 6 }).map((_, i) => (
+        <ChartPanelSkeleton key={i} />
+      ))}
+    </div>
+  )
+}
+
+function TableSkeleton({ rows = 8 }: { rows?: number }) {
+  return (
+    <div className="space-y-2">
+      <Skeleton h="h-10" w="w-full" rounded="rounded-lg" />
+      {Array.from({ length: rows }).map((_, i) => (
+        <Skeleton key={i} h="h-9" w="w-full" rounded="rounded-md" />
+      ))}
+    </div>
+  )
+}
+
+/** Skeleton arrangement for the single-lap branch — mirrors the real layout. */
+function SingleLapSkeleton() {
+  return (
+    <>
+      <TrackMapsSkeleton />
+      <OverlayChartsSkeleton />
+      <TableSkeleton rows={6} />
+      <MetricCardsSkeleton />
+    </>
+  )
+}
+
+/** Skeleton arrangement for the all-laps branch. */
+function AllLapsSkeleton() {
+  return (
+    <>
+      <MetricCardsSkeleton />
+      <TableSkeleton rows={10} />
+    </>
+  )
+}
+
+/** Designed error fallback with Retry. Uses window.location.reload() — every
+ *  affected SWR key is involved, so a full reload is the simplest correct retry. */
+function VerificationError({ message }: { message: string }) {
+  return (
+    <EmptyState
+      title="Couldn't load verification data"
+      description={message}
+      action={
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          className="rounded-md border border-[var(--border-strong)] bg-[var(--surface-3)] px-3 py-1.5 text-xs font-medium text-[var(--text-primary)] hover:bg-[var(--surface-2)]"
+        >
+          Retry
+        </button>
+      }
+    />
+  )
 }
 
 export default function VerificationPage() {
@@ -80,25 +168,31 @@ export default function VerificationPage() {
     !validationLoading
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
+      <AccuracyBanner />
+
       {/* Header + Lap Selector */}
       <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold">Verification</h2>
+        <h2 className="text-2xl font-bold text-[var(--text-primary)]">Verification</h2>
         <div className="flex items-center gap-3">
-          <label htmlFor="lap-select" className="text-sm text-gray-400">Lap:</label>
-          <select
-            id="lap-select"
-            value={selectedLap ?? 'all'}
-            onChange={(e) => setSelectedLap(e.target.value === 'all' ? null : Number(e.target.value))}
-            className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm"
-          >
-            <option value="all">All Laps</option>
-            {lapsData?.laps.map((l) => (
-              <option key={l.lap_number} value={l.lap_number}>
-                Lap {l.lap_number} — {l.time_s.toFixed(1)}s (GPS: {l.gps_quality_score})
-              </option>
-            ))}
-          </select>
+          <label htmlFor="lap-select" className="text-sm text-[var(--text-tertiary)]">Lap:</label>
+          {lapsData ? (
+            <select
+              id="lap-select"
+              value={selectedLap ?? 'all'}
+              onChange={(e) => setSelectedLap(e.target.value === 'all' ? null : Number(e.target.value))}
+              className="bg-[var(--surface-3)] border border-[var(--border-subtle)] hover:border-[var(--border-strong)] focus:border-[var(--border-strong)] focus:outline-none rounded px-3 py-1.5 text-sm text-[var(--text-primary)]"
+            >
+              <option value="all">All Laps</option>
+              {lapsData.laps.map((l) => (
+                <option key={l.lap_number} value={l.lap_number}>
+                  Lap {l.lap_number} — {l.time_s.toFixed(1)}s (GPS: {l.gps_quality_score})
+                </option>
+              ))}
+            </select>
+          ) : (
+            <Skeleton h="h-9" w="w-64" rounded="rounded" />
+          )}
         </div>
       </div>
 
@@ -109,20 +203,22 @@ export default function VerificationPage() {
           singleLapInitializing ||
           trackLoading ||
           validationLoading ? (
-            <LoadingSpinner message="Running simulation and loading telemetry..." />
+            <SingleLapSkeleton />
           ) : track && validation ? (
             <>
-              <Suspense fallback={<LoadingSpinner message="Loading charts..." />}>
+              <Suspense fallback={<TrackMapsSkeleton />}>
                 <TrackMaps track={track} validation={validation} />
+              </Suspense>
+              <Suspense fallback={<OverlayChartsSkeleton />}>
                 <OverlayCharts validation={validation} />
               </Suspense>
               <SectorTable sectors={validation.sectors} />
               <MetricCards metrics={validation.metrics} />
             </>
           ) : (
-            <p className="text-red-400">
-              {errorMessage(trackError ?? validationError ?? lapsError)}
-            </p>
+            <VerificationError
+              message={errorMessage(trackError ?? validationError ?? lapsError)}
+            />
           )}
         </>
       )}
@@ -131,16 +227,14 @@ export default function VerificationPage() {
       {selectedLap === null && (
         <>
           {initializingLaps || allLapsLoading ? (
-            <LoadingSpinner message="Computing all-laps summary..." />
+            <AllLapsSkeleton />
           ) : allLaps ? (
             <>
               <MetricCards metrics={allLaps.metrics} />
               <LapTable laps={allLaps.laps} selectedLap={null} />
             </>
           ) : (
-            <p className="text-red-400">
-              {errorMessage(allLapsError ?? lapsError)}
-            </p>
+            <VerificationError message={errorMessage(allLapsError ?? lapsError)} />
           )}
         </>
       )}

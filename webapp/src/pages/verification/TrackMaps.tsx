@@ -1,5 +1,6 @@
 import Plot from '../../components/Plot'
 import type { TrackData, ValidationResponse } from '../../api/client'
+import { ChartShell } from '../../components/ui'
 
 interface Props {
   track: TrackData
@@ -13,6 +14,8 @@ const COLOR_SCALE: [number, string][] = [
   [0.75, '#f97316'], // orange
   [1, '#ef4444'],    // red - fast
 ]
+
+const TEXT_SECONDARY = '#a4acba' // --text-secondary
 
 // Spread-free min/max: large speed arrays (~40k points) blow the JS engine's
 // argument-count limit when passed via Math.min(...arr) / Math.max(...arr).
@@ -54,15 +57,14 @@ export default function TrackMaps({ track, validation }: Props) {
   const maxSpeed = Number.isFinite(rawMax) ? rawMax : 1
   const minSpeed = Number.isFinite(rawMin) ? rawMin : 0
 
-  const layout = (title: string) => ({
-    title: { text: title, font: { color: '#9ca3af', size: 14 } },
+  const layout = {
     paper_bgcolor: 'transparent',
     plot_bgcolor: 'transparent',
     xaxis: { visible: false, scaleanchor: 'y', scaleratio: 1 },
     yaxis: { visible: false },
-    margin: { t: 40, b: 10, l: 10, r: 10 },
+    margin: { t: 8, b: 10, l: 10, r: 10 },
     showlegend: false,
-  })
+  }
 
   const makeTrace = (speeds: number[]) => ({
     type: 'scatter' as const,
@@ -75,31 +77,35 @@ export default function TrackMaps({ track, validation }: Props) {
       cmin: minSpeed,
       cmax: maxSpeed,
       size: 4,
-      colorbar: { title: 'km/h', tickfont: { color: '#9ca3af' }, titlefont: { color: '#9ca3af' } },
+      colorbar: {
+        title: 'km/h',
+        tickfont: { color: TEXT_SECONDARY },
+        titlefont: { color: TEXT_SECONDARY },
+      },
     },
     hovertemplate: 'Speed: %{marker.color:.1f} km/h<extra></extra>',
   })
 
   return (
     <div className="grid grid-cols-2 gap-4">
-      <div className="bg-gray-900 rounded-lg p-2">
+      <ChartShell title="Track map (sim)" subtitle="Speed colored along centerline" height={400}>
         <Plot
           data={[makeTrace(validation.track_sim_speed)]}
-          layout={layout('Simulation Speed')}
+          layout={layout}
           config={{ responsive: true, displayModeBar: false }}
-          className="w-full"
-          style={{ height: 400 }}
+          className="w-full h-full"
+          style={{ width: '100%', height: '100%' }}
         />
-      </div>
-      <div className="bg-gray-900 rounded-lg p-2">
+      </ChartShell>
+      <ChartShell title="Track map (real)" subtitle="AiM telemetry speed colored along centerline" height={400}>
         <Plot
           data={[makeTrace(validation.track_real_speed)]}
-          layout={layout('Real Telemetry Speed')}
+          layout={layout}
           config={{ responsive: true, displayModeBar: false }}
-          className="w-full"
-          style={{ height: 400 }}
+          className="w-full h-full"
+          style={{ width: '100%', height: '100%' }}
         />
-      </div>
+      </ChartShell>
     </div>
   )
 }

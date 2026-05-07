@@ -2,7 +2,6 @@ import { useEffect, useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { usePlaybackStore } from '../../stores/playbackStore'
 import { parseCameraMode, type CameraMode } from './CameraController'
-import { parseDataSource, type DataSource } from './VisualizationPage'
 
 const speeds = [0.5, 1, 2, 5]
 const cameras: { mode: CameraMode; label: string }[] = [
@@ -11,22 +10,20 @@ const cameras: { mode: CameraMode; label: string }[] = [
   { mode: 'orbit', label: 'Orbit' },
 ]
 
+const baseBtn =
+  'px-2 py-0.5 text-xs rounded transition-colors bg-[var(--surface-3)] ' +
+  'text-[var(--text-secondary)] hover:bg-[var(--accent)]/20 hover:text-[var(--text-primary)]'
+const activeBtn = 'bg-[var(--accent)]/30 text-[var(--accent)]'
+
 export default function PlaybackControls() {
   const store = usePlaybackStore()
   const [searchParams, setSearchParams] = useSearchParams()
 
   const cameraMode = parseCameraMode(searchParams.get('camera'))
-  const dataSource = parseDataSource(searchParams.get('source'))
 
   const setCameraMode = (m: CameraMode) => {
     const next = new URLSearchParams(searchParams)
     next.set('camera', m)
-    setSearchParams(next, { replace: true })
-  }
-
-  const setDataSource = (s: DataSource) => {
-    const next = new URLSearchParams(searchParams)
-    next.set('source', s)
     setSearchParams(next, { replace: true })
   }
 
@@ -43,14 +40,18 @@ export default function PlaybackControls() {
   }, [handleKeydown])
 
   return (
-    <div className="flex items-center gap-4 px-4">
+    <div className="flex items-center gap-4 px-4 flex-wrap">
       {/* Play/Pause */}
       <button
         onClick={store.togglePlay}
-        className="text-lg hover:text-green-400 transition-colors"
+        className={`px-2 py-0.5 text-base rounded transition-colors ${
+          store.isPlaying
+            ? 'bg-[var(--accent)]/30 text-[var(--accent)]'
+            : 'bg-[var(--surface-3)] text-[var(--text-primary)] hover:bg-[var(--accent)]/20'
+        }`}
         aria-label={store.isPlaying ? 'Pause' : 'Play'}
       >
-        {store.isPlaying ? '\u23F8' : '\u25B6'}
+        {store.isPlaying ? '⏸' : '▶'}
       </button>
 
       {/* Speed */}
@@ -59,16 +60,14 @@ export default function PlaybackControls() {
           <button
             key={s}
             onClick={() => store.setSpeed(s)}
-            className={`px-2 py-0.5 text-xs rounded ${
-              store.speed === s ? 'bg-green-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-            }`}
+            className={`${baseBtn} ${store.speed === s ? activeBtn : ''}`}
           >
             {s}x
           </button>
         ))}
       </div>
 
-      <div className="w-px h-4 bg-gray-700" />
+      <div className="w-px h-4 bg-[var(--border-subtle)]" />
 
       {/* Camera */}
       <div className="flex gap-1">
@@ -76,48 +75,25 @@ export default function PlaybackControls() {
           <button
             key={mode}
             onClick={() => setCameraMode(mode)}
-            className={`px-2 py-0.5 text-xs rounded ${
-              cameraMode === mode ? 'bg-blue-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-            }`}
+            className={`${baseBtn} ${cameraMode === mode ? activeBtn : ''}`}
           >
             {label}
           </button>
         ))}
       </div>
 
-      <div className="w-px h-4 bg-gray-700" />
-
-      {/* Data source toggle */}
-      <div className="flex gap-1">
-        {(['sim', 'real'] as const).map((src) => (
-          <button
-            key={src}
-            onClick={() => setDataSource(src)}
-            className={`px-2 py-0.5 text-xs rounded ${
-              dataSource === src ? 'bg-purple-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-            }`}
-          >
-            {src === 'sim' ? 'Sim' : 'Real'}
-          </button>
-        ))}
-      </div>
-
-      <div className="w-px h-4 bg-gray-700" />
+      <div className="w-px h-4 bg-[var(--border-subtle)]" />
 
       {/* Overlay toggles */}
       <button
         onClick={store.toggleForces}
-        className={`px-2 py-0.5 text-xs rounded ${
-          store.showForces ? 'bg-gray-700 text-white' : 'bg-gray-800 text-gray-500'
-        }`}
+        className={`${baseBtn} ${store.showForces ? activeBtn : ''}`}
       >
         Forces
       </button>
       <button
         onClick={store.toggleTrackColor}
-        className={`px-2 py-0.5 text-xs rounded ${
-          store.showTrackColor ? 'bg-gray-700 text-white' : 'bg-gray-800 text-gray-500'
-        }`}
+        className={`${baseBtn} ${store.showTrackColor ? activeBtn : ''}`}
       >
         Track Color
       </button>

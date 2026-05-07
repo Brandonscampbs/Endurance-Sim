@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { LapSummary } from '../../api/client'
+import { Card, CardHeader, CardTitle, CardBody } from '../../components/ui'
 
 type SortKey = keyof Pick<
   LapSummary,
@@ -7,6 +8,9 @@ type SortKey = keyof Pick<
   | 'sim_time_s'
   | 'real_time_s'
   | 'time_error_pct'
+  | 'sim_charge_ah'
+  | 'real_charge_ah'
+  | 'charge_error_pct'
   | 'sim_energy_kwh'
   | 'real_energy_kwh'
   | 'energy_error_pct'
@@ -24,9 +28,9 @@ const DRIVER_CHANGE_MIN_LAPS = 15 // only highlight when enough laps are shown t
 
 function errorColor(pct: number): string {
   const abs = Math.abs(pct)
-  if (abs < 5) return 'text-green-400'
-  if (abs < 10) return 'text-yellow-400'
-  return 'text-red-400'
+  if (abs < 5) return 'var(--ok)'
+  if (abs < 10) return 'var(--warn)'
+  return 'var(--error)'
 }
 
 interface HeaderProps {
@@ -43,15 +47,14 @@ function SortableHeader({ label, sortKey, activeKey, activeDir, align = 'right',
   const ariaSort = isActive ? (activeDir === 'asc' ? 'ascending' : 'descending') : 'none'
   const indicator = isActive ? (activeDir === 'asc' ? '↑' : '↓') : ''
   const alignClass = align === 'right' ? 'text-right' : 'text-left'
+  const buttonClass =
+    'inline-flex items-center gap-1 uppercase tracking-wider focus:outline-none ' +
+    (isActive
+      ? 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+      : 'text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]')
   return (
     <th scope="col" aria-sort={ariaSort} className={`px-4 py-2 ${alignClass}`}>
-      <button
-        type="button"
-        onClick={() => onSort(sortKey)}
-        className={`inline-flex items-center gap-1 uppercase tracking-wider hover:text-gray-300 focus:outline-none focus:text-white ${
-          isActive ? 'text-gray-300' : 'text-gray-500'
-        }`}
-      >
+      <button type="button" onClick={() => onSort(sortKey)} className={buttonClass}>
         <span>{label}</span>
         <span aria-hidden="true" className="w-2 text-xs">
           {indicator}
@@ -89,70 +92,103 @@ export default function LapTable({ laps, selectedLap }: { laps: LapSummary[]; se
   const showDriverChangeMarker = laps.length >= DRIVER_CHANGE_MIN_LAPS
 
   return (
-    <div className="bg-gray-900 rounded-lg overflow-hidden">
-      <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider px-4 py-3 border-b border-gray-800">
-        Per-Lap Summary
-      </h3>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="text-xs">
-              <SortableHeader label="Lap" sortKey="lap_number" activeKey={sortKey} activeDir={sortDir} align="left" onSort={handleSort} />
-              <SortableHeader label="Sim Time" sortKey="sim_time_s" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
-              <SortableHeader label="Real Time" sortKey="real_time_s" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
-              <SortableHeader label="Time Err" sortKey="time_error_pct" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
-              <SortableHeader label="Sim Energy" sortKey="sim_energy_kwh" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
-              <SortableHeader label="Real Energy" sortKey="real_energy_kwh" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
-              <SortableHeader label="Energy Err" sortKey="energy_error_pct" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
-              <SortableHeader label="Speed Err" sortKey="mean_speed_error_pct" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
-            </tr>
-          </thead>
-          <tbody>
-            {sortedLaps.map((l) => {
-              const isSelected = selectedLap === l.lap_number
-              const isDriverChange = showDriverChangeMarker && l.lap_number === DRIVER_CHANGE_LAP
-              const rowClass = [
-                'border-t border-gray-800',
-                isSelected ? 'bg-gray-800' : 'hover:bg-gray-800/50',
-                isDriverChange && !isSelected ? 'bg-blue-950/30' : '',
-              ]
-                .filter(Boolean)
-                .join(' ')
-              return (
-                <tr key={l.lap_number} className={rowClass}>
-                  <td className="px-4 py-2 font-medium">
-                    <span className="inline-flex items-center gap-1.5">
-                      <span>#{l.lap_number}</span>
-                      {isDriverChange && (
-                        <span
-                          className="text-[10px] uppercase tracking-wider text-blue-300 bg-blue-900/40 border border-blue-800 rounded px-1.5 py-0.5"
-                          title="Driver change occurred around this lap in Michigan 2025 endurance"
-                          aria-label="Driver change"
-                        >
-                          <span aria-hidden="true">ℹ </span>Driver change
-                        </span>
-                      )}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2 text-right">{l.sim_time_s.toFixed(2)}s</td>
-                  <td className="px-4 py-2 text-right">{l.real_time_s.toFixed(2)}s</td>
-                  <td className={`px-4 py-2 text-right ${errorColor(l.time_error_pct)}`}>
-                    {l.time_error_pct.toFixed(1)}%
-                  </td>
-                  <td className="px-4 py-2 text-right">{l.sim_energy_kwh.toFixed(3)}</td>
-                  <td className="px-4 py-2 text-right">{l.real_energy_kwh.toFixed(3)}</td>
-                  <td className={`px-4 py-2 text-right ${errorColor(l.energy_error_pct)}`}>
-                    {l.energy_error_pct.toFixed(1)}%
-                  </td>
-                  <td className={`px-4 py-2 text-right ${errorColor(l.mean_speed_error_pct)}`}>
-                    {l.mean_speed_error_pct.toFixed(1)}%
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
+    <Card>
+      <CardHeader>
+        <CardTitle>Per-lap results</CardTitle>
+      </CardHeader>
+      <CardBody className="p-0">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-xs">
+                <SortableHeader label="Lap" sortKey="lap_number" activeKey={sortKey} activeDir={sortDir} align="left" onSort={handleSort} />
+                <SortableHeader label="Sim Time" sortKey="sim_time_s" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+                <SortableHeader label="Real Time" sortKey="real_time_s" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+                <SortableHeader label="Time Err" sortKey="time_error_pct" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+                <SortableHeader label="Sim Ah" sortKey="sim_charge_ah" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+                <SortableHeader label="Real Ah" sortKey="real_charge_ah" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+                <SortableHeader label="Ah Err" sortKey="charge_error_pct" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+                <SortableHeader label="Sim Energy" sortKey="sim_energy_kwh" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+                <SortableHeader label="Real Energy" sortKey="real_energy_kwh" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+                <SortableHeader label="Energy Err" sortKey="energy_error_pct" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+                <SortableHeader label="Speed Err" sortKey="mean_speed_error_pct" activeKey={sortKey} activeDir={sortDir} onSort={handleSort} />
+              </tr>
+            </thead>
+            <tbody>
+              {sortedLaps.map((l) => {
+                const isSelected = selectedLap === l.lap_number
+                const isDriverChange = showDriverChangeMarker && l.lap_number === DRIVER_CHANGE_LAP
+                const rowClass = [
+                  'border-t border-[var(--border-subtle)]',
+                  isSelected
+                    ? 'bg-[var(--surface-3)]'
+                    : isDriverChange
+                      ? 'bg-[var(--info-bg)]'
+                      : 'hover:bg-[var(--surface-2)]',
+                ]
+                  .filter(Boolean)
+                  .join(' ')
+                return (
+                  <tr key={l.lap_number} className={rowClass}>
+                    <td className="px-4 py-2 font-medium text-[var(--text-primary)]">
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="tabular-nums">#{l.lap_number}</span>
+                        {isDriverChange && (
+                          <span
+                            className="text-[10px] uppercase tracking-wider rounded px-1.5 py-0.5"
+                            style={{
+                              color: 'var(--info)',
+                              backgroundColor: 'var(--info-bg)',
+                              border: '1px solid var(--border-subtle)',
+                            }}
+                            title="Driver change occurred around this lap in Michigan 2025 endurance"
+                            aria-label="Driver change"
+                          >
+                            <span aria-hidden="true">ℹ </span>Driver change
+                          </span>
+                        )}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums">{l.sim_time_s.toFixed(2)}s</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{l.real_time_s.toFixed(2)}s</td>
+                    <td
+                      className="px-4 py-2 text-right tabular-nums"
+                      style={{ color: errorColor(l.time_error_pct) }}
+                    >
+                      {l.time_error_pct.toFixed(1)}%
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums">{l.sim_charge_ah.toFixed(2)}</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{l.real_charge_ah.toFixed(2)}</td>
+                    <td
+                      className="px-4 py-2 text-right tabular-nums"
+                      style={{ color: errorColor(l.charge_error_pct) }}
+                    >
+                      {l.charge_error_pct.toFixed(1)}%
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums">{l.sim_energy_kwh.toFixed(3)}</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{l.real_energy_kwh.toFixed(3)}</td>
+                    <td
+                      className="px-4 py-2 text-right tabular-nums"
+                      style={{ color: errorColor(l.energy_error_pct) }}
+                    >
+                      {l.energy_error_pct.toFixed(1)}%
+                    </td>
+                    <td
+                      className="px-4 py-2 text-right tabular-nums"
+                      style={{ color: errorColor(l.mean_speed_error_pct) }}
+                    >
+                      {l.mean_speed_error_pct.toFixed(1)}%
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div className="border-t border-[var(--border-subtle)] px-4 py-2 text-xs text-[var(--text-tertiary)]">
+          {laps.length} {laps.length === 1 ? 'lap' : 'laps'}
+        </div>
+      </CardBody>
+    </Card>
   )
 }

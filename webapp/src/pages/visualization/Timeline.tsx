@@ -57,22 +57,26 @@ export default function Timeline({ data }: Props) {
 
   return (
     <div className="flex items-center gap-3 px-4">
-      <span className="text-xs text-gray-400 font-mono w-12">{formatTime(currentTime)}</span>
+      <span className="text-xs text-[var(--text-tertiary)] font-mono tabular-nums w-12">
+        {formatTime(currentTime)}
+      </span>
       <div
         ref={barRef}
-        className="flex-1 h-2 bg-gray-800 rounded cursor-pointer relative"
+        className="flex-1 h-2 bg-[var(--surface-3)] rounded cursor-pointer relative"
         onMouseDown={handleMouseDown}
       >
         <div
-          className="h-full bg-green-500 rounded transition-none"
+          className="h-full bg-[var(--accent)] rounded transition-none"
           style={{ width: `${progress * 100}%` }}
         />
         <div
-          className="absolute top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full shadow"
+          className="absolute top-1/2 w-3 h-3 bg-[var(--text-primary)] rounded-full shadow ring-1 ring-[var(--accent)]"
           style={{ left: `${progress * 100}%`, transform: 'translate(-50%, -50%)' }}
         />
       </div>
-      <span className="text-xs text-gray-400 font-mono w-12">{formatTime(data.total_time_s)}</span>
+      <span className="text-xs text-[var(--text-tertiary)] font-mono tabular-nums w-12">
+        {formatTime(data.total_time_s)}
+      </span>
     </div>
   )
 }

@@ -112,12 +112,13 @@ export interface SectorComparison {
 }
 export interface LapSummary {
   lap_number: number; sim_time_s: number; real_time_s: number; time_error_pct: number;
+  sim_charge_ah: number; real_charge_ah: number; charge_error_pct: number;
   sim_energy_kwh: number; real_energy_kwh: number; energy_error_pct: number;
   mean_speed_error_pct: number
 }
 export interface ValidationResponse {
   lap_number: number; speed: TraceData; throttle: TraceData; brake: TraceData;
-  power: TraceData; soc: TraceData; lat_accel: TraceData;
+  power: TraceData; charge_ah: TraceData; lat_accel: TraceData;
   track_sim_speed: number[]; track_real_speed: number[];
   sectors: SectorComparison[]; metrics: ValidationMetric[]
 }
@@ -133,6 +134,77 @@ export interface VizFrame {
 export interface VisualizationResponse {
   lap_number: number; total_time_s: number; total_frames: number; frames: VizFrame[];
   track_centerline_x: number[]; track_centerline_y: number[]; track_speed_colors: number[]
+}
+
+// Simulate page — request/response mirror backend/models/simulate.py
+export interface SocCurrentPoint {
+  soc_pct: number
+  max_current_a: number
+}
+export interface SimulateRequest {
+  max_rpm: number
+  max_torque_nm: number
+  soc_discharge_map: SocCurrentPoint[]
+}
+export interface SimulateLapResult {
+  lap_number: number
+  time_s: number
+  charge_used_ah: number
+  energy_used_kwh: number
+  mean_speed_kmh: number
+  peak_speed_kmh: number
+  end_soc_pct: number
+}
+export interface SimulateTimeSeries {
+  distance_m: number[]
+  speed_kmh: number[]
+  pack_power_w: number[]
+  pack_current_a: number[]
+  soc_pct: number[]
+  cumulative_charge_ah: number[]
+}
+export interface SimulateAggregate {
+  total_time_s: number
+  net_ah: number
+  net_kwh: number
+  completed_laps: number
+  target_laps: number
+  final_soc_pct: number
+}
+export interface SimulateResponse {
+  request: SimulateRequest
+  summary: SimulateAggregate
+  laps: SimulateLapResult[]
+  time_series: SimulateTimeSeries
+  baseline: SimulateAggregate
+  baseline_laps: SimulateLapResult[]
+  baseline_time_series: SimulateTimeSeries
+  notes: string[]
+}
+
+/**
+ * Run an override endurance simulation. Throws ApiError on non-2xx; the page
+ * owns user-facing feedback (no toast here so the inline state can render
+ * cleanly without competing notifications).
+ */
+export async function runSimulation(
+  req: SimulateRequest,
+  signal?: AbortSignal,
+): Promise<SimulateResponse> {
+  const res = await fetch(`${API_BASE}/simulate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+    signal,
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as
+      | { detail?: string }
+      | null
+    const detail = body?.detail ?? res.statusText
+    throw new ApiError(res.status, detail)
+  }
+  return res.json() as Promise<SimulateResponse>
 }
 
 // SWR hooks
