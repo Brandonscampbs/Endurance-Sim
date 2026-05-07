@@ -375,7 +375,6 @@ class VehicleDynamics:
     # that have since been re-derived independently. After closed-loop
     # grade de-biasing, the 95% winsorized coast-down mean is 35.5 N
     # (the raw mean is dominated by a few stop/coast outliers).
-    # See scripts/calibrate_physics.py.
     _PARASITIC_DRAG_N: float = 35.0
 
     def parasitic_drag(self) -> float:
