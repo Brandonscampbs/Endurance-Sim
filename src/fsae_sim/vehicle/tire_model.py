@@ -324,6 +324,16 @@ class PacejkaTireModel:
         pey2 = lat_get("PEY2", 0.0)
         pey3 = lat_get("PEY3", 0.0)
         pey4 = lat_get("PEY4", 0.0)
+        # sign(alpha_star) introduces a step discontinuity at alpha_star = 0
+        # in the curvature factor when (pey3 + pey4 * camber_rad) != 0.
+        # This is the textbook PAC2002 form (Pacejka §4.3.2 eq. 4.E11), but
+        # numerically it produces a small jump in dFy/d(alpha) right at
+        # zero slip. For the physical regime relevant to FSAE (|alpha|
+        # always > a few millirad once cornering), the discontinuity is
+        # invisible. Documented here so future calibration / autodiff work
+        # is not surprised by the kink at alpha = 0. A C¹-smooth alternative
+        # is `sign_a = math.tanh(alpha_star * k)` for large k, but that
+        # changes the textbook formula and is not adopted.
         sign_a = 1.0 if alpha_star >= 0.0 else -1.0
         ey = (pey1 + pey2 * dfz) * (
             1.0 - (pey3 + pey4 * camber_rad) * sign_a
@@ -517,7 +527,21 @@ class PacejkaTireModel:
         inner_xa0 = bxa_sh - exa * (bxa_sh - math.atan(bxa_sh))
         gxa_den = math.cos(cxa * math.atan(inner_xa0))
 
-        gxa = gxa_num / gxa_den if abs(gxa_den) > 1e-9 else 1.0
+        # Tightened from 1e-9 to 1e-6: at the slip-zero edge case the
+        # cos() denominator can be close to but not at zero, and a tiny
+        # numerator/denominator ratio at very small alpha can wobble
+        # outside [0, 1] from floating-point noise.  Pacejka §4.3.4
+        # mandates Gxα ∈ [0, 1] (G-factors are non-amplifying); the
+        # final clamp below enforces that bound regardless of which
+        # branch this guard takes.
+        gxa = gxa_num / gxa_den if abs(gxa_den) > 1e-6 else 1.0
+        # Clamp to [0, 1] per Pacejka §4.3.4: G-factors must be
+        # non-negative and not amplify pure-slip force.  PAC2002's
+        # orthodox formulation can return values slightly outside this
+        # bound (~0.1 %) at small |α| due to the normalized-cos shape;
+        # the clamp restores the textbook invariant without altering
+        # the well-formed interior of the surface.
+        gxa = max(0.0, min(gxa, 1.0))
 
         # === Gyk: slip-ratio reduction of Fy ===
         rby1 = self._lat("RBY1")
@@ -546,7 +570,11 @@ class PacejkaTireModel:
         inner_yk0 = byk_sh - eyk * (byk_sh - math.atan(byk_sh))
         gyk_den = math.cos(cyk * math.atan(inner_yk0))
 
-        gyk = gyk_num / gyk_den if abs(gyk_den) > 1e-9 else 1.0
+        # Tightened from 1e-9 to 1e-6: see Gxα guard above.  The same
+        # slip-zero edge case applies to Gyκ in the κ → 0 limit.
+        gyk = gyk_num / gyk_den if abs(gyk_den) > 1e-6 else 1.0
+        # Clamp to [0, 1] per Pacejka §4.3.4 (see Gxα clamp above).
+        gyk = max(0.0, min(gyk, 1.0))
 
         # === Svyk: kappa-induced side force ===
         rvy1 = self._lat("RVY1")
