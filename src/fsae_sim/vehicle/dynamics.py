@@ -89,12 +89,21 @@ class VehicleDynamics:
         # Effective mass: bare mass + rotational inertia of spinning components.
         # Use the configured rolling radius so motor RPM, wheel force, and
         # rotational inertia all share one driveline geometry.
+        #
+        # Drivetrain efficiency is a power-flow / force concept, NOT a
+        # kinematic inertia property. It belongs in drive_force / regen_force
+        # (already applied there as × η motoring, × 1/η regen) — not here.
+        # KE = (1/2) m_eff v² is a state function of speed alone; a
+        # direction-dependent inertia term would violate KE conservation.
+        # The earlier audit recommendation of `× G²/η` for the regen
+        # direction was a misdiagnosis (M13).
+        # Refs: Genta §5.2; Krause/Wasynczuk/Sudhoff §3.5; TUMFTM
+        # laptime-simulation `__compute_m_eq`.
         if powertrain_config is not None:
             tire_radius = powertrain_config.rolling_radius_m
             G = powertrain_config.gear_ratio
-            eta = powertrain_config.drivetrain_efficiency
             j_eff = (
-                vehicle.rotor_inertia_kg_m2 * G * G * eta
+                vehicle.rotor_inertia_kg_m2 * G * G
                 + 4 * vehicle.wheel_inertia_kg_m2
             )
             self.m_effective: float = vehicle.mass_kg + j_eff / (tire_radius * tire_radius)
