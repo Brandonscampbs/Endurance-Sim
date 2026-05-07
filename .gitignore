@@ -21,3 +21,6 @@ webapp/dist/
 
 # Superpowers brainstorm sessions
 .superpowers/
+
+# Local defensive copies of untracked work
+.plan-backups/
