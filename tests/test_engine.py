@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 from fsae_sim.data.loader import load_aim_csv, load_voltt_csv
-from fsae_sim.driver.strategies import CoastOnlyStrategy
 from fsae_sim.driver.strategy import ControlAction, ControlCommand, DriverStrategy, SimState
 from fsae_sim.sim.engine import SimulationEngine, SimResult
 from fsae_sim.track.track import Segment, Track
@@ -64,13 +63,6 @@ def simple_track():
 @pytest.fixture
 def engine_full_throttle(vehicle_config, battery_model, simple_track):
     strategy = FullThrottleStrategy()
-    return SimulationEngine(vehicle_config, simple_track, strategy, battery_model)
-
-
-@pytest.fixture
-def engine_coast(vehicle_config, battery_model, simple_track):
-    dynamics = VehicleDynamics(vehicle_config.vehicle)
-    strategy = CoastOnlyStrategy(dynamics)
     return SimulationEngine(vehicle_config, simple_track, strategy, battery_model)
 
 
@@ -157,27 +149,6 @@ class TestPhysicalSanity:
         result = engine_full_throttle.run(num_laps=1)
         times = result.states["time_s"].values
         assert np.all(np.diff(times) > 0)
-
-
-# ---------------------------------------------------------------------------
-# Strategy interactions
-# ---------------------------------------------------------------------------
-
-class TestStrategyInteractions:
-
-    def test_coast_uses_less_energy(self, engine_full_throttle, engine_coast):
-        r_throttle = engine_full_throttle.run(num_laps=1)
-        r_coast = engine_coast.run(num_laps=1)
-        assert r_coast.total_energy_kwh < r_throttle.total_energy_kwh
-
-    def test_coast_uses_less_energy_than_throttle(self, engine_full_throttle, engine_coast):
-        """Coast strategy should consume less energy (may also be slower)."""
-        r_throttle = engine_full_throttle.run(num_laps=1)
-        r_coast = engine_coast.run(num_laps=1)
-        # With downforce, the corner speed limit can be high enough that
-        # coast and full-throttle produce similar lap times. But coast
-        # always uses less energy.
-        assert r_coast.total_energy_kwh <= r_throttle.total_energy_kwh
 
 
 # ---------------------------------------------------------------------------

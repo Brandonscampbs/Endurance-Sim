@@ -535,12 +535,11 @@ class SimulationEngine:
                 # 2. Speed limit from pre-computed envelope
                 speed_limit = float(v_max[seg_idx])
 
-                # 2a. D-09: honor zone-level ``max_speed_ms`` from the
-                # driver's ControlCommand.metadata.  CalibratedStrategy /
-                # PedalProfileStrategy can carry a per-zone cap that the
-                # envelope doesn't see (e.g. driver-discipline cap below
-                # the tire-limit envelope).  Take the min so whichever
-                # constraint is tighter wins.
+                # 2a. Honor zone-level ``max_speed_ms`` from the driver's
+                # ControlCommand.metadata. CalibratedStrategy can carry a
+                # per-zone cap that the envelope doesn't see (e.g. driver-
+                # discipline cap below the tire-limit envelope). Take the
+                # min so whichever constraint is tighter wins.
                 if cmd.metadata is not None:
                     meta_cap = cmd.metadata.get("max_speed_ms")
                     if meta_cap is not None:

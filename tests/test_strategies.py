@@ -4,11 +4,7 @@ import numpy as np
 import pytest
 
 from fsae_sim.driver.strategy import ControlAction, SimState
-from fsae_sim.driver.strategies import (
-    CoastOnlyStrategy,
-    ReplayStrategy,
-    ThresholdBrakingStrategy,
-)
+from fsae_sim.driver.strategies import ReplayStrategy
 from fsae_sim.track.track import Segment, Track
 from fsae_sim.vehicle.dynamics import VehicleDynamics
 from fsae_sim.vehicle.vehicle import VehicleParams
@@ -232,78 +228,6 @@ class TestReplayStrategy:
         assert strategy.measured_electrical_power(50.0) == pytest.approx(4000.0)
 
 
-# ---------------------------------------------------------------------------
-# CoastOnlyStrategy
-# ---------------------------------------------------------------------------
-
-class TestCoastOnlyStrategy:
-
-    def test_throttle_when_slow(self, dynamics, sim_state_slow, corner_segment):
-        strategy = CoastOnlyStrategy(dynamics)
-        # corner speed limit ~13.6 m/s, car at 5 m/s → throttle
-        cmd = strategy.decide(sim_state_slow, [corner_segment])
-        assert cmd.action == ControlAction.THROTTLE
-        assert cmd.throttle_pct == 1.0
-
-    def test_coast_when_near_limit(self, dynamics, corner_segment):
-        strategy = CoastOnlyStrategy(dynamics, coast_margin_ms=2.0)
-        # With downforce, corner speed limit is higher (~15+ m/s)
-        limit = dynamics.max_cornering_speed(corner_segment.curvature)
-        state = SimState(0, 50.0, limit - 1.0, 0.9, 440, 20, 30, 0, 0)
-        cmd = strategy.decide(state, [corner_segment])
-        assert cmd.action == ControlAction.COAST
-
-    def test_never_brakes(self, dynamics, sim_state_fast, corner_segment):
-        strategy = CoastOnlyStrategy(dynamics)
-        # even when speed exceeds limit, should only coast
-        state = SimState(0, 50.0, 20.0, 0.9, 440, 30, 30, 0, 0)
-        cmd = strategy.decide(state, [corner_segment])
-        assert cmd.action != ControlAction.BRAKE
-
-    def test_throttle_with_no_upcoming(self, dynamics, sim_state_fast):
-        strategy = CoastOnlyStrategy(dynamics)
-        cmd = strategy.decide(sim_state_fast, [])
-        assert cmd.action == ControlAction.THROTTLE
-
-    def test_name(self, dynamics):
-        assert CoastOnlyStrategy(dynamics).name == "coast_only"
-
-
-# ---------------------------------------------------------------------------
-# ThresholdBrakingStrategy
-# ---------------------------------------------------------------------------
-
-class TestThresholdBrakingStrategy:
-
-    def test_throttle_when_slow(self, dynamics, sim_state_slow, corner_segment):
-        strategy = ThresholdBrakingStrategy(dynamics)
-        cmd = strategy.decide(sim_state_slow, [corner_segment])
-        assert cmd.action == ControlAction.THROTTLE
-
-    def test_coast_when_near_limit(self, dynamics, corner_segment):
-        strategy = ThresholdBrakingStrategy(dynamics, coast_margin_ms=3.0)
-        state = SimState(0, 50.0, 12.0, 0.9, 440, 20, 30, 0, 0)
-        cmd = strategy.decide(state, [corner_segment])
-        assert cmd.action == ControlAction.COAST
-
-    def test_brake_when_over_limit(self, dynamics, corner_segment):
-        strategy = ThresholdBrakingStrategy(dynamics, brake_threshold_ms=1.0)
-        # corner limit ~13.6, set speed to 16 → well over limit
-        state = SimState(0, 50.0, 16.0, 0.9, 440, 30, 30, 0, 0)
-        cmd = strategy.decide(state, [corner_segment])
-        assert cmd.action == ControlAction.BRAKE
-        assert cmd.brake_pct > 0.0
-
-    def test_brake_intensity_configurable(self, dynamics, corner_segment):
-        strategy = ThresholdBrakingStrategy(dynamics, brake_intensity=0.8)
-        state = SimState(0, 50.0, 18.0, 0.9, 440, 30, 30, 0, 0)
-        cmd = strategy.decide(state, [corner_segment])
-        assert cmd.brake_pct == 0.8
-
-    def test_name(self, dynamics):
-        assert ThresholdBrakingStrategy(dynamics).name == "threshold_braking"
-
-
 class TestControlCommandMetadata:
     """D-27: ControlCommand supports an optional metadata dict."""
 
@@ -384,89 +308,4 @@ class TestSegmentToZoneIndex:
             assert fast is expected, f"seg {seg}: fast={fast.zone_id} expected={expected.zone_id}"
 
 
-class TestEnvelopeAwareStrategies:
-    """D-20: CoastOnly/ThresholdBraking honor an injected SpeedEnvelope."""
-
-    def test_coast_only_sees_downstream_corner_via_envelope(self, dynamics, corner_segment):
-        from fsae_sim.driver.strategies import CoastOnlyStrategy
-        from fsae_sim.driver.strategy import SimState
-        from fsae_sim.track.track import Segment
-
-        straight = Segment(index=0, distance_start_m=0.0, length_m=5.0, curvature=0.0, grade=0.0)
-        # Synthetic envelope: segment 0 ceiling forced low by a downstream corner.
-        envelope = np.array([5.0, 20.0, 20.0])
-        strat_no_env = CoastOnlyStrategy(dynamics)
-        strat_env = CoastOnlyStrategy(dynamics, envelope=envelope)
-
-        state = SimState(0, 0.0, 8.0, 0.9, 400, 0, 25, 0, 0)
-        # With envelope, segment 0 ceiling is 5 m/s so 8 m/s ⇒ coast.
-        cmd_env = strat_env.decide(state, [straight])
-        assert cmd_env.action == ControlAction.COAST
-
-        # Without envelope, the straight has no corner limit ⇒ throttle.
-        cmd_raw = strat_no_env.decide(state, [straight])
-        assert cmd_raw.action == ControlAction.THROTTLE
-
-    def test_threshold_braking_envelope_brakes_earlier(self, dynamics):
-        from fsae_sim.driver.strategies import ThresholdBrakingStrategy
-        from fsae_sim.driver.strategy import SimState
-        from fsae_sim.track.track import Segment
-
-        # Two "straights" but envelope marks both as pre-corner slow zones.
-        upcoming = [
-            Segment(index=0, distance_start_m=0.0, length_m=5.0, curvature=0.0, grade=0.0),
-            Segment(index=1, distance_start_m=5.0, length_m=5.0, curvature=0.0, grade=0.0),
-        ]
-        envelope = np.array([8.0, 8.0])  # envelope says 8 m/s max here
-        state = SimState(0, 0.0, 20.0, 0.9, 400, 30, 25, 0, 0)
-
-        strat_env = ThresholdBrakingStrategy(
-            dynamics, brake_threshold_ms=1.0, brake_intensity=0.5, envelope=envelope,
-        )
-        strat_raw = ThresholdBrakingStrategy(
-            dynamics, brake_threshold_ms=1.0, brake_intensity=0.5,
-        )
-
-        assert strat_env.decide(state, upcoming).action == ControlAction.BRAKE
-        # Raw strategy sees inf corner speed on straights ⇒ no brake.
-        assert strat_raw.decide(state, upcoming).action != ControlAction.BRAKE
-
-
-class TestCalibratedStrategyWithParams:
-    """D-28: CalibratedStrategy.with_params applies DriverParams multipliers."""
-
-    def _zones(self):
-        from fsae_sim.analysis.telemetry_analysis import DriverZone
-        return [
-            DriverZone(
-                zone_id=0, segment_start=0, segment_end=9,
-                action=ControlAction.THROTTLE, intensity=0.8,
-                distance_start_m=0.0, distance_end_m=500.0, label="all",
-            ),
-        ]
-
-    def test_throttle_scale_halves_intensity(self):
-        from fsae_sim.driver.strategies import CalibratedStrategy, DriverParams
-        from fsae_sim.driver.strategy import SimState
-
-        baseline = CalibratedStrategy(self._zones(), num_segments=10)
-        scaled = baseline.with_params(DriverParams(throttle_scale=0.5))
-
-        state = SimState(0, 0.0, 10.0, 0.9, 400, 0, 25, 0, 3)
-        base_cmd = baseline.decide(state, [])
-        scaled_cmd = scaled.decide(state, [])
-
-        assert base_cmd.throttle_pct == pytest.approx(0.8)
-        assert scaled_cmd.throttle_pct == pytest.approx(0.4)
-
-    def test_max_throttle_caps_value(self):
-        from fsae_sim.driver.strategies import CalibratedStrategy, DriverParams
-        from fsae_sim.driver.strategy import SimState
-
-        baseline = CalibratedStrategy(self._zones(), num_segments=10)
-        capped = baseline.with_params(DriverParams(max_throttle=0.3))
-
-        state = SimState(0, 0.0, 10.0, 0.9, 400, 0, 25, 0, 3)
-        cmd = capped.decide(state, [])
-        assert cmd.throttle_pct == pytest.approx(0.3)
 
