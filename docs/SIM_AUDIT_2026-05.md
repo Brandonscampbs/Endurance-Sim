@@ -143,12 +143,19 @@ Each item: what to change, where, and why it moves the grade.
     energy and time both bias optimistic in the last 4-5 laps — the laps
     that matter most for the efficiency score.
 
-- [ ] **`m_effective` accel-vs-regen direction (issue M13).**
-  - File: `src/fsae_sim/vehicle/dynamics.py:90-100`. Effective mass currently
-    folds rotor inertia × G² × η in both directions.
-  - Fix: in regen direction, use `× G² / η` (mirroring the gearbox-direction
-    fix already present in `regen_force`).
-  - Why: ~1 % bias on regen-energy estimates. Small but real.
+- [x] **`m_effective` should not contain η (issue M13).** RESOLVED 2026-05-07.
+  - File: `src/fsae_sim/vehicle/dynamics.py:96-98`.
+  - Diagnosis: η is a power-flow / force property; it cannot appear in
+    kinetic energy or equivalent inertia. KE is a state function of speed
+    alone (Genta §5.2; Krause/Wasynczuk/Sudhoff §3.5). The earlier audit
+    note proposing `× G²/η` for regen was a misdiagnosis — direction-
+    dependent inertia violates conservation.
+  - Fix: drop η from the rotor-inertia term entirely.
+    `m_eff = m + (J_motor·G² + 4·J_wheel) / r²` — symmetric, no η.
+  - The directional asymmetry between accel and regen lives correctly in
+    `drive_force` (× η) and `regen_force` (× 1/η, S12). It does not need
+    to be re-applied in the inertia term.
+  - Cross-check: TUMFTM `laptime-simulation` `__compute_m_eq` matches.
 
 - [ ] **Coast electrical-power gap (issue 22, ~45 Wh / stint).**
   - File: `src/fsae_sim/vehicle/powertrain_model.py:545-617` (the `coast`

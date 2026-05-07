@@ -49,7 +49,7 @@ Legend: `C*` critical, `S*` significant, `M*` moderate, `m*` minor, `NF-*` new-f
 - **8** `battery_model.py` internal resistance temperature-independent (SOC dependence added by S17; T dependence still pending).
 - **9** `analysis/scoring.py` EFmin falls back to 0 when track distance is unknown (inflates efficiency score on that path).
 - **12** Python sim loop limits throughput.
-- **14** Effective mass includes drivetrain efficiency on rotor inertia.
+- **14** Effective mass includes drivetrain efficiency on rotor inertia. (resolved 2026-05-07: η removed from m_eff; KE-derived inertia cannot depend on a dissipation parameter. See SIM_AUDIT_2026-05.md M13 entry.)
 - **16** Track curvature from GPS acceleration (noisy at low speed).
 - **17** 5 m segment resolution — nominal config entry stale (default now 0.5 m).
 - **19** ISA air density vs Michigan conditions.
@@ -64,7 +64,7 @@ Legend: `C*` critical, `S*` significant, `M*` moderate, `m*` minor, `NF-*` new-f
 - **M8** Camber sign convention undocumented.
 - **M10** Brake distribution load-proportional, not mechanical-bias.
 - **M12** PAC2002 Svy missing LKYG on camber term.
-- **M13** `m_effective` doesn't distinguish accel vs regen direction.
+- **M13** `m_effective` doesn't distinguish accel vs regen direction. (resolved 2026-05-07: η removed from m_eff entirely; direction-dependent inertia would violate KE conservation, so the audit's `× G²/η` proposal was a misdiagnosis. See SIM_AUDIT_2026-05.md P1 entry.)
 - **M14** LONGVL speed correction ignored in Fx.
 - **M15** `max_traction_force` hardcodes 0.3g load-transfer (NF-6 dropped the 0.3g/-1.0g magic from force iter; audit whether this duplicate claim still applies).
 - **M16** Forward-Euler lag between `pack_voltage` and `pack_current`.
