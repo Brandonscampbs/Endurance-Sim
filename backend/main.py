@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.errors import register_exception_handlers
 from backend.middleware import RequestIdLogFilter, RequestIdMiddleware
-from backend.routers import cache, laps, track, validation, visualization
+from backend.routers import cache, laps, simulate, track, validation, visualization
 
 
 def _configure_logging() -> logging.Logger:
@@ -84,6 +84,7 @@ register_exception_handlers(app)
 
 app.include_router(cache.router)
 app.include_router(laps.router)
+app.include_router(simulate.router)
 app.include_router(track.router)
 app.include_router(validation.router)
 app.include_router(visualization.router)
