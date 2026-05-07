@@ -4,8 +4,11 @@ A current-state physics audit of the FSAE EV endurance simulator, graded against
 industry-standard quasi-steady-state (QSS) lap simulators, with a prioritized
 improvement checklist.
 
-This supersedes most of `docs/PHYSICS_AUDIT.md` (which describes a much earlier
-version of the codebase). Where the two disagree, this document is current.
+This is the canonical physics-audit document. The earlier
+`docs/PHYSICS_AUDIT.md` (a critique of a much earlier version of the
+codebase) was retired in commit `ef0da94`; the historical text remains
+accessible at git blob `ef0da94^:docs/PHYSICS_AUDIT.md` for anyone who
+wants to read the original critique.
 
 ---
 
@@ -65,7 +68,7 @@ relative deltas are believable even when absolutes are off.
 
 ---
 
-## What is no longer broken (despite `PHYSICS_AUDIT.md`)
+## What is no longer broken (vs. the retired earlier audit)
 
 The earlier audit's "highest-severity findings" are largely resolved. Verified
 against current source:
@@ -94,8 +97,7 @@ against current source:
   filter, dynamic-curvature reference for outlier replacement, and 2-D
   start/finish gate.
 
-`PHYSICS_AUDIT.md` should be revised or replaced. Do not waste cycles
-re-investigating those.
+Do not waste cycles re-investigating those findings — they are closed.
 
 ---
 
@@ -196,10 +198,6 @@ Each item: what to change, where, and why it moves the grade.
   - File: `src/fsae_sim/physics_constants.py`.
   - Fix: make `AIR_DENSITY_KG_M3` configurable per event from temp/pressure.
     Michigan endurance day should be pulled from local METAR or a config knob.
-
-- [ ] **`docs/PHYSICS_AUDIT.md` is outdated.** Either revise it to reflect
-  current state, or delete and link this document. Most of its findings have
-  been fixed.
 
 ### P3 — bigger projects (defer until P0–P1 done)
 
