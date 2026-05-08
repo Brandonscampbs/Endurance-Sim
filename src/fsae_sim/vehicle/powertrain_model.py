@@ -583,6 +583,121 @@ class PowertrainModel:
     # noise floor on Torque Feedback.
     _COAST_TORQUE_THRESHOLD_NM: float = 0.5
 
+    # Per-phase resistance for the back-EMF rectifier guard branch.
+    # EMRAX 228 phase resistance order-of-magnitude.
+    _BEMF_PHASE_RESISTANCE_OHM: float = 0.05
+
+    def _iron_loss_w(self, omega_m_rad_s: float) -> float:
+        """Stator iron loss = hysteresis + eddy current vs electrical freq.
+
+        ``P_iron = k_h * f_e + k_e * f_e^2`` with
+        ``f_e = pole_pairs * omega_m / (2*pi)`` (Pyrhonen §3.6,
+        Hanselman §10.5). Hysteresis dominates at low f_e, eddy at high.
+
+        Args:
+            omega_m_rad_s: Motor mechanical angular velocity (rad/s).
+
+        Returns:
+            Iron-loss power dissipated in stator (W, >= 0).
+        """
+        coast = self.config.coast_loss
+        f_e = coast.pole_pairs * omega_m_rad_s / (2.0 * math.pi)
+        return coast.k_h_w_per_hz * f_e + coast.k_e_w_per_hz2 * f_e * f_e
+
+    def _windage_loss_w(self, omega_m_rad_s: float) -> float:
+        """Windage + bearing drag, ``P = a*omega + b*omega^2``.
+
+        Linear term covers viscous bearing drag, quadratic term
+        air-windage between rotor and stator (Hanselman §10.5,
+        Pyrhonen §3.7).
+        """
+        coast = self.config.coast_loss
+        return (
+            coast.a_w_w_per_rad_s * omega_m_rad_s
+            + coast.b_w_w_per_rad_s2 * omega_m_rad_s * omega_m_rad_s
+        )
+
+    def _pwm_switch_loss_w(self, pack_voltage_v: float) -> float:
+        """PWM gate-drive overhead at zero phase current.
+
+        Inverter switches at f_sw (~8 kHz on CM200DX) even at zero
+        commanded torque to maintain Iq=Id=0 closed-loop control;
+        gate-drive energy ``E_g`` per device dominates.
+        ``P_pwm ≈ pwm_overhead_w * V_pack / V_nom`` (linear V_pack
+        scaling per Infineon AN2008-03; the gate-charge → P_pwm
+        path scales linearly with bus voltage at constant f_sw).
+        """
+        coast = self.config.coast_loss
+        return coast.pwm_overhead_w * pack_voltage_v / coast.pack_voltage_nominal_v
+
+    def _bemf_rectify_guard_w(
+        self, omega_m_rad_s: float, pack_voltage_v: float,
+    ) -> float:
+        """Passive body-diode rectification guard.
+
+        Only fires when ``V_bemf = K_e * omega_m > V_pack``. On CT-16EV
+        at any sustained operating point this branch is dormant
+        (``K_e=0.045 V/(rad/s)``, ``omega < 700 rad/s`` → V_bemf < 32 V
+        ≪ V_pack ~380 V). Kept as a sanity guard so a future high-K_e
+        motor or low-V_pack stint exposes the physics naturally.
+
+        Returns:
+            0.0 when V_bemf <= V_pack (the normal operating regime on
+            CT-16EV at any RPM with a healthy pack).
+
+            A negative value (regen / pack-charging) when V_bemf
+            exceeds V_pack: the inverter body diodes conduct and the
+            pack absorbs current. Sign matches the rest of
+            ``electrical_power`` (negative = battery charging).
+            Magnitude follows ``P = -V_pack * I`` with
+            ``I = (V_bemf - V_pack) / R_phase``.
+        """
+        v_bemf = self.config.motor_back_emf_constant_v_s_per_rad * omega_m_rad_s
+        if v_bemf <= pack_voltage_v:
+            return 0.0
+        # Rectifier fires: body diodes conduct, pack charges.
+        # I_rectify = overvoltage / R_phase, P = -V_pack * I (negative
+        # = regen / pack-charging, matching the rest of electrical_power).
+        overvoltage = v_bemf - pack_voltage_v
+        i_regen = overvoltage / self._BEMF_PHASE_RESISTANCE_OHM
+        return -pack_voltage_v * i_regen
+
+    def _coast_power_w(
+        self, omega_m_rad_s: float, pack_voltage_v: float | None,
+    ) -> float:
+        """4-term coast electrical-power model + back-EMF guard.
+
+        ``P_coast = P_aux + P_iron(omega) + P_windage(omega)
+                    + P_pwm_switch(V_pack) + P_bemf_rectify(...)``
+
+        Args:
+            omega_m_rad_s: Motor angular velocity (rad/s, > 0).
+            pack_voltage_v: Pack terminal voltage (V). When ``None``,
+                the PWM and rectifier-guard terms are skipped; only
+                aux + iron + windage are returned. This back-compat
+                path lets callers that don't carry pack voltage still
+                see a non-zero coast power, biased low by exactly the
+                PWM contribution.
+
+        Returns:
+            Coast electrical power in W (positive = pack discharge).
+            Net value is the sum of (always positive) loss terms minus
+            the (always non-positive) rectifier contribution. On CT-16EV
+            the rectifier is always 0, so the net is positive in
+            practice; an externally-driven motor (V_bemf > V_pack)
+            could produce a net negative value.
+        """
+        coast = self.config.coast_loss
+        p_aux = coast.p_aux_w
+        p_iron = self._iron_loss_w(omega_m_rad_s)
+        p_windage = self._windage_loss_w(omega_m_rad_s)
+        p_pwm = 0.0
+        p_bemf = 0.0
+        if pack_voltage_v is not None and pack_voltage_v > 0.0:
+            p_pwm = self._pwm_switch_loss_w(pack_voltage_v)
+            p_bemf = self._bemf_rectify_guard_w(omega_m_rad_s, pack_voltage_v)
+        return p_aux + p_iron + p_windage + p_pwm + p_bemf
+
     def electrical_power(
         self,
         motor_torque_nm: float,
@@ -605,10 +720,15 @@ class PowertrainModel:
            ``P_elec = T·ω × η_regen(rpm, |T|)``.  Mechanical input times
            regen efficiency (losses reduce what reaches the pack).
         3. **Coast** (``|motor_torque_nm| ≤ COAST_THRESHOLD``):
-           Back-EMF rectifier model.  If ``K_e·ω > V_pack`` the inverter
-           body diodes conduct and current flows into the pack; otherwise
-           zero current (free-wheeling).  Requires ``pack_voltage_v``; if
-           None, returns 0 (no rectification).
+           4-term physical no-load loss model
+           ``P = P_aux + P_iron(omega) + P_windage(omega) + P_pwm(V_pack)
+           + P_bemf_rectify(omega, V_pack)``. Each term is bounded by
+           datasheet physics (Cascadia CM200DX, EMRAX 228 MV LC). The
+           back-EMF rectifier is a guard (~always 0 at CT-16EV
+           operating points). When ``pack_voltage_v`` is None, the PWM
+           and rectifier terms are skipped — the result is biased low
+           by the PWM contribution (~350 W at nominal V_pack). See
+           :class:`fsae_sim.vehicle.powertrain.CoastLossConfig`.
 
         Args:
             motor_torque_nm: Motor shaft torque in Nm.  Positive = motoring,
@@ -626,36 +746,19 @@ class PowertrainModel:
 
         omega = motor_rpm * self._rad_per_s_per_rpm  # rad/s
 
-        # --- Coast branch: passive back-EMF rectification ---
+        # --- Coast branch: 4-term physical no-load loss model ---
+        # Replaces the previous 0-W coast branch (which lost ~45 Wh per
+        # stint vs. telemetry — issue 22). Each term is tied to a named
+        # mechanism with datasheet-bounded coefficients; calibrate the
+        # full coefficient vector via ``scripts/calibrate_coast_loss.py``
+        # against telemetry for production use.
+        #
+        # Refs: Pyrhonen §3.6 (iron), §3.7 (windage); Hanselman §10.5
+        # (mechanical); Krause/Wasynczuk/Sudhoff §3.5/§6 (PMSM no-load);
+        # Cascadia CM200DX rev D §5.4 (PWM); Infineon AN2008-03
+        # (gate-charge); Mohan/Undeland/Robbins §27-2.
         if abs(motor_torque_nm) <= self._COAST_TORQUE_THRESHOLD_NM:
-            if pack_voltage_v is None or pack_voltage_v <= 0.0:
-                return 0.0
-            v_bemf = self.config.motor_back_emf_constant_v_s_per_rad * omega
-            if v_bemf <= pack_voltage_v:
-                # Body diodes reverse-biased → no current flow.
-                return 0.0
-            # Simplest honest rectifier: assume negligible source
-            # impedance → current limited only by the measured
-            # coast operating point.  We model the overvoltage as
-            # driving current through the battery's own internal
-            # resistance, but without a calibrated R we conservatively
-            # return the power associated with clamping V_bemf to
-            # V_pack — i.e. P = V_pack * I where the inverter sinks
-            # enough current to hold V_bemf = V_pack.  Without the
-            # current limit we can only give an upper bound; return
-            # a small pack-credit scaled by the overvoltage ratio.
-            #
-            # This branch is not exercised under the Michigan stint
-            # (V_bemf < V_pack always at realistic RPMs; see class
-            # constant comment).  Kept honest-and-simple until a
-            # validation point demonstrates it fires.
-            overvoltage = v_bemf - pack_voltage_v
-            # Use a nominal per-phase resistance of 0.05 Ω
-            # (EMRAX 228 phase resistance order of magnitude) so
-            # I = overvoltage / R_phase, P = V_pack * I.
-            R_phase = 0.05
-            i_regen = overvoltage / R_phase
-            return -pack_voltage_v * i_regen
+            return self._coast_power_w(omega, pack_voltage_v)
 
         p_mechanical = motor_torque_nm * omega  # W
 

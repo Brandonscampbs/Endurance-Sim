@@ -321,8 +321,40 @@ class TestElectricalPower:
         p = model.electrical_power(motor_torque_nm=-30.0, motor_rpm=1500.0)
         assert p < 0.0
 
-    def test_zero_torque_gives_zero_power(self, model: PowertrainModel) -> None:
-        assert model.electrical_power(0.0, 1000.0) == 0.0
+    def test_zero_torque_no_pack_voltage_is_aux_iron_windage_only(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Coast branch with V_pack=None contributes only aux + iron + windage.
+
+        Updated for the 4-term physical coast electrical-power model
+        (plan ``2026-05-06-engine-numerics-and-powertrain-losses.md``,
+        issue 22). Previously this test asserted 0 W because the
+        coast branch returned 0 whenever V_bemf < V_pack — that hid
+        the ~45 Wh/stint coast-power bias against telemetry. The new
+        model sums P_aux + P_iron + P_windage when V_pack is omitted
+        (PWM and rectifier require V_pack and are skipped).
+
+        At 1000 RPM with default ``CoastLossConfig``:
+            omega   = 1000 * pi/30 = 104.72 rad/s
+            f_e     = 10 * 1000 / 60 = 166.67 Hz
+            iron    = 0.18 * 166.67 + 1.5e-4 * 166.67^2 = 34.17 W
+            windage = 0.05 * 104.72 + 5e-5 * 104.72^2 = 5.79 W
+            aux     = 40 W
+            total   = 79.96 W (no V_pack -> PWM and rectifier off)
+        """
+        cfg = model.config.coast_loss
+        omega = 1000.0 * math.pi / 30.0
+        f_e = cfg.pole_pairs * 1000.0 / 60.0
+        expected = (
+            cfg.p_aux_w
+            + cfg.k_h_w_per_hz * f_e
+            + cfg.k_e_w_per_hz2 * f_e * f_e
+            + cfg.a_w_w_per_rad_s * omega
+            + cfg.b_w_w_per_rad_s2 * omega * omega
+        )
+        assert model.electrical_power(0.0, 1000.0) == pytest.approx(
+            expected, rel=1e-9,
+        )
 
     def test_zero_rpm_gives_zero_power(self, model: PowertrainModel) -> None:
         """At zero speed there is no back-EMF and no power flow."""
@@ -753,36 +785,111 @@ class TestBackEMFRectification:
     def test_coast_above_bemf_threshold_is_regen(
         self, model: PowertrainModel,
     ) -> None:
-        """K_e=0.045 V/(rad/s). At 2500 RPM ω=261.8 rad/s, V_bemf=11.78 V
-        for a single pole pair — but for EMRAX 228 the effective line-line
-        back-EMF constant scales up.
+        """K_e=0.045 V/(rad/s). At 2500 RPM ω=261.8 rad/s, V_bemf=11.78 V.
 
-        Test with a low pack voltage so V_bemf > V_pack unambiguously.
+        Test with a deliberately low pack voltage so V_bemf > V_pack
+        unambiguously. The back-EMF rectifier guard branch fires:
+        body diodes conduct, pack absorbs current. Net coast power
+        becomes negative (regen) once the rectifier overwhelms the
+        always-positive aux/iron/windage/PWM loss terms.
+
+        Updated for the 4-term physical coast model (plan
+        2026-05-06-engine-numerics-and-powertrain-losses.md): the
+        rectifier branch is now a guard that returns negative power
+        only above the bemf-vs-pack-voltage crossover; the rest of
+        the coast model contributes positive loss terms.
         """
         rpm = 2500.0
         # omega = 261.8 rad/s, V_bemf = 0.045 * 261.8 ≈ 11.78 V
         # Deliberately low pack voltage so back-EMF threshold is crossed.
         V_pack = 5.0
         p = model.electrical_power(0.0, rpm, V_pack)
-        assert p < 0.0, "Coast above back-EMF threshold must return negative (regen) power"
+        # The rectifier overvoltage = 6.78 V at R_phase=0.05 ohm
+        # produces ~135 A discharge into the pack -> -678 W; net is
+        # negative even after the +160 W of aux/iron/windage/PWM.
+        assert p < 0.0, (
+            "Coast above back-EMF threshold must return negative (regen) "
+            "power; rectifier guard fires."
+        )
 
-    def test_coast_below_bemf_threshold_is_zero(
+    def test_coast_below_bemf_threshold_rectifier_off(
         self, model: PowertrainModel,
     ) -> None:
-        """Below V_bemf threshold, coast returns zero power (no current flow)."""
+        """Below V_bemf threshold, the rectifier guard contributes 0;
+        only the aux + iron + windage + PWM loss terms fire.
+
+        Updated for the 4-term physical coast model (plan
+        2026-05-06-engine-numerics-and-powertrain-losses.md, issue 22).
+        Previously this asserted 0 W; the new model returns the
+        sum of always-on physical losses while the rectifier branch
+        stays at 0 because V_bemf << V_pack.
+
+        At 1000 RPM, V_pack=400 V with default ``CoastLossConfig``:
+            V_bemf  = 0.045 * 104.72 = 4.71 V (≪ 400, rectifier OFF)
+            iron    = 0.18 * 166.67 + 1.5e-4 * 166.67^2 ≈ 34.17 W
+            windage = 0.05 * 104.72 + 5e-5 * 104.72^2 ≈ 5.79 W
+            aux     = 40 W
+            pwm     = 350 * 400/390 ≈ 358.97 W
+            total   ≈ 438.93 W
+        """
         rpm = 1000.0
         # omega = 104.7 rad/s, V_bemf = 0.045 * 104.7 ≈ 4.71 V
         # Pack voltage of 400 V is well above, so no rectification.
         V_pack = 400.0
+        cfg = model.config.coast_loss
+        omega = rpm * math.pi / 30.0
+        f_e = cfg.pole_pairs * rpm / 60.0
+        expected_no_rectifier = (
+            cfg.p_aux_w
+            + cfg.k_h_w_per_hz * f_e
+            + cfg.k_e_w_per_hz2 * f_e * f_e
+            + cfg.a_w_w_per_rad_s * omega
+            + cfg.b_w_w_per_rad_s2 * omega * omega
+            + cfg.pwm_overhead_w * V_pack / cfg.pack_voltage_nominal_v
+        )
         p = model.electrical_power(0.0, rpm, V_pack)
-        assert p == 0.0
+        # Rectifier off: total equals sum of physical loss terms only.
+        assert p == pytest.approx(expected_no_rectifier, rel=1e-9)
+        assert p > 0.0, "Coast losses (rectifier off) must be positive."
 
-    def test_coast_no_pack_voltage_is_zero(
+    def test_coast_no_pack_voltage_skips_pwm_and_rectifier(
         self, model: PowertrainModel,
     ) -> None:
-        """Backwards compat: calling without V_pack defaults to no-rectification."""
-        p = model.electrical_power(0.0, 2000.0)
-        assert p == 0.0
+        """Without V_pack, the PWM and rectifier-guard terms are skipped;
+        the aux + iron + windage terms still fire.
+
+        Updated for the 4-term physical coast model (plan
+        2026-05-06-engine-numerics-and-powertrain-losses.md). The
+        previous behavior of returning 0 hid the always-on no-load
+        machine losses (~45 Wh/stint bias on Michigan endurance).
+
+        At 2000 RPM with default ``CoastLossConfig``:
+            f_e     = 333.33 Hz
+            iron    = 0.18 * 333.33 + 1.5e-4 * 333.33^2 ≈ 76.67 W
+            windage = 0.05 * 209.4 + 5e-5 * 209.4^2 ≈ 12.66 W
+            aux     = 40 W
+            pwm     = 0 (no V_pack)
+            total   ≈ 129.33 W
+        """
+        rpm = 2000.0
+        cfg = model.config.coast_loss
+        omega = rpm * math.pi / 30.0
+        f_e = cfg.pole_pairs * rpm / 60.0
+        expected = (
+            cfg.p_aux_w
+            + cfg.k_h_w_per_hz * f_e
+            + cfg.k_e_w_per_hz2 * f_e * f_e
+            + cfg.a_w_w_per_rad_s * omega
+            + cfg.b_w_w_per_rad_s2 * omega * omega
+        )
+        p = model.electrical_power(0.0, rpm)
+        assert p == pytest.approx(expected, rel=1e-9)
+        # PWM contribution must be exactly 0 (V_pack absent).
+        p_with_v = model.electrical_power(
+            0.0, rpm, cfg.pack_voltage_nominal_v,
+        )
+        pwm_contribution = p_with_v - p
+        assert pwm_contribution == pytest.approx(cfg.pwm_overhead_w, rel=1e-9)
 
     def test_motoring_ignores_back_emf(
         self, model: PowertrainModel,
@@ -808,28 +915,49 @@ class TestBackEMFRectification:
 # ---------------------------------------------------------------------------
 
 class TestBackEMFValidationMichigan:
-    """D-17: document the -456 W coast-power validation finding.
+    """D-17: validate coast-power at the Michigan 2025 mean operating point.
 
-    Michigan 2025 mean coast operating point:
+    Michigan 2025 mean coast operating point (telemetry):
       RPM   = 2299 (mean when |Torque Feedback| < 1 Nm)
       V_pack= 410 V (mean pack voltage over stint)
-      P     = -456 W (measured Pack V × I at those samples)
+      P     ≈ +400 W (measured Pack V × I at coast samples; the prior
+                     sign convention had this as -456 W due to a stale
+                     pack-current-direction bug noted in C2/D-17).
 
-    With physics-derived K_e = 0.6366 V·s/rad from EMRAX 228 MV LC
-    datasheet (Kv = 15 RPM/V → K_e = 60 / (2π · Kv)), V_bemf at 2299
-    RPM is ≈ 153 V — well below any realistic pack voltage. So the
-    passive-rectifier model predicts 0 W at this point, not -456 W.
-
-    This test pins that finding so a future change doesn't silently
-    re-introduce a fudge factor.  The -456 W must come from somewhere
-    else (iron losses, inverter standby current, driveline drag seen
-    by the pack) — logged in SIMULATOR_ISSUES.md.
+    The 4-term physical coast model (plan
+    2026-05-06-engine-numerics-and-powertrain-losses.md, issue 22)
+    explains this 250-600 W coast-discharge band as the sum of
+    always-on no-load loss mechanisms (iron, windage, PWM, aux),
+    with the back-EMF rectifier branch dormant
+    (K_e=0.045 V/(rad/s) -> V_bemf at 2299 RPM is ~10.8 V << V_pack).
     """
 
-    def test_michigan_coast_point_rectifier_off(self, model: PowertrainModel) -> None:
-        p = model.electrical_power(0.0, 2299.0, 410.0)
-        # Rectifier off: physics-honest model returns zero.
-        assert p == pytest.approx(0.0, abs=1e-6)
+    def test_michigan_coast_point_rectifier_off(
+        self, model: PowertrainModel,
+    ) -> None:
+        """Rectifier branch is OFF at Michigan coast cruise (V_bemf << V_pack);
+        total coast power lies in the 250..600 W telemetry-observed band.
+
+        Updated for the 4-term physical coast model: previously asserted
+        0 W (the old single-mechanism model). Now the test pins both
+        (a) the rectifier branch stays at 0, and (b) the total coast
+        power matches the telemetry-derived band.
+        """
+        rpm = 2299.0
+        v_pack = 410.0
+        # (a) Confirm rectifier guard contributes 0 at this operating point.
+        omega = rpm * math.pi / 30.0
+        v_bemf = model.config.motor_back_emf_constant_v_s_per_rad * omega
+        assert v_bemf < v_pack, (
+            f"Rectifier guard sanity: V_bemf={v_bemf:.2f} V must be "
+            f"below V_pack={v_pack} V at Michigan coast cruise."
+        )
+        # (b) Total coast power lies in the documented band 250..600 W.
+        p = model.electrical_power(0.0, rpm, v_pack)
+        assert 250.0 <= p <= 600.0, (
+            f"Michigan coast point ({rpm} RPM, {v_pack} V) coast power "
+            f"{p:.1f} W outside telemetry-observed band [250, 600]."
+        )
 
 
 class TestRegenEfficiencyNoDoubleCount:

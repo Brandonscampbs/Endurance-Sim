@@ -8,6 +8,10 @@ PROJECT_ROOT = Path(__file__).parent.parent
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
+# Project root needed so scripts.calibrate_coast_loss et al. resolve
+# as module paths in tests that exercise the calibration scripts.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # Data paths
 DATA_DIR = PROJECT_ROOT / "Real-Car-Data-And-Stats"
