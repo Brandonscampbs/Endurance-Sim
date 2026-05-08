@@ -557,73 +557,94 @@ class SimulationEngine:
 
                 seg_mid_dist = distance + segment.length_m / 2.0
 
-                def resolve_at_operating_speed(
+                def evaluate_forces_at(
                     op_speed_ms: float,
-                ) -> tuple[float, float, float, float, float, float, bool, bool]:
+                ) -> tuple[float, float, float, float, float]:
+                    """Evaluate forces at one operating speed (no cap).
+
+                    Used by both Heun stages. Returns
+                    ``(motor_torque, drive_f, brake_f, regen_f,
+                    resist_f)``. The speed cap is *not* enforced here;
+                    that saturation is applied to the trapezoidal-
+                    average output so energy bookkeeping is unbroken.
+                    """
                     motor_torque_n, drive_n, brake_n, regen_n = command_forces(
                         op_speed_ms, cmd, bms_current_limit, seg_mid_dist,
                     )
                     resist_n = self.dynamics.total_resistance(
                         op_speed_ms, segment.grade, segment.curvature,
                     )
-                    (
-                        exit_v,
-                        drive_n,
-                        brake_n,
-                        net_n,
-                        limited,
-                        violated,
-                    ) = enforce_speed_limit(
-                        speed,
-                        segment.length_m,
-                        drive_n,
-                        brake_n,
-                        regen_n,
-                        resist_n,
-                        speed_limit,
-                    )
                     return (
-                        exit_v,
-                        motor_torque_n,
-                        drive_n,
-                        brake_n,
-                        regen_n,
-                        resist_n,
-                        limited,
-                        violated,
+                        motor_torque_n, drive_n, brake_n, regen_n, resist_n,
                     )
 
-                # Predictor-corrector: estimate exit from entry-speed
-                # forces, then recompute forces at the segment operating
-                # speed. This keeps drag, field weakening, traction limits,
-                # and brake force tied to the speed where the segment is
-                # actually traversed.
+                # Heun's method (RK2 trapezoidal) on the segment.
+                #
+                # Stage 1 (predictor): evaluate forces at entry speed,
+                # solve for the unconstrained predicted exit.
+                # Stage 2 (corrector): evaluate forces at the predicted
+                # exit speed, average with stage-1 forces, solve again.
+                # Final: apply ``enforce_speed_limit`` once on the
+                # corrected output to saturate at the envelope cap
+                # without distorting the segment's energy bookkeeping.
+                #
+                # Reference: Hairer/Norsett/Wanner, Solving ODEs I
+                # (1993) §II.1; Plan
+                # docs/superpowers/plans/2026-05-06-engine-numerics-and-powertrain-losses.md.
+
+                # --- Stage 1: predictor at entry speed ---
+                (
+                    motor_torque_p,
+                    drive_f_p,
+                    brake_f_p,
+                    regen_f_p,
+                    resist_f_p,
+                ) = evaluate_forces_at(speed)
+                net_p = drive_f_p + regen_f_p - brake_f_p - resist_f_p
+                v_predict = solve_exit_speed(speed, segment.length_m, net_p)
+
+                # --- Stage 2: corrector at predicted exit speed ---
+                v_predict_clipped = max(v_predict, self._MIN_SPEED_MS)
+                (
+                    motor_torque_c,
+                    drive_f_c,
+                    brake_f_c,
+                    regen_f_c,
+                    resist_f_c,
+                ) = evaluate_forces_at(v_predict_clipped)
+
+                # --- Trapezoidal average of net forces ---
+                drive_f = 0.5 * (drive_f_p + drive_f_c)
+                brake_f = 0.5 * (brake_f_p + brake_f_c)
+                regen_f = 0.5 * (regen_f_p + regen_f_c)
+                resist_f = 0.5 * (resist_f_p + resist_f_c)
+                motor_torque = 0.5 * (motor_torque_p + motor_torque_c)
+
+                # --- Speed-cap saturation on the corrected output ---
+                # If the unconstrained Heun exit exceeds the envelope,
+                # ``enforce_speed_limit`` rebalances drive/brake to
+                # land exactly at v_cap. Apply only once, at the end,
+                # so the cap-induced work is bookkept in the segment
+                # without a second force evaluation.
                 (
                     exit_speed,
-                    motor_torque,
                     drive_f,
                     brake_f,
-                    regen_f,
-                    resist_f,
+                    net_force,
                     speed_limited,
                     speed_limit_violation,
-                ) = resolve_at_operating_speed(speed)
-                op_speed = (speed + max(exit_speed, 0.0)) / 2.0
-                (
-                    exit_speed,
-                    motor_torque,
+                ) = enforce_speed_limit(
+                    speed,
+                    segment.length_m,
                     drive_f,
                     brake_f,
                     regen_f,
                     resist_f,
-                    corrected_limited,
-                    corrected_violation,
-                ) = resolve_at_operating_speed(op_speed)
-                speed_limited = speed_limited or corrected_limited
-                speed_limit_violation = (
-                    speed_limit_violation or corrected_violation
+                    speed_limit,
                 )
                 exit_speed = max(exit_speed, self._MIN_SPEED_MS)
+                # Recompute net_force after MIN_SPEED clamp so downstream
+                # state reporting is consistent.
                 net_force = drive_f + regen_f - brake_f - resist_f
 
                 avg_speed = (speed + exit_speed) / 2.0
