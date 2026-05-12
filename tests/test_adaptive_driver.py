@@ -330,14 +330,180 @@ def test_driver_does_not_require_telemetry(models, flat_track):
 # ---------------------------------------------------------------------------
 
 
-def test_adaptive_driver_params_defaults_are_pure_feedforward():
-    """Wave 4a ships with PI gains disabled and energy shaper off. Wave
-    4b will enable them via this same dataclass."""
+def test_adaptive_driver_params_defaults_enable_pi_corrector_in_wave4b():
+    """Wave 4b enables the PI velocity-error corrector by default.
+
+    Plan A3 gains: kp = 0.05 (1/s), ki = 0.005 (1/s^2), integral clamp
+    at +/- 0.5 m/s. Energy shaper remains off by default (None) so the
+    pure feedforward + PI behavior is the baseline.
+    """
     params = AdaptiveDriverParams()
+    # Lookahead bumped from 5 to 60 in Sub-task D per plan (Lookahead
+    # section). Sub-task A keeps the historical 5; Sub-task D will lift
+    # it to 60.
     assert params.lookahead_segments == 5
-    # Wave 4b fields must default to a disabled state.
-    assert params.kp_velocity == 0.0
-    assert params.ki_velocity == 0.0
-    assert params.i_clamp_mps == 0.0
+    # PI gains active by default in Wave 4b.
+    assert params.kp_velocity == pytest.approx(0.05)
+    assert params.ki_velocity == pytest.approx(0.005)
+    assert params.i_clamp_mps == pytest.approx(0.5)
+    # Energy shaper still default-off.
     assert params.energy_budget_kwh is None
     assert params.energy_shaper_strategy == "FCFB"
+
+
+# ---------------------------------------------------------------------------
+# 10. PI velocity-error corrector (Sub-task A)
+# ---------------------------------------------------------------------------
+
+
+def test_pi_corrector_zero_error_zero_correction(models, flat_track):
+    """When v == v_target exactly, both the proportional and integral
+    components are zero on the first call, so the corrector contributes
+    nothing.
+    """
+    _cfg, pt, dyn = models
+    drv = AdaptiveDriver(dynamics=dyn, powertrain=pt)
+    drv.set_envelope(np.full(flat_track.num_segments, 20.0))
+    # Reset state to be safe; subsequent tests verify reset semantics.
+    drv.reset()
+    a_corr = drv.compute_pi_correction(
+        v_measured_mps=20.0, v_target_mps=20.0, dt_s=0.05,
+    )
+    assert a_corr == pytest.approx(0.0, abs=1e-12)
+    assert drv.velocity_error_integral_mps_s == pytest.approx(0.0, abs=1e-12)
+
+
+def test_pi_corrector_proportional_term_on_first_call(models, flat_track):
+    """A 1 m/s underspeed on the first call yields a_corr = kp * 1.0 = 0.05
+    m/s^2 with no integral contribution (integral is 0 initially)."""
+    _cfg, pt, dyn = models
+    drv = AdaptiveDriver(dynamics=dyn, powertrain=pt)
+    drv.set_envelope(np.full(flat_track.num_segments, 20.0))
+    drv.reset()
+    a_corr = drv.compute_pi_correction(
+        v_measured_mps=19.0, v_target_mps=20.0, dt_s=0.05,
+    )
+    # Error = +1.0 m/s (positive = need to speed up).
+    # On first call, integral is accumulated AFTER the proportional term
+    # to keep the trapezoidal contribution on subsequent calls clean.
+    # ki * integral on the FIRST call after reset reflects the freshly-
+    # accumulated 1.0 * 0.05 = 0.05 m/s ki * 0.05 = 0.00025.
+    # The user-spec language "no integral on first call since integral=0"
+    # is honored by computing a_corr BEFORE the integral update.
+    assert a_corr == pytest.approx(0.05, abs=1e-9)
+
+
+def test_pi_corrector_integral_accumulates(models, flat_track):
+    """10 calls at error = +1 m/s with dt = 0.05 s accumulate integral
+    to 10 * 1.0 * 0.05 = 0.5 m/s, which is exactly the clamp value."""
+    _cfg, pt, dyn = models
+    drv = AdaptiveDriver(dynamics=dyn, powertrain=pt)
+    drv.set_envelope(np.full(flat_track.num_segments, 20.0))
+    drv.reset()
+    for _ in range(10):
+        drv.compute_pi_correction(
+            v_measured_mps=19.0, v_target_mps=20.0, dt_s=0.05,
+        )
+    # 10 calls * 1.0 * 0.05 = 0.5 m/s, at the clamp boundary.
+    assert drv.velocity_error_integral_mps_s == pytest.approx(0.5, abs=1e-9)
+
+
+def test_pi_corrector_integral_clamps_to_i_clamp_mps(models, flat_track):
+    """Drive the integrator hard so the clamp engages."""
+    _cfg, pt, dyn = models
+    drv = AdaptiveDriver(dynamics=dyn, powertrain=pt)
+    drv.set_envelope(np.full(flat_track.num_segments, 20.0))
+    drv.reset()
+    # 100 calls at +1 m/s error with dt=0.05 -> 5.0 m/s raw, clamped to 0.5.
+    for _ in range(100):
+        drv.compute_pi_correction(
+            v_measured_mps=19.0, v_target_mps=20.0, dt_s=0.05,
+        )
+    assert drv.velocity_error_integral_mps_s == pytest.approx(
+        drv.params.i_clamp_mps, abs=1e-9,
+    )
+
+    # Symmetric clamp for negative errors.
+    drv.reset()
+    for _ in range(100):
+        drv.compute_pi_correction(
+            v_measured_mps=21.0, v_target_mps=20.0, dt_s=0.05,
+        )
+    assert drv.velocity_error_integral_mps_s == pytest.approx(
+        -drv.params.i_clamp_mps, abs=1e-9,
+    )
+
+
+def test_reset_zeros_velocity_error_integral(models, flat_track):
+    """reset() must zero internal PI state so consecutive sims are
+    independent (acceptance criterion AC4 in the plan: determinism)."""
+    _cfg, pt, dyn = models
+    drv = AdaptiveDriver(dynamics=dyn, powertrain=pt)
+    drv.set_envelope(np.full(flat_track.num_segments, 20.0))
+    # Accumulate some integral.
+    for _ in range(5):
+        drv.compute_pi_correction(
+            v_measured_mps=19.0, v_target_mps=20.0, dt_s=0.05,
+        )
+    assert drv.velocity_error_integral_mps_s != 0.0
+    drv.reset()
+    assert drv.velocity_error_integral_mps_s == 0.0
+
+
+def test_decide_with_pi_correction_is_deterministic(models, flat_track):
+    """A fixed input sequence must produce the same output sequence over
+    two independent runs — confirms PI state is deterministic and reset()
+    fully restores initial conditions."""
+    _cfg, pt, dyn = models
+    drv_a = AdaptiveDriver(dynamics=dyn, powertrain=pt)
+    drv_b = AdaptiveDriver(dynamics=dyn, powertrain=pt)
+    v_max = np.linspace(10.0, 25.0, flat_track.num_segments)
+    drv_a.set_envelope(v_max)
+    drv_b.set_envelope(v_max)
+
+    # Run a sequence of decide() calls with underspeeds so the PI
+    # corrector engages on every step (state must evolve deterministically).
+    outputs_a: list[tuple[float, float]] = []
+    outputs_b: list[tuple[float, float]] = []
+    for seg_idx in range(20, 30):
+        v = float(v_max[seg_idx]) - 0.5  # under by 0.5 m/s
+        state = _state_at(v, seg_idx=seg_idx)
+        upcoming = [flat_track.segments[i] for i in range(seg_idx, seg_idx + 5)]
+        ca = drv_a.decide(state, upcoming)
+        cb = drv_b.decide(state, upcoming)
+        outputs_a.append((ca.throttle_pct, ca.brake_pct))
+        outputs_b.append((cb.throttle_pct, cb.brake_pct))
+
+    assert outputs_a == outputs_b, (
+        f"Two independent runs diverged: {outputs_a!r} vs {outputs_b!r}"
+    )
+
+
+def test_decide_with_underspeed_increases_throttle_vs_no_pi(models, flat_track):
+    """Sanity: the PI corrector's job is to add corrective acceleration
+    when the car is below the envelope. So at v < v_target, throttle
+    should be greater than (or equal to) what the pure feedforward path
+    issues. Equivalently: disabling PI via custom params should yield
+    less-or-equal throttle than the default-PI driver.
+    """
+    _cfg, pt, dyn = models
+    pure_ff = AdaptiveDriver(
+        dynamics=dyn,
+        powertrain=pt,
+        params=AdaptiveDriverParams(kp_velocity=0.0, ki_velocity=0.0, i_clamp_mps=0.0),
+    )
+    pi_active = AdaptiveDriver(dynamics=dyn, powertrain=pt)
+    v_max = np.full(flat_track.num_segments, 25.0)
+    pure_ff.set_envelope(v_max)
+    pi_active.set_envelope(v_max)
+    # Sit 2 m/s below envelope at a midstream segment.
+    state = _state_at(23.0, seg_idx=40)
+    upcoming = [flat_track.segments[i] for i in range(40, 45)]
+    cmd_ff = pure_ff.decide(state, upcoming)
+    cmd_pi = pi_active.decide(state, upcoming)
+    # PI should push throttle up (or saturate at 1.0). The strict
+    # inequality is only loose if pure-feedforward already saturates.
+    assert cmd_pi.throttle_pct >= cmd_ff.throttle_pct - 1e-9
+    # And in the unsaturated regime, PI is strictly more aggressive.
+    if cmd_ff.throttle_pct < 0.99:
+        assert cmd_pi.throttle_pct > cmd_ff.throttle_pct

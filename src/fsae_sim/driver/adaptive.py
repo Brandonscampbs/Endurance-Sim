@@ -105,12 +105,16 @@ class AdaptiveDriverParams:
     lookahead_segments: int = 5
     default_bms_current_limit_a: float = 200.0
 
-    # Wave 4b: PI velocity-error tracking. Defaults disabled.
-    kp_velocity: float = 0.0  # Wave 4b
-    ki_velocity: float = 0.0  # Wave 4b
-    i_clamp_mps: float = 0.0  # Wave 4b
+    # Wave 4b Sub-task A: PI velocity-error corrector. Plan A3 defaults.
+    # The corrector closes the loop on small QSS modeling errors that
+    # would otherwise drift across a stint. Gains derived analytically
+    # in the plan; kept conservative so they cannot destabilize the
+    # forward integration when the segment grid changes.
+    kp_velocity: float = 0.05  # proportional gain (1/s)
+    ki_velocity: float = 0.005  # integral gain (1/s^2)
+    i_clamp_mps: float = 0.5  # anti-windup clamp on the integral (m/s)
 
-    # Wave 4b: energy shaping. Defaults disabled (FCFB).
+    # Wave 4b: energy shaping. Defaults disabled (FCFB = pass-through).
     energy_budget_kwh: float | None = None  # Wave 4b
     energy_shaper_strategy: str = "FCFB"  # Wave 4b: "FCFB" | "LBP" | "LS"
 
@@ -152,6 +156,12 @@ class AdaptiveDriver:
         self._params = params if params is not None else AdaptiveDriverParams()
         self._envelope: np.ndarray | None = None
         self._bms_current_limit_a: float = self._params.default_bms_current_limit_a
+        # PI velocity-error integrator (Sub-task A).
+        self._velocity_error_integral_mps_s: float = 0.0
+        # Engine wires set_envelope() before reset() in normal flow, so
+        # the integrator naturally starts at zero. Tests can call reset()
+        # explicitly to guard against stale state when re-driving the
+        # same driver instance.
 
     # ------------------------------------------------------------------
     # Configuration hooks (driven by the engine; see Wave 4b)
@@ -167,12 +177,85 @@ class AdaptiveDriver:
         return False
 
     def set_envelope(self, v_max: np.ndarray) -> None:
-        """Install the pre-computed speed envelope (m/s per segment)."""
+        """Install the pre-computed speed envelope (m/s per segment).
+
+        Does NOT reset PI integrator state — that is the caller's
+        responsibility, because the engine may push a refreshed envelope
+        mid-stint (BMS lap-refresh) and we do not want to discard the
+        accumulated integral every time the envelope is recomputed.
+        Use :meth:`reset` at the *start* of a sim run instead.
+        """
         self._envelope = np.asarray(v_max, dtype=np.float64).copy()
 
     def set_bms_limit(self, bms_current_limit_a: float) -> None:
         """Update the BMS reference used by the inverse pedal solve."""
         self._bms_current_limit_a = float(bms_current_limit_a)
+
+    # ------------------------------------------------------------------
+    # PI velocity-error corrector (Sub-task A)
+    # ------------------------------------------------------------------
+
+    @property
+    def velocity_error_integral_mps_s(self) -> float:
+        """Current integral state in m/s.
+
+        Exposed for tests and for instrumentation; callers should not
+        mutate this directly — use :meth:`reset` to zero it.
+        """
+        return self._velocity_error_integral_mps_s
+
+    def reset(self) -> None:
+        """Reset internal PI integrator state.
+
+        Called by the engine at the start of each sim run so back-to-back
+        runs with the same driver instance produce deterministic output
+        (acceptance criterion AC4 in the plan).
+        """
+        self._velocity_error_integral_mps_s = 0.0
+
+    def compute_pi_correction(
+        self,
+        *,
+        v_measured_mps: float,
+        v_target_mps: float,
+        dt_s: float,
+    ) -> float:
+        """Return the corrective acceleration ``a_corr`` (m/s^2).
+
+        Closed-loop correction: ``a_corr = kp * e + ki * integral`` where
+        ``e = v_target - v_measured`` (positive = need to speed up).
+
+        The proportional term is computed BEFORE the integral update so
+        a single-call evaluation at integral=0 returns ``kp * e`` exactly
+        (user spec: "no integral on first call since integral=0"). The
+        integral is then accumulated and clamped to ``+/- i_clamp_mps``.
+
+        Args:
+            v_measured_mps: Current vehicle speed (m/s).
+            v_target_mps: Envelope target speed at the current segment.
+            dt_s: Time elapsed since the previous call (s). Used only
+                to scale the integrator: ``integral += e * dt``.
+
+        Returns:
+            Corrective acceleration in m/s^2 to add to the feedforward
+            target acceleration. Sign convention: positive = push the
+            car faster, negative = pull it back below the envelope.
+        """
+        error_mps = float(v_target_mps) - float(v_measured_mps)
+        # Proportional contribution at the entry-time integral state.
+        a_corr = (
+            self._params.kp_velocity * error_mps
+            + self._params.ki_velocity * self._velocity_error_integral_mps_s
+        )
+        # Accumulate the integral with anti-windup clamp.
+        self._velocity_error_integral_mps_s += error_mps * float(dt_s)
+        clamp = self._params.i_clamp_mps
+        if clamp > 0.0:
+            if self._velocity_error_integral_mps_s > clamp:
+                self._velocity_error_integral_mps_s = clamp
+            elif self._velocity_error_integral_mps_s < -clamp:
+                self._velocity_error_integral_mps_s = -clamp
+        return float(a_corr)
 
     # ------------------------------------------------------------------
     # Decision (the inverse force-balance solve)
@@ -220,6 +303,22 @@ class AdaptiveDriver:
         a_target = (target_exit_ms * target_exit_ms - v_entry * v_entry) / (
             2.0 * seg_len
         )
+
+        # PI velocity-error correction (Sub-task A). When the measured
+        # speed drifts from the envelope target at the current segment,
+        # add a corrective acceleration that the feedforward layer would
+        # not otherwise produce. dt is approximated by the segment
+        # transit time at v_op so the integrator scales with the actual
+        # time spent at this state.
+        v_target_now_ms = float(self._envelope[idx])
+        dt_seg_s = seg_len / max(v_op, 0.5)
+        a_corr = self.compute_pi_correction(
+            v_measured_mps=v_entry,
+            v_target_mps=v_target_now_ms,
+            dt_s=dt_seg_s,
+        )
+        a_target += a_corr
+
         m_eff = float(self._dyn.m_effective)
         f_resist = float(
             self._dyn.total_resistance(
