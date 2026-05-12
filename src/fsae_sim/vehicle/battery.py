@@ -1,6 +1,7 @@
 """Battery pack configuration."""
 
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -10,9 +11,22 @@ class DischargeLimitPoint:
     max_current_a: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class BatteryConfig:
-    """Battery pack configuration parameters."""
+    """Battery pack configuration parameters.
+
+    Forced-convection pack cooling uses ``h_eff(v) = h_static + k_v · v``.
+    CT-16EV (2025) has no active cooling, but the enclosure does see air
+    over the vents at speed.  The linear chord is the leading term of an
+    Incropera/DeWitt §7 flat-plate forced-convection correlation
+    (``Nu ∝ Re^{0.8}`` collapses to a near-linear ``h(v)`` over the
+    5–28 m/s band the car operates in).
+
+    The legacy ``thermal_conductance_w_per_k`` kwarg is retained as a
+    constructor-only alias for ``h_static_w_per_k`` (with
+    ``k_v_w_per_k_per_ms`` defaulting to 0) so prior configs and tests
+    continue to pass bit-identically.  Passing both names is an error.
+    """
     cell_type: str
     series: int
     parallel: int
@@ -24,14 +38,53 @@ class BatteryConfig:
     discharge_limits: tuple[DischargeLimitPoint, ...]
     cell_capacity_ah: float = 4.5  # Molicel P45B default; P50B = 5.0
     pack_structural_thermal_mass_kj_per_k: float = 7.5  # ≈25% of cell thermal mass (busbars, plates, enclosure)
-    # Passive cooling: Newton's law h·(T_cell − T_ambient).
-    # CT-16EV (2025) has no active cooling — enclosure is effectively
-    # adiabatic on endurance-lap timescales.  Default is 0 (no cooling)
-    # to match the real car; override in the config when the 2026 car
-    # gets a cooling system.  With h > 0 the model has a proper
-    # equilibrium instead of ramping until the BMS kills power.
-    thermal_conductance_w_per_k: float = 0.0
+    h_static_w_per_k: float = 0.0
+    k_v_w_per_k_per_ms: float = 0.0
     ambient_temperature_c: float = 25.0
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        legacy = kwargs.pop("thermal_conductance_w_per_k", None)
+        if legacy is not None:
+            if "h_static_w_per_k" in kwargs:
+                raise TypeError(
+                    "BatteryConfig: cannot pass both "
+                    "'thermal_conductance_w_per_k' (legacy alias) and "
+                    "'h_static_w_per_k'"
+                )
+            kwargs["h_static_w_per_k"] = float(legacy)
+
+        names = [f.name for f in fields(type(self))]
+        bound: dict[str, Any] = {}
+        for i, a in enumerate(args):
+            if i >= len(names):
+                raise TypeError(
+                    f"BatteryConfig takes at most {len(names)} positional "
+                    f"arguments ({len(args)} given)"
+                )
+            bound[names[i]] = a
+        for k, v in kwargs.items():
+            if k not in names:
+                raise TypeError(
+                    f"BatteryConfig got an unexpected keyword argument {k!r}"
+                )
+            if k in bound:
+                raise TypeError(
+                    f"BatteryConfig got multiple values for argument {k!r}"
+                )
+            bound[k] = v
+        for f in fields(type(self)):
+            if f.name in bound:
+                continue
+            if f.default is not MISSING:
+                bound[f.name] = f.default
+            elif f.default_factory is not MISSING:  # type: ignore[misc]
+                bound[f.name] = f.default_factory()
+            else:
+                raise TypeError(
+                    f"BatteryConfig missing required argument {f.name!r}"
+                )
+        for n, v in bound.items():
+            object.__setattr__(self, n, v)
 
     @property
     def pack_voltage_min_v(self) -> float:
@@ -73,6 +126,10 @@ class BatteryConfig:
             kwargs["thermal_conductance_w_per_k"] = float(
                 data["thermal_conductance_w_per_k"]
             )
+        if "h_static_w_per_k" in data:
+            kwargs["h_static_w_per_k"] = float(data["h_static_w_per_k"])
+        if "k_v_w_per_k_per_ms" in data:
+            kwargs["k_v_w_per_k_per_ms"] = float(data["k_v_w_per_k_per_ms"])
         if "ambient_temperature_c" in data:
             kwargs["ambient_temperature_c"] = float(
                 data["ambient_temperature_c"]

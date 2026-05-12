@@ -83,7 +83,7 @@ def configure_battery_mock(batt: MagicMock) -> None:
     batt.pack_voltage.return_value = 400.0
     batt.max_discharge_current.return_value = 100.0
     batt.step_power.side_effect = (
-        lambda power_w, _dt_s, _soc, _temp, time_s=None: (
+        lambda power_w, _dt_s, _soc, _temp, time_s=None, vehicle_speed_ms=0.0: (
             90.0, 26.0, 395.0, power_w / 400.0,
         )
     )

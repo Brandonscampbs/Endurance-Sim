@@ -1,0 +1,11 @@
+# Pack thermal forced-convection calibration
+# h_eff(v) = h_static + k_v * v   [W/K, m/s -> W/K]
+# Source: scripts/calibrate_thermal.py against CleanedEndurance.csv
+# Closes audit P2 issue 4.
+h_static_w_per_k: 0.500000
+k_v_w_per_k_per_ms: 0.037900
+ambient_temperature_c: 29.000
+# n_samples: 32294
+# mean_residual_k: 0.2753
+# peak_residual_k: 0.7927
+# final_residual_k: -0.2728

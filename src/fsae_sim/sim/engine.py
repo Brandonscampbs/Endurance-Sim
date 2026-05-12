@@ -800,6 +800,7 @@ class SimulationEngine:
                 new_soc, new_temp, new_voltage, pack_current = (
                     self.battery_model.step_power(
                         elec_power, seg_time, soc, temp, time_s=time,
+                        vehicle_speed_ms=avg_speed,
                     )
                 )
                 if abs(pack_current) > 1e-9:

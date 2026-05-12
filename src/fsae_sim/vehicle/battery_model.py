@@ -858,6 +858,44 @@ class BatteryModel:
             return power / max(floor_v, 1e-9)
         return (ocv - math.sqrt(discriminant)) / (2.0 * r_pack)
 
+    def heat_out_w(self, temp_c: float, vehicle_speed_ms: float = 0.0) -> float:
+        """Pack heat rejection rate (W) under forced convection.
+
+        ``h_eff(v) = h_static + k_v · |v|`` is the linear chord of an
+        Incropera/DeWitt §7 flat-plate forced-convection correlation
+        over the operating-speed band (5–28 m/s on Michigan endurance);
+        the Reynolds-number nonlinearity is below the calibration noise
+        floor at these speeds.  When ``v=0`` (default), the model
+        collapses to ``h_static`` — the legacy static-only conductance,
+        bit-identical to the pre-change formulation.
+
+        Sign convention: positive = heat *leaving* the pack (cooling).
+        At ``T_pack ≤ T_ambient`` the model goes negative (the pack
+        absorbs heat from ambient), which is correct physics for very
+        cold starts but a regime CT-16EV never sees on a Michigan
+        endurance afternoon.
+
+        Args:
+            temp_c: Pack (mean cell) temperature in Celsius.
+            vehicle_speed_ms: Vehicle speed in m/s.  Default 0 → static
+                convection only, matching the pre-change formulation.
+
+        Returns:
+            Heat-out rate in W, ``h_eff(v) · (T_pack − T_ambient)``.
+
+        References:
+            Incropera, F.P. & DeWitt, D.P., *Fundamentals of Heat and
+            Mass Transfer* 7e (Wiley 2011), Ch. 7 (external flow),
+            §7.2 (flat plate); plan
+            ``docs/superpowers/plans/2026-05-06-battery-upgrades.md``
+            Part 2.
+        """
+        h_eff = (
+            self.config.h_static_w_per_k
+            + self.config.k_v_w_per_k_per_ms * abs(vehicle_speed_ms)
+        )
+        return h_eff * (temp_c - self.config.ambient_temperature_c)
+
     def step_power(
         self,
         terminal_power_w: float,
@@ -866,8 +904,20 @@ class BatteryModel:
         temp_c: float,
         *,
         time_s: float | None = None,
+        vehicle_speed_ms: float = 0.0,
     ) -> tuple[float, float, float, float]:
         """Advance battery state from a terminal power trace.
+
+        Args:
+            terminal_power_w: Pack-terminal electrical power (W).
+                Positive = discharge, negative = regen.
+            dt_s: Timestep in seconds.
+            soc_pct: Current state-of-charge (percent, 0–100).
+            temp_c: Current mean cell temperature (Celsius).
+            time_s: Optional simulation time (for violation events).
+            vehicle_speed_ms: Vehicle speed (m/s) at this timestep,
+                used in the forced-convection ``h_eff(v)`` model.
+                Default 0 collapses to legacy static-only cooling.
 
         Returns:
             (new_soc_pct, new_mean_cell_temp_c, pack_voltage_v, pack_current_a)
@@ -876,7 +926,9 @@ class BatteryModel:
             terminal_power_w, soc_pct, time_s=time_s,
         )
         new_soc, new_temp, pack_voltage = self.step(
-            pack_current, dt_s, soc_pct, temp_c, time_s=time_s,
+            pack_current, dt_s, soc_pct, temp_c,
+            time_s=time_s,
+            vehicle_speed_ms=vehicle_speed_ms,
         )
         return new_soc, new_temp, pack_voltage, pack_current
 
@@ -888,6 +940,7 @@ class BatteryModel:
         temp_c: float,
         *,
         time_s: float | None = None,
+        vehicle_speed_ms: float = 0.0,
     ) -> tuple[float, float, float]:
         """Advance battery state by one timestep.
 
@@ -897,6 +950,10 @@ class BatteryModel:
             soc_pct: Current state-of-charge (percent, 0-100).
             temp_c: Current mean cell temperature (Celsius).
             time_s: Optional simulation time (for violation events).
+            vehicle_speed_ms: Vehicle speed (m/s) at this timestep,
+                used in the forced-convection ``h_eff(v)`` model.
+                Default 0 reproduces the legacy static-only cooling
+                term (``h_static · ΔT``).
 
         Returns:
             (new_soc_pct, new_mean_cell_temp_c, pack_voltage_v)
@@ -917,17 +974,16 @@ class BatteryModel:
         # Pack voltage at updated SOC
         v_pack = self.pack_voltage(new_soc, pack_current_a, time_s=time_s)
 
-        # Thermal model: lumped I^2*R heating plus passive cooling.
-        # S15: thermal mass includes structural components.
-        # Newton cooling h·A·(T − T_ambient) prevents unbounded drift
-        # during sustained discharge — without it the model has no
-        # equilibrium and every long sim crosses the BMS kill temp.
+        # Thermal model: lumped I^2*R heating plus speed-dependent
+        # forced-convection cooling ``h_eff(v) · (T − T_ambient)``.
+        # S15: thermal mass includes structural components.  Issue 4
+        # (P2 audit): the constant ``thermal_conductance_w_per_k`` is
+        # replaced by ``h_eff(v) = h_static + k_v · v``; see
+        # :meth:`heat_out_w`.
         r_cell = self.internal_resistance(new_soc)
         heat_in_w = cell_current ** 2 * r_cell * self._num_cells
-        heat_out_w = self.config.thermal_conductance_w_per_k * (
-            temp_c - self.config.ambient_temperature_c
-        )
-        net_heat_w = heat_in_w - heat_out_w
+        q_out_w = self.heat_out_w(temp_c, vehicle_speed_ms=vehicle_speed_ms)
+        net_heat_w = heat_in_w - q_out_w
         thermal_mass = self._thermal_mass_j_per_k
         dtemp = (net_heat_w * dt_s) / thermal_mass if thermal_mass > 0 else 0.0
         new_temp = temp_c + dtemp
