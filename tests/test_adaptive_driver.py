@@ -479,6 +479,35 @@ def test_decide_with_pi_correction_is_deterministic(models, flat_track):
     )
 
 
+def test_decide_with_energy_shaper_none_matches_no_shaping(models, flat_track):
+    """Regression guard: with ``energy_shaper = None`` (the default),
+    ``decide()`` produces bitwise-identical output to the same driver
+    constructed without any shaper reference. Sub-task B must not
+    perturb the Wave 4a / Sub-task A code path.
+    """
+    _cfg, pt, dyn = models
+    # Default params -> no shaper attached.
+    drv_default = AdaptiveDriver(dynamics=dyn, powertrain=pt)
+    # Explicit None for clarity.
+    drv_explicit_none = AdaptiveDriver(
+        dynamics=dyn,
+        powertrain=pt,
+        params=AdaptiveDriverParams(energy_shaper=None),
+    )
+    v_max = np.linspace(10.0, 25.0, flat_track.num_segments)
+    drv_default.set_envelope(v_max)
+    drv_explicit_none.set_envelope(v_max)
+    for seg_idx in range(10, 30):
+        v = float(v_max[seg_idx]) - 0.3
+        state = _state_at(v, seg_idx=seg_idx)
+        upcoming = [flat_track.segments[i] for i in range(seg_idx, seg_idx + 5)]
+        cmd_a = drv_default.decide(state, upcoming)
+        cmd_b = drv_explicit_none.decide(state, upcoming)
+        assert cmd_a.throttle_pct == cmd_b.throttle_pct
+        assert cmd_a.brake_pct == cmd_b.brake_pct
+        assert cmd_a.action == cmd_b.action
+
+
 def test_decide_with_underspeed_increases_throttle_vs_no_pi(models, flat_track):
     """Sanity: the PI corrector's job is to add corrective acceleration
     when the car is below the envelope. So at v < v_target, throttle

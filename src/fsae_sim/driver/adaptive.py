@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.optimize import brentq
 
+from fsae_sim.driver.energy_shaper import EnergyShaper
 from fsae_sim.driver.strategy import (
     ControlAction,
     ControlCommand,
@@ -114,9 +115,16 @@ class AdaptiveDriverParams:
     ki_velocity: float = 0.005  # integral gain (1/s^2)
     i_clamp_mps: float = 0.5  # anti-windup clamp on the integral (m/s)
 
-    # Wave 4b: energy shaping. Defaults disabled (FCFB = pass-through).
-    energy_budget_kwh: float | None = None  # Wave 4b
-    energy_shaper_strategy: str = "FCFB"  # Wave 4b: "FCFB" | "LBP" | "LS"
+    # Wave 4b Sub-task B: energy-budget shaper. Defaults to None which
+    # means "no shaping" (FCFB pass-through). Provide an EnergyShaper
+    # instance to engage attenuation behavior. The historical placeholder
+    # fields ``energy_budget_kwh`` and ``energy_shaper_strategy`` are
+    # retained as construction helpers for callers that want defaults
+    # without instantiating an EnergyShaper directly; if both are set
+    # we still consume ``energy_shaper`` (explicit beats implicit).
+    energy_shaper: EnergyShaper | None = None  # Wave 4b
+    energy_budget_kwh: float | None = None  # legacy / helper for ad-hoc setups
+    energy_shaper_strategy: str = "FCFB"  # legacy / helper
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +166,14 @@ class AdaptiveDriver:
         self._bms_current_limit_a: float = self._params.default_bms_current_limit_a
         # PI velocity-error integrator (Sub-task A).
         self._velocity_error_integral_mps_s: float = 0.0
+        # Energy-shaper state (Sub-task B). The engine pushes the running
+        # net-kWh / lap-index / lap-progress through ``set_energy_state``
+        # before each ``decide()``; absent that, the shaper sees a
+        # zero-spend state and returns ``v_max`` unchanged, so the
+        # default behavior is bit-identical to the Wave 4a feedforward.
+        self._energy_used_kwh: float = 0.0
+        self._lap_index: int = 0
+        self._segment_progress: float = 0.0
         # Engine wires set_envelope() before reset() in normal flow, so
         # the integrator naturally starts at zero. Tests can call reset()
         # explicitly to guard against stale state when re-driving the
@@ -191,6 +207,24 @@ class AdaptiveDriver:
         """Update the BMS reference used by the inverse pedal solve."""
         self._bms_current_limit_a = float(bms_current_limit_a)
 
+    def set_energy_state(
+        self,
+        *,
+        energy_used_kwh: float,
+        lap_index: int,
+        segment_progress: float,
+    ) -> None:
+        """Push current stint energy / lap state for the energy shaper.
+
+        Called by the engine before each ``decide()`` when an energy
+        shaper is attached so the shaper has the live spend reference.
+        When no shaper is attached this is a cheap noop — the driver
+        does not introspect the state.
+        """
+        self._energy_used_kwh = float(energy_used_kwh)
+        self._lap_index = int(lap_index)
+        self._segment_progress = float(segment_progress)
+
     # ------------------------------------------------------------------
     # PI velocity-error corrector (Sub-task A)
     # ------------------------------------------------------------------
@@ -205,13 +239,16 @@ class AdaptiveDriver:
         return self._velocity_error_integral_mps_s
 
     def reset(self) -> None:
-        """Reset internal PI integrator state.
+        """Reset internal PI integrator and energy-shaper state.
 
         Called by the engine at the start of each sim run so back-to-back
         runs with the same driver instance produce deterministic output
         (acceptance criterion AC4 in the plan).
         """
         self._velocity_error_integral_mps_s = 0.0
+        self._energy_used_kwh = 0.0
+        self._lap_index = 0
+        self._segment_progress = 0.0
 
     def compute_pi_correction(
         self,
@@ -293,6 +330,20 @@ class AdaptiveDriver:
         seg = upcoming[0]
         seg_len = max(float(seg.length_m), 1e-6)
         v_entry = max(float(state.speed), 0.0)
+
+        # Energy shaper attenuation (Sub-task B). Pure feedforward when
+        # ``params.energy_shaper is None``; when present, attenuate the
+        # next-segment target speed against the stint budget. The PI
+        # corrector below sees the shaped target so it does not fight
+        # the shaper.
+        shaper = self._params.energy_shaper
+        if shaper is not None:
+            target_exit_ms = float(shaper.shape_target_speed(
+                target_exit_ms,
+                energy_used_kwh=self._energy_used_kwh,
+                lap_index=self._lap_index,
+                segment_progress=self._segment_progress,
+            ))
 
         # Mid-segment operating speed mirrors the engine's predictor-
         # corrector midpoint — keeps the inverse and forward solves in
