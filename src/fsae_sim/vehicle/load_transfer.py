@@ -121,6 +121,16 @@ class LoadTransferModel:
         rl = rr = rear_axle / 2.0
         return (fl, fr, rl, rr)
 
+    def _air_density(self) -> float:
+        """Air density (kg/m^3) from ``vehicle.environment`` with ISA fallback.
+
+        See :class:`fsae_sim.vehicle.environment.EnvironmentConfig`.
+        """
+        env = getattr(self._vehicle, "environment", None)
+        if env is None:
+            return AIR_DENSITY
+        return env.air_density_kg_m3
+
     def aero_loads(self, speed_ms: float) -> tuple[float, float]:
         """Return aerodynamic downforce per axle.
 
@@ -133,7 +143,7 @@ class LoadTransferModel:
         Returns:
             (delta_front, delta_rear) downforce in Newtons per axle.
         """
-        dynamic_pressure = 0.5 * AIR_DENSITY * speed_ms * speed_ms
+        dynamic_pressure = 0.5 * self._air_density() * speed_ms * speed_ms
         total_downforce = dynamic_pressure * self._vehicle.downforce_coefficient
         delta_front = total_downforce * self._downforce_dist_front
         delta_rear = total_downforce * (1.0 - self._downforce_dist_front)

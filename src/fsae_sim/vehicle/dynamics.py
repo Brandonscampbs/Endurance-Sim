@@ -125,12 +125,24 @@ class VehicleDynamics:
     # Resistance forces  (all return positive magnitudes)
     # ------------------------------------------------------------------
 
+    def _air_density(self) -> float:
+        """Air density (kg/m^3) from the attached ``EnvironmentConfig``.
+
+        Falls back to the ``physics_constants.AIR_DENSITY_KG_M3`` ISA
+        constant when ``vehicle.environment`` is not present (legacy
+        constructions that bypassed the dataclass default).
+        """
+        env = getattr(self.vehicle, "environment", None)
+        if env is None:
+            return AIR_DENSITY_KG_M3
+        return env.air_density_kg_m3
+
     def drag_force(self, speed_ms: float) -> float:
         """Aerodynamic drag (N).  F = 0.5 * rho * Cd * A * v^2."""
         v = abs(speed_ms)
         return (
             0.5
-            * AIR_DENSITY_KG_M3
+            * self._air_density()
             * self.vehicle.drag_coefficient
             * self.vehicle.frontal_area_m2
             * v * v
@@ -141,7 +153,7 @@ class VehicleDynamics:
         v = abs(speed_ms)
         return (
             0.5
-            * AIR_DENSITY_KG_M3
+            * self._air_density()
             * self.vehicle.downforce_coefficient
             * v * v
         )
@@ -460,7 +472,7 @@ class VehicleDynamics:
 
         # With downforce: (m*g + 0.5*rho*ClA*v^2)*mu = m*v^2*kappa
         # v^2 * (m*kappa - 0.5*rho*ClA*mu) = m*g*mu
-        rho = AIR_DENSITY_KG_M3
+        rho = self._air_density()
         denom = m * kappa - 0.5 * rho * cl_a * mu
         if denom <= 0:
             # Downforce dominates: effectively unlimited speed for this curvature

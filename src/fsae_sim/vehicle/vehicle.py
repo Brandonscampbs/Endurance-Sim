@@ -1,11 +1,12 @@
 """Top-level vehicle configuration."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 from fsae_sim.vehicle.battery import BatteryConfig
+from fsae_sim.vehicle.environment import EnvironmentConfig
 from fsae_sim.vehicle.powertrain import PowertrainConfig
 
 
@@ -31,6 +32,12 @@ class VehicleParams:
     # FSAE-typical max; override in configs/ct16ev.yaml when the DSS Brake
     # System sheet provides a measured value.
     brake_max_pressure_bar: float = 60.0
+    # Per-event ambient-air state (replaces the bare
+    # ``physics_constants.AIR_DENSITY_KG_M3`` global).  Default block is
+    # the Michigan International Speedway endurance day; override per
+    # event from local METAR.  Frozen dataclasses cannot share mutable
+    # defaults, so we use ``field(default_factory=EnvironmentConfig)``.
+    environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 
     def __post_init__(self) -> None:
         if self.mass_kg <= 0.0:

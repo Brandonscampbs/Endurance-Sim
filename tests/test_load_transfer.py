@@ -11,6 +11,7 @@ import math
 
 import pytest
 
+from fsae_sim.vehicle.environment import EnvironmentConfig
 from fsae_sim.vehicle.load_transfer import (
     AIR_DENSITY,
     GRAVITY,
@@ -26,7 +27,13 @@ from fsae_sim.vehicle.vehicle import SuspensionConfig, VehicleParams
 
 @pytest.fixture
 def vehicle() -> VehicleParams:
-    """CT-16EV vehicle parameters from DSS."""
+    """CT-16EV vehicle parameters from DSS.
+
+    Pins ``environment`` to ISA sea-level (15 °C, 101325 Pa, 0 % RH) so
+    the hand-calculated downforce values below remain valid after the
+    ``VehicleParams.environment`` default migrated to Michigan
+    conditions (rho ≈ 1.144 kg/m³).
+    """
     return VehicleParams(
         mass_kg=278.0,
         frontal_area_m2=1.0,
@@ -34,6 +41,11 @@ def vehicle() -> VehicleParams:
         rolling_resistance=0.015,
         wheelbase_m=1.549,
         downforce_coefficient=2.18,
+        environment=EnvironmentConfig(
+            ambient_temp_c=15.0,
+            ambient_pressure_pa=101325.0,
+            relative_humidity=0.0,
+        ),
     )
 
 
@@ -120,10 +132,19 @@ class TestAeroLoads:
         assert df_r == pytest.approx(257.16, abs=0.01)
 
     def test_aero_sum_equals_total(self, model: LoadTransferModel) -> None:
-        """Front + rear must equal 0.5*rho*v^2*ClA."""
+        """Front + rear must equal 0.5*rho*v^2*ClA at the model's air density.
+
+        The model resolves rho from the attached ``EnvironmentConfig``
+        (ISA pinned in this fixture).  The fixture's ISA EnvironmentConfig
+        density (computed from first principles via ideal gas + Magnus)
+        is 1.22498 kg/m^3 — within 2e-5 kg/m^3 of the legacy
+        ``AIR_DENSITY`` constant 1.225 but not bit-identical.  Use the
+        model's actual density for the invariant.
+        """
         speed = 80.0 / 3.6
         df_f, df_r = model.aero_loads(speed)
-        q = 0.5 * AIR_DENSITY * speed * speed
+        rho = model._air_density()  # actual rho the model used
+        q = 0.5 * rho * speed * speed
         expected_total = q * 2.18
         assert (df_f + df_r) == pytest.approx(expected_total, abs=0.01)
 
