@@ -498,11 +498,13 @@ class AdaptiveDriver:
         ``f_decel_required_n`` Newtons of decel beyond resistance.
 
         Default brake-bias (plan A1): regen first, up to the motor
-        envelope at this RPM; friction brakes for any remainder.
-        Wave 4a reports the combined brake-pedal fraction through
-        ``brake_pct``. Channel-split metadata for regen vs friction
-        is deferred to Wave 4b (when the strategy can route it to a
-        dedicated regen channel in the engine).
+        envelope at this RPM; friction brakes for any remainder. Wave
+        4b Sub-task C splits the channels at the strategy boundary —
+        ``brake_pct`` carries the hydraulic-friction component (no
+        electrical effect) and ``regen_request_pct`` carries the motor
+        regen request (negative motor torque -> negative pack current).
+        The engine routes each to its own physics in the adaptive
+        dispatch branch.
         """
         # Regen ceiling at this rpm — driver can recover up to this
         # without touching mechanical brakes.
@@ -535,21 +537,21 @@ class AdaptiveDriver:
                 1.0, f_friction_needed / friction_capacity_n,
             )
 
-        # The total brake-pedal command the engine consumes. Wave 4a
-        # collapses regen + friction into one brake-pedal value because
-        # the engine's force-balance treats `brake_pct` as the friction
-        # pedal and the existing regen path is gated by replay-only
-        # negative-torque commands. Wave 4b adds the channel-split
-        # plumbing.
+        # Regen pedal fraction is reported separately on the
+        # ``regen_request_pct`` channel; the engine routes it through
+        # ``regen_force`` / the negative-torque path so battery
+        # bookkeeping is correct.
         regen_pedal_fraction = (
             f_regen_used / max(f_regen_max, 1e-6) if f_regen_max > 0 else 0.0
         )
-        brake_pct = max(0.0, min(1.0, max(brake_pct_friction, regen_pedal_fraction)))
+        brake_pct = max(0.0, min(1.0, brake_pct_friction))
+        regen_request_pct = max(0.0, min(1.0, regen_pedal_fraction))
 
         return ControlCommand(
             action=ControlAction.BRAKE,
             throttle_pct=0.0,
             brake_pct=brake_pct,
+            regen_request_pct=regen_request_pct,
         )
 
     # ------------------------------------------------------------------

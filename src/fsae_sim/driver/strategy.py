@@ -27,12 +27,22 @@ class ControlCommand:
             the 99th-percentile recorded brake-line pressure. NF-30:
             this is NOT the same as "fraction of max regen torque."
             Consumers that need a regen-torque command must map
-            pressure→regen explicitly; see `regen_force`.
+            pressure->regen explicitly; see `regen_force`.
+        regen_request_pct: Wave 4b Sub-task C — fraction of motor regen
+            envelope to command, in [0, 1]. Separate from ``brake_pct``
+            so the engine can split mechanical-brake force (hydraulic
+            friction, no electrical effect) from regen-brake force
+            (negative motor torque -> negative pack current). Existing
+            strategies (Replay, Calibrated, PedalReplay) leave it at
+            0.0 — they get regen via the recorded negative-torque
+            channel (Replay) or do not model it (Calibrated). Only
+            AdaptiveStrategy populates this field.
     """
 
     action: ControlAction
     throttle_pct: float = 0.0  # 0 to 1
     brake_pct: float = 0.0  # 0 to 1 — brake-PRESSURE fraction, not regen-torque
+    regen_request_pct: float = 0.0  # 0 to 1 — fraction of motor regen envelope
     # D-27: optional extensibility hook for zone-level metadata such as
     # ``max_speed_ms`` (D-09), without forcing every strategy/consumer to
     # update dataclass signatures. Default is None so existing call sites

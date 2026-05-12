@@ -42,6 +42,7 @@ from fsae_sim.analysis.telemetry_analysis import (
 
 if TYPE_CHECKING:
     from fsae_sim.driver.adaptive import AdaptiveDriver, AdaptiveDriverParams
+    from fsae_sim.vehicle import VehicleConfig
     from fsae_sim.vehicle.powertrain_model import PowertrainModel
 
 
@@ -852,6 +853,26 @@ class AdaptiveStrategy(DriverStrategy):
             dynamics=dynamics, powertrain=powertrain, params=self._params,
         )
 
+    @classmethod
+    def from_config(
+        cls,
+        vehicle_config: "VehicleConfig",
+        track: Track,
+        *,
+        params: "AdaptiveDriverParams | None" = None,
+    ) -> "AdaptiveStrategy":
+        """Convenience constructor that builds dynamics + powertrain
+        directly from a :class:`VehicleConfig`. Used by the engine
+        dispatch and the validation harness.
+        """
+        from fsae_sim.vehicle.powertrain_model import PowertrainModel
+        pt = PowertrainModel(vehicle_config.powertrain)
+        dyn = VehicleDynamics(
+            vehicle_config.vehicle,
+            powertrain_config=vehicle_config.powertrain,
+        )
+        return cls(dynamics=dyn, powertrain=pt, track=track, params=params)
+
     # ------------------------------------------------------------------
     # Configuration plumbing (mirrors the CalibratedStrategy/Replay API)
     # ------------------------------------------------------------------
@@ -880,6 +901,28 @@ class AdaptiveStrategy(DriverStrategy):
     def set_bms_limit(self, bms_current_limit_a: float) -> None:
         """Hook for the engine's per-lap BMS-refresh path."""
         self._driver.set_bms_limit(bms_current_limit_a)
+
+    def reset(self) -> None:
+        """Reset the wrapped driver's internal state (PI, energy shaper).
+
+        Called by the engine at the start of each run so back-to-back
+        sims with the same strategy instance are deterministic.
+        """
+        self._driver.reset()
+
+    def set_energy_state(
+        self,
+        *,
+        energy_used_kwh: float,
+        lap_index: int,
+        segment_progress: float,
+    ) -> None:
+        """Forward energy-shaper state from the engine to the driver."""
+        self._driver.set_energy_state(
+            energy_used_kwh=energy_used_kwh,
+            lap_index=lap_index,
+            segment_progress=segment_progress,
+        )
 
     # ------------------------------------------------------------------
     # DriverStrategy protocol

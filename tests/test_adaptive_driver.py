@@ -236,7 +236,13 @@ def test_ramp_up_throttle_increases_with_demand(models):
 
 
 def test_ramp_down_envelope_commands_brake_no_throttle(driver, flat_track):
-    """v_max(s+ds) < v_max(s) -> brake (and/or regen) > 0; throttle = 0."""
+    """v_max(s+ds) < v_max(s) -> brake or regen > 0; throttle = 0.
+
+    Sub-task C split the brake-pedal channel into hydraulic friction
+    (``brake_pct``) and motor regen (``regen_request_pct``). A mild
+    decel that fits within the motor regen envelope can be satisfied
+    entirely with regen, leaving ``brake_pct == 0``.
+    """
     n = flat_track.num_segments
     v_max = np.linspace(30.0, 10.0, n, dtype=np.float64)
     driver.set_envelope(v_max)
@@ -244,9 +250,11 @@ def test_ramp_down_envelope_commands_brake_no_throttle(driver, flat_track):
     upcoming = [flat_track.segments[i] for i in range(40, 45)]
     cmd = driver.decide(state, upcoming)
     assert cmd.throttle_pct == pytest.approx(0.0, abs=1e-6)
-    assert cmd.brake_pct > 0.0, (
+    total_decel_demand = cmd.brake_pct + cmd.regen_request_pct
+    assert total_decel_demand > 0.0, (
         f"Ramp-down envelope must invoke brake/regen, got "
-        f"brake_pct={cmd.brake_pct:.4f}"
+        f"brake_pct={cmd.brake_pct:.4f}, regen_request_pct="
+        f"{cmd.regen_request_pct:.4f}"
     )
     assert cmd.action == ControlAction.BRAKE
 
@@ -280,19 +288,26 @@ def test_saturation_unphysical_demand_does_not_crash(driver, flat_track):
 # ---------------------------------------------------------------------------
 
 
-def test_decide_is_deterministic(driver, flat_track):
-    """Calling decide() twice with identical state must yield identical
-    commands. No RNG anywhere."""
+def test_decide_is_deterministic_after_reset(driver, flat_track):
+    """Calling decide() with identical state on a freshly reset()
+    driver must yield identical commands. Sub-task A added an
+    internal PI integrator, so this regression test now resets the
+    driver between calls — see ``test_decide_with_pi_correction_is_
+    deterministic`` for the multi-call sequence determinism guarantee.
+    """
     n = flat_track.num_segments
     v_max = np.linspace(10.0, 25.0, n, dtype=np.float64)
     driver.set_envelope(v_max)
     state = _state_at(15.0, seg_idx=30)
     upcoming = [flat_track.segments[i] for i in range(30, 35)]
+    driver.reset()
     cmd_a = driver.decide(state, upcoming)
+    driver.reset()
     cmd_b = driver.decide(state, upcoming)
     assert cmd_a.action == cmd_b.action
     assert cmd_a.throttle_pct == cmd_b.throttle_pct
     assert cmd_a.brake_pct == cmd_b.brake_pct
+    assert cmd_a.regen_request_pct == cmd_b.regen_request_pct
 
 
 # ---------------------------------------------------------------------------

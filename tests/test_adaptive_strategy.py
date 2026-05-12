@@ -178,8 +178,9 @@ def test_existing_strategies_still_importable():
 
 
 def test_adaptive_strategy_decide_deterministic_after_envelope_set(models, flat_track):
-    """Strategy-level determinism (extends the driver-core determinism
-    test): two decide() calls with identical state -> identical command."""
+    """Strategy-level determinism: identical state on a freshly reset()
+    driver yields identical commands. Wave 4b Sub-task A added PI state,
+    so this test resets between the two calls."""
     from fsae_sim.driver.strategies import AdaptiveStrategy
 
     cfg, pt, dyn = models
@@ -187,8 +188,11 @@ def test_adaptive_strategy_decide_deterministic_after_envelope_set(models, flat_
     strategy.set_envelope(np.linspace(10.0, 25.0, flat_track.num_segments))
     state = _state_at(15.0, seg_idx=30)
     upcoming = [flat_track.segments[i] for i in range(30, 35)]
+    strategy.driver.reset()
     cmd_a = strategy.decide(state, upcoming)
+    strategy.driver.reset()
     cmd_b = strategy.decide(state, upcoming)
     assert cmd_a.action == cmd_b.action
     assert cmd_a.throttle_pct == cmd_b.throttle_pct
     assert cmd_a.brake_pct == cmd_b.brake_pct
+    assert cmd_a.regen_request_pct == cmd_b.regen_request_pct

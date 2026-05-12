@@ -26,7 +26,11 @@ import pandas as pd
 BMS_REFRESH_DELTA_A: float = 5.0
 
 from fsae_sim.driver.strategy import ControlAction, DriverStrategy, SimState
-from fsae_sim.driver.strategies import CalibratedStrategy, ReplayStrategy
+from fsae_sim.driver.strategies import (
+    AdaptiveStrategy,
+    CalibratedStrategy,
+    ReplayStrategy,
+)
 from fsae_sim.track.track import Track
 from fsae_sim.vehicle import VehicleConfig
 from fsae_sim.vehicle.battery_model import BatteryModel
@@ -362,6 +366,13 @@ class SimulationEngine:
 
         is_replay = isinstance(self.strategy, ReplayStrategy)
         is_calibrated = isinstance(self.strategy, CalibratedStrategy)
+        is_adaptive = isinstance(self.strategy, AdaptiveStrategy)
+
+        # Sub-task C: reset adaptive driver's internal PI / energy state
+        # at the start of each run so back-to-back sims with the same
+        # strategy instance are deterministic.
+        if is_adaptive:
+            self.strategy.reset()
 
         # D-20: push the envelope into synthetic corner-braking strategies
         # so their lookahead uses the forward-backward-solved ceiling
@@ -424,6 +435,12 @@ class SimulationEngine:
                         command.throttle_pct, rpm, current_limit_a,
                     )
                 else:
+                    # Sub-task C: adaptive driver emits RAW pedal
+                    # positions (pre-deadzone) that the inverse-pedal
+                    # solve constructed via the firmware-faithful
+                    # ``lvcu_torque_command`` chain. The same path
+                    # services predictive non-adaptive strategies for
+                    # backward compatibility.
                     lvcu = float(self.powertrain.lvcu_torque_command(
                         command.throttle_pct, rpm, current_limit_a,
                     ))
@@ -455,6 +472,25 @@ class SimulationEngine:
                 )
             elif torque < 0.0 and is_replay:
                 regen_force = self.powertrain.wheel_force(torque)
+
+            # Sub-task C: adaptive driver routes regen through a
+            # dedicated ``regen_request_pct`` channel. Convert to a
+            # negative wheel force via ``powertrain.regen_force`` which
+            # mirrors the firmware-faithful generator-side torque flow
+            # (gearbox friction adds, not subtracts, on regen — S12).
+            # The returned force is already negative.
+            if is_adaptive and command.regen_request_pct > 0.0 and torque <= 0.0:
+                regen_force = float(self.powertrain.regen_force(
+                    command.regen_request_pct, op_speed_ms,
+                ))
+                # Update ``torque`` so downstream electrical-power and
+                # bookkeeping see the regen command. wheel_force inverse
+                # of regen_force at this rpm yields a negative motor
+                # torque consistent with the negative pack current path.
+                if regen_force < 0.0:
+                    torque = self.powertrain.motor_torque_from_wheel_force(
+                        regen_force,
+                    )
 
             # Brake force: any positive brake_pct produces brake force,
             # regardless of action label. Lets calibrated lap-mean driver
@@ -608,6 +644,25 @@ class SimulationEngine:
                     segment_idx=seg_idx,
                 )
 
+                # Sub-task C: push live energy-shaper state to the
+                # adaptive driver before each decide() so the shaper
+                # has the current spend reference. The driver is the
+                # only consumer; when no energy_shaper is attached
+                # this is a cheap noop (the driver stores the values
+                # but never reads them).
+                if is_adaptive:
+                    net_energy_kwh = (
+                        discharge_energy_j - regen_energy_j
+                    ) / 3.6e6
+                    seg_progress = (
+                        seg_idx / num_segments if num_segments > 0 else 0.0
+                    )
+                    self.strategy.set_energy_state(
+                        energy_used_kwh=net_energy_kwh,
+                        lap_index=effective_lap if effective_lap >= 0 else 0,
+                        segment_progress=seg_progress,
+                    )
+
                 # 1. Driver decision
                 cmd = self.strategy.decide(
                     sim_state, upcoming_by_segment[seg_idx],
@@ -760,6 +815,20 @@ class SimulationEngine:
                         )
                     motor_torque = self.powertrain.apply_inverter_delivery(
                         motor_rpm, lvcu_command,
+                    )
+                elif (
+                    is_adaptive
+                    and cmd.regen_request_pct > 0.0
+                    and regen_f < 0.0
+                ):
+                    # Sub-task C: when the adaptive driver issues regen,
+                    # the resolved torque is the motor-side equivalent
+                    # of the negative wheel force. Sign is preserved
+                    # through ``motor_torque_from_wheel_force`` so the
+                    # downstream electrical-power model sees a negative
+                    # torque (pack-current convention).
+                    motor_torque = float(
+                        self.powertrain.motor_torque_from_wheel_force(regen_f),
                     )
                 else:
                     motor_torque = 0.0
