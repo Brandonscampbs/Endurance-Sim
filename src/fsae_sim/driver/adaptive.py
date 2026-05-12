@@ -103,7 +103,12 @@ class AdaptiveDriverParams:
             to next brake point — TUMFTM), or ``"LS"`` (lowest speed).
     """
 
-    lookahead_segments: int = 5
+    # Sub-task D: lookahead bumped from 5 -> 60 (~30 m at the default
+    # 0.5 m segment grid; ~1 s of preview at 30 m/s). The plan's
+    # Lookahead section motivates 60 for envelope-following: the
+    # driver can pre-lift and trail-brake across an entire corner-
+    # entry sequence rather than reacting one segment at a time.
+    lookahead_segments: int = 60
     default_bms_current_limit_a: float = 200.0
 
     # Wave 4b Sub-task A: PI velocity-error corrector. Plan A3 defaults.

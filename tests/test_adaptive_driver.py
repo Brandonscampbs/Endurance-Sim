@@ -353,10 +353,10 @@ def test_adaptive_driver_params_defaults_enable_pi_corrector_in_wave4b():
     pure feedforward + PI behavior is the baseline.
     """
     params = AdaptiveDriverParams()
-    # Lookahead bumped from 5 to 60 in Sub-task D per plan (Lookahead
-    # section). Sub-task A keeps the historical 5; Sub-task D will lift
-    # it to 60.
-    assert params.lookahead_segments == 5
+    # Sub-task D bumped lookahead to 60 (~30 m at 0.5 m segments, ~1 s
+    # of preview at 30 m/s) so the envelope-following driver can pre-
+    # lift and trail-brake across corner-entry sequences.
+    assert params.lookahead_segments == 60
     # PI gains active by default in Wave 4b.
     assert params.kp_velocity == pytest.approx(0.05)
     assert params.ki_velocity == pytest.approx(0.005)

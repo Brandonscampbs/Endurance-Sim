@@ -383,7 +383,17 @@ class SimulationEngine:
             except Exception:
                 pass
 
+        # Sub-task D: AdaptiveStrategy needs a longer preview to make
+        # envelope-following decisions across corner-entry sequences.
+        # Respect the driver's own lookahead_segments when it provides
+        # one; fall back to the historical 5 for all other strategies.
         lookahead = 5
+        if is_adaptive:
+            try:
+                lookahead = int(self.strategy.params.lookahead_segments)
+            except AttributeError:
+                lookahead = 5
+        lookahead = max(1, lookahead)
         upcoming_by_segment = [
             [
                 segments[(seg_idx + offset) % num_segments]
