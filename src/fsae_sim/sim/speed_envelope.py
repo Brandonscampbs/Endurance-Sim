@@ -41,6 +41,12 @@ class SpeedEnvelope:
         self._powertrain = powertrain
         self._track = track
         self._corner_speed_cache: dict[tuple, np.ndarray] = {}
+        # BMS refresh bookkeeping. ``last_built_bms_limit_a`` is the
+        # BMS current limit the most recent envelope was built with;
+        # the engine compares this against the live (temp, soc)-derived
+        # limit at lap boundaries and recomputes when the drift exceeds
+        # ``BMS_REFRESH_DELTA_A``. ``None`` until the first compute call.
+        self.last_built_bms_limit_a: float | None = None
 
     def compute(
         self,
@@ -49,12 +55,23 @@ class SpeedEnvelope:
     ) -> np.ndarray:
         """Compute the speed envelope for the full track.
 
+        Records the BMS current limit used in this build under
+        ``self.last_built_bms_limit_a`` so callers can decide whether
+        to recompute (e.g. at lap boundaries when thermal derating has
+        moved the limit).
+
         Args:
             initial_speed: Vehicle speed at segment 0 (m/s).
+            bms_current_limit_a: BMS discharge current limit (A) used
+                by the forward-pass acceleration ceiling.
 
         Returns:
             1-D array of maximum feasible speed (m/s) per segment.
         """
+        # Track the BMS limit the envelope was built with so the engine
+        # can compare against later (temp, soc)-derived limits.
+        self.last_built_bms_limit_a = bms_current_limit_a
+
         segments = self._track.segments
         n = len(segments)
         m_eff = self._dynamics.m_effective

@@ -8,12 +8,22 @@ endurance simulation.
 from __future__ import annotations
 
 import math
+import time as _time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
 import pandas as pd
+
+# BMS lap-refresh threshold (A). At lap boundaries, if the
+# (temp, soc)-derived BMS discharge limit has drifted more than this
+# from the limit the envelope was last built with, the speed envelope
+# is recomputed. Default 5 A is below the BMS LUT bin width (10 A in
+# Endurance Tune2) so we catch every cross-bin transition while
+# preserving stability against per-segment noise. See plan
+# docs/superpowers/plans/2026-05-06-battery-upgrades.md (BMS lap-refresh).
+BMS_REFRESH_DELTA_A: float = 5.0
 
 from fsae_sim.driver.strategy import ControlAction, DriverStrategy, SimState
 from fsae_sim.driver.strategies import CalibratedStrategy, ReplayStrategy
@@ -69,6 +79,13 @@ class SimResult:
     discharge_charge_ah: float = 0.0
     regen_charge_ah: float = 0.0
     net_charge_ah: float = 0.0
+    # BMS lap-by-lap envelope refresh diagnostics. The envelope is
+    # rebuilt whenever the live BMS discharge limit drifts more than
+    # ``BMS_REFRESH_DELTA_A`` from the limit it was built with.
+    # ``bms_limit_a_per_lap`` is the live limit at lap entry.
+    bms_limit_a_per_lap: list[float] = field(default_factory=list)
+    envelope_recomputes: int = 0
+    envelope_recompute_ms_total: float = 0.0
 
 
 class SimulationMode(str, Enum):
@@ -325,6 +342,16 @@ class SimulationEngine:
             initial_speed=speed,
             bms_current_limit_a=initial_bms_limit,
         )
+        # BMS lap-refresh diagnostics. ``bms_limit_a_per_lap`` records
+        # the BMS-limit at each lap entry; ``envelope_recomputes`` and
+        # ``envelope_recompute_ms_total`` track refresh frequency and
+        # cost. The envelope is rebuilt at the top of a lap when the
+        # live BMS limit has drifted more than BMS_REFRESH_DELTA_A
+        # from the limit the envelope was last built with.
+        bms_limit_a_per_lap: list[float] = []
+        envelope_recomputes: int = 0
+        envelope_recompute_ms_total: float = 0.0
+
         is_replay = isinstance(self.strategy, ReplayStrategy)
         is_calibrated = isinstance(self.strategy, CalibratedStrategy)
 
@@ -507,11 +534,59 @@ class SimulationEngine:
             and any(getattr(s, "lap_index", -1) >= 0 for s in segments)
         )
 
+        # Helper for lap-boundary BMS refresh. Called at each true
+        # lap transition (outer loop for non-stitched tracks; segment
+        # lap_index transitions for stitched tracks). Records the
+        # live BMS limit and recomputes the envelope iff the limit
+        # has drifted >= BMS_REFRESH_DELTA_A.
+        def _bms_lap_refresh() -> None:
+            nonlocal v_max, envelope_recomputes, envelope_recompute_ms_total
+            bms_limit_now = self.battery_model.max_discharge_current(temp, soc)
+            bms_limit_a_per_lap.append(float(bms_limit_now))
+            last_built = self._envelope.last_built_bms_limit_a
+            if (
+                last_built is not None
+                and abs(bms_limit_now - last_built) >= BMS_REFRESH_DELTA_A
+            ):
+                _t0 = _time.perf_counter()
+                v_max = self._envelope.compute(
+                    initial_speed=speed,
+                    bms_current_limit_a=bms_limit_now,
+                )
+                envelope_recompute_ms_total += (
+                    (_time.perf_counter() - _t0) * 1000.0
+                )
+                envelope_recomputes += 1
+                # Re-push to synthetic strategies if they consume the
+                # envelope directly.
+                if hasattr(self.strategy, "set_envelope"):
+                    try:
+                        self.strategy.set_envelope(v_max)
+                    except Exception:
+                        pass
+
+        # Track the last seen segment lap_index so stitched tracks
+        # can fire the BMS refresh at true lap boundaries (segment
+        # lap_index transitions) rather than the outer-loop counter.
+        last_seen_lap_index: int = -1
+
         for lap in range(num_laps):
+            # Non-stitched tracks: outer-loop iteration is the lap.
+            if not segments_carry_lap_index:
+                _bms_lap_refresh()
+
             for seg_idx, segment in enumerate(segments):
                 effective_lap = (
                     segment.lap_index if segments_carry_lap_index else lap
                 )
+                # Stitched tracks: refresh on lap_index transitions.
+                if (
+                    segments_carry_lap_index
+                    and effective_lap >= 0
+                    and effective_lap != last_seen_lap_index
+                ):
+                    _bms_lap_refresh()
+                    last_seen_lap_index = effective_lap
                 # Build SimState for driver strategy
                 sim_state = SimState(
                     time=time,
@@ -869,11 +944,17 @@ class SimulationEngine:
                     return self._build_result(
                         records, time, total_energy_j, soc, laps_completed,
                         discharge_energy_j, regen_energy_j,
+                        bms_limit_a_per_lap=bms_limit_a_per_lap,
+                        envelope_recomputes=envelope_recomputes,
+                        envelope_recompute_ms_total=envelope_recompute_ms_total,
                     )
                 if temp >= self._termination_temp_c:
                     return self._build_result(
                         records, time, total_energy_j, soc, laps_completed,
                         discharge_energy_j, regen_energy_j,
+                        bms_limit_a_per_lap=bms_limit_a_per_lap,
+                        envelope_recomputes=envelope_recomputes,
+                        envelope_recompute_ms_total=envelope_recompute_ms_total,
                     )
 
             if segments_carry_lap_index:
@@ -892,6 +973,9 @@ class SimulationEngine:
         return self._build_result(
             records, time, total_energy_j, soc, laps_completed,
             discharge_energy_j, regen_energy_j,
+            bms_limit_a_per_lap=bms_limit_a_per_lap,
+            envelope_recomputes=envelope_recomputes,
+            envelope_recompute_ms_total=envelope_recompute_ms_total,
         )
 
     def _build_result(
@@ -903,6 +987,9 @@ class SimulationEngine:
         laps_completed: int,
         discharge_energy_j: float = 0.0,
         regen_energy_j: float = 0.0,
+        bms_limit_a_per_lap: list[float] | None = None,
+        envelope_recomputes: int = 0,
+        envelope_recompute_ms_total: float = 0.0,
     ) -> SimResult:
         states = pd.DataFrame(records)
         discharge_charge_ah = 0.0
@@ -931,4 +1018,7 @@ class SimulationEngine:
             discharge_charge_ah=discharge_charge_ah,
             regen_charge_ah=regen_charge_ah,
             net_charge_ah=discharge_charge_ah - regen_charge_ah,
+            bms_limit_a_per_lap=list(bms_limit_a_per_lap or []),
+            envelope_recomputes=envelope_recomputes,
+            envelope_recompute_ms_total=envelope_recompute_ms_total,
         )
