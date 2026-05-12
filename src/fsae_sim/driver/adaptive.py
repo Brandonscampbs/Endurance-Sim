@@ -521,11 +521,13 @@ class AdaptiveDriver:
         f_friction_needed = max(0.0, f_decel_required_n - f_regen_used)
 
         # Mechanical brake capacity: the engine uses
-        # `mechanical_brake_force(brake_pct, v)`, which is linear in
-        # brake_pct up to `_MAX_BRAKE_DECEL_G * m * g` (further clamped
-        # by tire grip). For the inverse we use the same scaling.
+        # ``mechanical_brake_force(brake_pct, v)``, which is linear in
+        # brake_pct up to ``max_brake_decel_g * m * g`` (further clamped
+        # by tire grip). For the inverse we use the same scaling. The
+        # leading-underscore alias is preserved on VehicleDynamics for
+        # back-compat, but new code reads the public attribute.
         peak_brake_force_n = (
-            self._dyn._MAX_BRAKE_DECEL_G
+            self._dyn.max_brake_decel_g
             * 9.81
             * float(self._dyn.vehicle.mass_kg)
         )

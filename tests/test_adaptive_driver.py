@@ -107,6 +107,9 @@ class _ZeroResistanceDynamics:
         self.vehicle = real_dynamics.vehicle
         # Expose the brake-decel cap so the driver matches what the
         # real engine would do when mechanical brakes are saturated.
+        # Sub-task E: prefer the public ``max_brake_decel_g`` name;
+        # leading-underscore alias preserved for back-compat.
+        self.max_brake_decel_g = real_dynamics.max_brake_decel_g
         self._MAX_BRAKE_DECEL_G = real_dynamics._MAX_BRAKE_DECEL_G
 
     def total_resistance(self, speed_ms: float, *, grade: float = 0.0, curvature: float = 0.0) -> float:
@@ -343,6 +346,21 @@ def test_driver_does_not_require_telemetry(models, flat_track):
 # ---------------------------------------------------------------------------
 # 9. AdaptiveDriverParams sanity (structure, defaults)
 # ---------------------------------------------------------------------------
+
+
+def test_vehicle_dynamics_exposes_public_max_brake_decel_g():
+    """Sub-task E: ``VehicleDynamics.max_brake_decel_g`` is the public
+    name; the leading-underscore alias is preserved for back-compat.
+    Both refer to the same float (0.55 g for CT-16EV).
+    """
+    from fsae_sim.vehicle.dynamics import VehicleDynamics
+    # Class-level (instance not required).
+    assert VehicleDynamics.max_brake_decel_g == pytest.approx(0.55)
+    assert VehicleDynamics._MAX_BRAKE_DECEL_G == pytest.approx(0.55)
+    assert (
+        VehicleDynamics.max_brake_decel_g
+        == VehicleDynamics._MAX_BRAKE_DECEL_G
+    )
 
 
 def test_adaptive_driver_params_defaults_enable_pi_corrector_in_wave4b():

@@ -529,10 +529,17 @@ class VehicleDynamics:
     # reflects driver discipline, brake-bias setup, and pad/master-
     # cylinder sizing — the brake hardware does not push pads hard
     # enough at full pedal to lock all four wheels. Using tire-grip as
-    # the cap caused the sim to over-brake by 2.4× wherever brake_pct
+    # the cap caused the sim to over-brake by 2.4x wherever brake_pct
     # was non-zero, dragging speeds 20+ km/h below telemetry through
     # corner-entry zones.
-    _MAX_BRAKE_DECEL_G: float = 0.55
+    #
+    # Sub-task E: ``max_brake_decel_g`` is the public name; the
+    # leading-underscore ``_MAX_BRAKE_DECEL_G`` alias is preserved for
+    # backward compatibility with callers that referenced the private
+    # name (notably the AdaptiveDriver's inverse decel solve before
+    # this promotion).
+    max_brake_decel_g: float = 0.55
+    _MAX_BRAKE_DECEL_G: float = 0.55  # legacy alias — use max_brake_decel_g
 
     def mechanical_brake_force(
         self, brake_pct: float, speed_ms: float,
@@ -555,7 +562,7 @@ class VehicleDynamics:
         """
         brake_pct = max(0.0, min(1.0, brake_pct))
         peak_brake_force_n = (
-            self._MAX_BRAKE_DECEL_G * GRAVITY_M_S2 * self.vehicle.mass_kg
+            self.max_brake_decel_g * GRAVITY_M_S2 * self.vehicle.mass_kg
         )
         # Tire grip is the absolute physical ceiling — never let the
         # commanded brake force exceed what the tires can transmit.
