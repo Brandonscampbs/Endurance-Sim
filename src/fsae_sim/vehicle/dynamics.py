@@ -99,6 +99,17 @@ class VehicleDynamics:
         # direction was a misdiagnosis (M13).
         # Refs: Genta §5.2; Krause/Wasynczuk/Sudhoff §3.5; TUMFTM
         # laptime-simulation `__compute_m_eq`.
+        #
+        # Note on issue 18 (loaded radius routing): the load-dependent
+        # loaded radius from `tire_model.loaded_radius(fz)` is used at
+        # the *operating-point* level (motor RPM, wheel force) via
+        # `PowertrainModel.rolling_radius_for`.  The equivalent-inertia
+        # m_eff stays on the static config radius because (a) it is a
+        # kinematic baseline, not an operating-point quantity, and
+        # (b) per-segment m_eff variation from Fz changes would force
+        # a non-conservative KE accounting (Genta §5.2 cautions against
+        # speed-dependent inertia for the same reason).  This is the
+        # same simplification TUMFTM `laptime-simulation` makes.
         if powertrain_config is not None:
             tire_radius = powertrain_config.rolling_radius_m
             G = powertrain_config.gear_ratio

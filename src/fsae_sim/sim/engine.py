@@ -225,19 +225,27 @@ class SimulationEngine:
                     stacklevel=2,
                 )
 
-        self.powertrain = PowertrainModel(
-            vehicle.powertrain,
-            efficiency_map=motor_map,
-            inverter_delivery_map=inverter_delivery_map,
-        )
-
         tire_cfg = getattr(vehicle, "tire", None)
         susp_cfg = getattr(vehicle, "suspension", None)
 
+        # Build the tire model before the PowertrainModel so the load-
+        # dependent rolling radius can be routed through motor RPM and
+        # wheel force (issue 18 partial closure).  See
+        # `PowertrainModel.rolling_radius_for`.
+        tire_model: "PacejkaTireModel | None" = None
         if _HAS_TIRE_MODELS and tire_cfg is not None and susp_cfg is not None:
             tire_model = PacejkaTireModel(tire_cfg.tir_file)
             if tire_cfg.grip_scale != 1.0:
                 tire_model.apply_grip_scale(tire_cfg.grip_scale)
+
+        self.powertrain = PowertrainModel(
+            vehicle.powertrain,
+            efficiency_map=motor_map,
+            inverter_delivery_map=inverter_delivery_map,
+            tire_model=tire_model,
+        )
+
+        if tire_model is not None and susp_cfg is not None:
             load_transfer = LoadTransferModel(
                 vehicle.vehicle,
                 susp_cfg,

@@ -22,6 +22,7 @@ from fsae_sim.vehicle.powertrain import PowertrainConfig
 if TYPE_CHECKING:
     from fsae_sim.vehicle.inverter_delivery import InverterDeliveryMap
     from fsae_sim.vehicle.motor_efficiency import MotorEfficiencyMap
+    from fsae_sim.vehicle.tire_model import PacejkaTireModel
 
 
 @dataclass(frozen=True)
@@ -100,10 +101,12 @@ class PowertrainModel:
         config: PowertrainConfig,
         efficiency_map: "MotorEfficiencyMap | None" = None,
         inverter_delivery_map: "InverterDeliveryMap | None" = None,
+        tire_model: "PacejkaTireModel | None" = None,
     ) -> None:
         self.config = config
         self._efficiency_map = efficiency_map
         self._inverter_delivery_map = inverter_delivery_map
+        self._tire_model = tire_model
         self.rolling_radius_m = float(config.rolling_radius_m)
 
         # Pre-compute constants used in every call.  The effective torque
@@ -140,10 +143,38 @@ class PowertrainModel:
         return self.config.drivetrain_efficiency
 
     # ------------------------------------------------------------------
+    # Rolling radius (load-dependent when tire model attached)
+    # ------------------------------------------------------------------
+
+    def rolling_radius_for(self, fz: float | None) -> float:
+        """Effective rolling radius (m) for a given tire normal load.
+
+        When a Pacejka tire model is attached, returns
+        ``tire_model.loaded_radius(fz)`` — the static loaded radius from
+        PAC2002 vertical stiffness (linear spring formulation).  When no
+        tire model is attached, or ``fz`` is ``None``, returns the
+        configured ``rolling_radius_m`` (the static / unloaded value).
+
+        The ``fz`` argument is the mean per-tire normal load (N), not the
+        total vertical force on the car.  Callers are responsible for
+        averaging across the four wheels (TUMFTM ``laptime-simulation``
+        precedent — see plan U4 default).
+
+        References:
+            Pacejka, *Tyre and Vehicle Dynamics* 3e (2012) §1.3, §4.3.6.
+            Adams Tire 2018 PAC2002 docs (Stackpole/Hoosier export).
+        """
+        if fz is None or self._tire_model is None:
+            return self.rolling_radius_m
+        return float(self._tire_model.loaded_radius(float(fz)))
+
+    # ------------------------------------------------------------------
     # Speed / RPM conversion
     # ------------------------------------------------------------------
 
-    def motor_rpm_from_speed(self, vehicle_speed_ms: float) -> float:
+    def motor_rpm_from_speed(
+        self, vehicle_speed_ms: float, *, fz: float | None = None,
+    ) -> float:
         """Convert vehicle speed (m/s) to motor shaft RPM.
 
         Derivation:
@@ -151,32 +182,47 @@ class PowertrainModel:
             wheel_rpm               [rpm]  = (v / r) * 60 / (2*pi)
             motor_rpm               [rpm]  = wheel_rpm * gear_ratio
 
+        When ``fz`` (mean per-tire normal load, N) is provided and a
+        tire model is attached, the load-dependent rolling radius from
+        ``rolling_radius_for(fz)`` is used in place of the configured
+        static radius.  This captures the ~3-4 % rolling-radius
+        reduction under FSAE-typical tire loads (issue 18).
+
         Args:
             vehicle_speed_ms: Vehicle longitudinal speed in m/s.
+            fz: Optional mean per-tire normal load (N).  When ``None``
+                (default, for back-compat), the static config radius
+                is used.
 
         Returns:
             Motor shaft speed in RPM.  Returns 0.0 for negative speed
             inputs (reversing is not modelled).
         """
         speed = max(0.0, vehicle_speed_ms)
-        wheel_rpm = (speed / self.rolling_radius_m) * 60.0 / (2.0 * math.pi)
+        r = self.rolling_radius_for(fz)
+        wheel_rpm = (speed / r) * 60.0 / (2.0 * math.pi)
         return wheel_rpm * self.config.gear_ratio
 
-    def speed_from_motor_rpm(self, motor_rpm: float) -> float:
+    def speed_from_motor_rpm(
+        self, motor_rpm: float, *, fz: float | None = None,
+    ) -> float:
         """Convert motor shaft RPM to vehicle speed (m/s).
 
         Inverse of ``motor_rpm_from_speed``.
 
         Args:
             motor_rpm: Motor shaft speed in RPM.
+            fz: Optional mean per-tire normal load (N).  See
+                :meth:`motor_rpm_from_speed` for usage.
 
         Returns:
             Vehicle longitudinal speed in m/s.  Returns 0.0 for negative
             RPM inputs.
         """
         rpm = max(0.0, motor_rpm)
+        r = self.rolling_radius_for(fz)
         wheel_rpm = rpm / self.config.gear_ratio
-        return wheel_rpm * self.rolling_radius_m * 2.0 * math.pi / 60.0
+        return wheel_rpm * r * 2.0 * math.pi / 60.0
 
     # ------------------------------------------------------------------
     # Torque capability
@@ -447,7 +493,11 @@ class PowertrainModel:
     # ------------------------------------------------------------------
 
     def apply_inverter_delivery(
-        self, motor_rpm: float, lvcu_command_nm: float,
+        self,
+        motor_rpm: float,
+        lvcu_command_nm: float,
+        *,
+        fz: float | None = None,
     ) -> float:
         """Translate an LVCU torque request into delivered shaft torque.
 
@@ -460,7 +510,15 @@ class PowertrainModel:
         When no map is attached, returns the command unchanged so the
         powertrain remains backward-compatible. Negative commands
         (regen) pass through untouched; the map only models motoring.
+
+        Note: ``fz`` is accepted on the public signature so callers can
+        route a load reference through the powertrain pipeline (motor
+        RPM -> command -> delivered torque -> wheel force).  The inverter
+        map itself is rolling-radius-independent (it is a (rpm, torque)
+        -> torque interpolation), but its caller chain becomes
+        load-aware once the kwarg is in place.
         """
+        del fz  # accepted for callsite uniformity; map itself is radius-independent
         if lvcu_command_nm <= 0.0 or self._inverter_delivery_map is None:
             return lvcu_command_nm
         return self._inverter_delivery_map.delivered_torque(
@@ -487,30 +545,45 @@ class PowertrainModel:
         """
         return motor_torque_nm * self.config.gear_ratio * self._GEARBOX_EFFICIENCY
 
-    def wheel_force(self, motor_torque_nm: float) -> float:
+    def wheel_force(
+        self, motor_torque_nm: float, *, fz: float | None = None,
+    ) -> float:
         """Tractive force at the tire contact patch from motor torque.
 
         Args:
             motor_torque_nm: Motor shaft torque in Nm.
+            fz: Optional mean per-tire normal load (N).  When provided
+                with a tire model attached, the load-dependent rolling
+                radius is used in place of the static config radius.
 
         Returns:
             Force in N at the contact patch.  Positive = forward, negative =
             rearward (regen/braking).
         """
-        return self.wheel_torque(motor_torque_nm) / self.rolling_radius_m
+        r = self.rolling_radius_for(fz)
+        return self.wheel_torque(motor_torque_nm) / r
 
-    def motor_torque_from_wheel_force(self, wheel_force_n: float) -> float:
+    def motor_torque_from_wheel_force(
+        self, wheel_force_n: float, *, fz: float | None = None,
+    ) -> float:
         """Inverse of :meth:`wheel_force` for a realized contact-patch force."""
         denom = self.config.gear_ratio * self._GEARBOX_EFFICIENCY
         if denom <= 0.0:
             return 0.0
-        return wheel_force_n * self.rolling_radius_m / denom
+        r = self.rolling_radius_for(fz)
+        return wheel_force_n * r / denom
 
     # ------------------------------------------------------------------
     # Drive and regen demand
     # ------------------------------------------------------------------
 
-    def drive_force(self, throttle_pct: float, vehicle_speed_ms: float) -> float:
+    def drive_force(
+        self,
+        throttle_pct: float,
+        vehicle_speed_ms: float,
+        *,
+        fz: float | None = None,
+    ) -> float:
         """Tractive force (N) at given throttle demand and vehicle speed.
 
         The commanded motor torque is ``throttle_pct * max_motor_torque(rpm)``.
@@ -519,17 +592,26 @@ class PowertrainModel:
         Args:
             throttle_pct: Throttle demand in the range [0.0, 1.0].
             vehicle_speed_ms: Vehicle longitudinal speed in m/s.
+            fz: Optional mean per-tire normal load (N).  Threads through
+                ``motor_rpm_from_speed`` and ``wheel_force`` for
+                load-dependent rolling radius.
 
         Returns:
             Forward tractive force in N (>= 0).
         """
         throttle = max(0.0, min(1.0, throttle_pct))
-        rpm = self.motor_rpm_from_speed(vehicle_speed_ms)
+        rpm = self.motor_rpm_from_speed(vehicle_speed_ms, fz=fz)
         max_torque = self.max_motor_torque(rpm)
         commanded_torque = throttle * max_torque
-        return self.wheel_force(commanded_torque)
+        return self.wheel_force(commanded_torque, fz=fz)
 
-    def regen_force(self, brake_pct: float, vehicle_speed_ms: float) -> float:
+    def regen_force(
+        self,
+        brake_pct: float,
+        vehicle_speed_ms: float,
+        *,
+        fz: float | None = None,
+    ) -> float:
         """Regenerative braking force (N, negative = decelerating).
 
         Regen torque capability is limited by the same motor torque envelope
@@ -561,7 +643,7 @@ class PowertrainModel:
         if speed == 0.0:
             return 0.0
 
-        rpm = self.motor_rpm_from_speed(speed)
+        rpm = self.motor_rpm_from_speed(speed, fz=fz)
         # Generator torque capability uses the same RPM-torque envelope.
         max_regen_torque = self.max_motor_torque(rpm)
         commanded_torque = brake * max_regen_torque
@@ -570,7 +652,8 @@ class PowertrainModel:
         regen_wheel_torque = (
             commanded_torque * self.config.gear_ratio / self._GEARBOX_EFFICIENCY
         )
-        return -(regen_wheel_torque / self.rolling_radius_m)
+        r = self.rolling_radius_for(fz)
+        return -(regen_wheel_torque / r)
 
     # ------------------------------------------------------------------
     # Electrical power
