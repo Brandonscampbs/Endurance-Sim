@@ -727,6 +727,10 @@ class PacejkaTireModel:
 
         where r0 is the unloaded radius and kz is vertical stiffness.
         Clamped to a minimum of 0.01 m.
+
+        Use ``effective_rolling_radius`` for velocity-RPM kinematics; this
+        method returns the static load-bearing radius used in PAC2002
+        vertical force balance.
         """
         r0 = self.unloaded_radius
         kz = self.vertical_stiffness
@@ -737,6 +741,31 @@ class PacejkaTireModel:
 
         r_loaded = r0 - fz / kz
         return max(r_loaded, 0.01)
+
+    def effective_rolling_radius(
+        self,
+        normal_load_n: float,
+        speed_ms: float = 0.0,
+    ) -> float:
+        """Effective rolling radius for velocity-RPM kinematics.
+
+        Per Pacejka, *Tyre and Vehicle Dynamics* 3e §1.3.3, the effective
+        rolling radius (defined by distance traveled per revolution / 2π)
+        is approximately ``r_e ≈ r0 - δ/3`` where ``δ = r0 - r_l`` is the
+        tyre vertical deflection under load. This is the correct radius
+        for the kinematic identity ``v = ω_w · r_e``; the static loaded
+        radius ``r_l`` is the load-bearing moment arm, not the kinematic
+        one. Real tyres roll on roughly two-thirds of their vertical
+        deflection because the contact patch unfurls and re-furls around
+        the tread band as the wheel rotates.
+
+        Refs: Pacejka 2012 §1.3.3; Genta, *Motor Vehicle Dynamics* §2.1.
+        """
+        r0 = self.unloaded_radius
+        r_l = self.loaded_radius(normal_load_n, speed_ms)
+        delta = r0 - r_l
+        r_e = r0 - delta / 3.0
+        return max(r_e, 0.01)
 
     # ------------------------------------------------------------------
     # String representation

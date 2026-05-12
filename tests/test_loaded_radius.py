@@ -98,15 +98,18 @@ class TestRollingRadiusFor:
             0.2042, abs=1e-5,
         )
 
-    def test_with_tire_at_700n_linear_spring(
+    def test_with_tire_at_700n_effective_rolling_radius(
         self, model_with_tire: PowertrainModel,
     ) -> None:
-        """At Fz=700 N the loaded radius matches the .tir linear spring.
+        """At Fz=700 N rolling_radius_for returns r_e ≈ r0 - δ/3 (Pacejka §1.3.3).
 
         From the LC0 .tir file: VERTICAL_STIFFNESS = 87914 N/m, so
-            r_loaded = r0 - Fz/kz = 0.2042 - 700/87914 = 0.19624 m.
+        δ = Fz/kz = 700/87914 = 7.96 mm; the load-bearing radius would
+        be r_l = r0 - δ = 0.19624 m, but the kinematic-correct
+        effective rolling radius is r_e = r0 - δ/3 = 0.20155 m.
         """
-        expected = 0.2042 - 700.0 / 87914.0
+        delta = 700.0 / 87914.0
+        expected = 0.2042 - delta / 3.0
         assert model_with_tire.rolling_radius_for(700.0) == pytest.approx(
             expected, abs=1e-5,
         )
@@ -135,14 +138,22 @@ class TestMotorRPMRouting:
         rpm = model_with_tire.motor_rpm_from_speed(v)
         assert rpm == pytest.approx(expected, rel=1e-6)
 
-    def test_with_fz_uses_loaded_radius(
+    def test_with_fz_uses_effective_rolling_radius(
         self, model_with_tire: PowertrainModel,
     ) -> None:
-        """With Fz provided, RPM uses the loaded radius from the tire model."""
+        """With Fz provided, RPM uses effective rolling radius (Pacejka §1.3.3).
+
+        r_e ≈ r0 - δ/3 where δ = r0 - r_l is the vertical deflection.
+        Real tyre kinematics roll on roughly two-thirds of the deflection;
+        using r_l here would over-shrink the radius and bias RPM ~3 %
+        high under FSAE downforce loads.
+        """
         v = 15.78
         fz = 800.0
-        r_loaded = 0.2042 - 800.0 / 87914.0
-        expected = (v / r_loaded) * 60.0 / (2.0 * math.pi) * 3.6363
+        r_l = 0.2042 - 800.0 / 87914.0
+        delta = 0.2042 - r_l
+        r_e = 0.2042 - delta / 3.0
+        expected = (v / r_e) * 60.0 / (2.0 * math.pi) * 3.6363
         rpm = model_with_tire.motor_rpm_from_speed(v, fz=fz)
         assert rpm == pytest.approx(expected, rel=1e-6)
 
@@ -175,15 +186,23 @@ class TestWheelForceRouting:
         f = model_with_tire.wheel_force(torque)
         assert f == pytest.approx(expected, rel=1e-6)
 
-    def test_with_fz_uses_loaded_radius(
+    def test_with_fz_uses_effective_rolling_radius(
         self, model_with_tire: PowertrainModel,
     ) -> None:
-        """wheel_force(T, fz=...) divides by the load-dependent radius."""
+        """wheel_force(T, fz=...) divides by the kinematic radius r_e.
+
+        The single rolling-radius simplification (TUMFTM precedent)
+        applies r_e to both kinematics and force conversion: F = T/r_e.
+        Strictly Pacejka uses r_l for vertical force balance and r_e
+        for kinematics; for QSS single-DOF longitudinal work the
+        difference is below model error.
+        """
         torque = 60.0
         fz = 800.0
-        r_loaded = 0.2042 - 800.0 / 87914.0
+        delta = 800.0 / 87914.0
+        r_e = 0.2042 - delta / 3.0
         wheel_torque = 60.0 * 3.6363 * 0.97
-        expected = wheel_torque / r_loaded
+        expected = wheel_torque / r_e
         f = model_with_tire.wheel_force(torque, fz=fz)
         assert f == pytest.approx(expected, rel=1e-6)
 
@@ -279,36 +298,23 @@ class TestTelemetryKinematic:
     def test_motor_rpm_kinematic_residuals(
         self, model_with_tire: PowertrainModel,
     ) -> None:
-        """Document the kinematic residual at the highest sustained cruise.
+        """Assert the kinematic identity holds at the highest sustained cruise.
 
         At v ≈ 15.78 m/s (56.8 km/h, max sustained on Michigan endurance)
-        the AiM Motor RPM channel reads ~2717 RPM; the gear-ratio
-        identity with the .tir static loaded radius
-        ``r_l = r0 - Fz/kz`` and total mean vertical load
-        ``Fz = (m·g + ½·ρ·ClA·v²) / 4`` predicts ~2807 RPM — a ~3 %
-        positive bias.
+        the AiM Motor RPM channel reads ~2717 RPM.  With the effective
+        rolling radius ``r_e ≈ r0 - δ/3`` (Pacejka §1.3.3) and total mean
+        vertical load ``Fz = (m·g + ½·ρ·ClA·v²) / 4``, the gear-ratio
+        identity should predict telemetry within ~1 %.
 
-        The bias is a *known physics gap*: Pacejka §1.3.3 distinguishes
-        static loaded radius ``r_l`` (what the .tir's vertical stiffness
-        gives, used here for self-consistency with the PAC2002 file)
-        from effective rolling radius ``r_e ≈ r0 - δ/3``.  Real-tire
-        kinematics use ``r_e``; the static ``r_l`` shrinks ~3× more under
-        load.  The plan
-        ``docs/superpowers/plans/2026-05-06-tire-and-dynamics.md`` (item
-        3 in "Alternatives Considered") defers the ``r_e`` correction
-        because it requires a parallel change in slip-ratio definitions
-        in ``combined_forces`` for self-consistency.
-
-        This test asserts the residual is within the bound set by the
-        ``r_l`` vs ``r_e`` gap (4 %) so the routing is correct without
-        masking the deferred physics.  When the ``r_e`` correction
-        ships, tighten this bound to 1 % per the original plan.
+        Earlier work used the static loaded radius ``r_l = r0 - Fz/kz``
+        for the kinematic mapping; ``r_l`` shrinks ~3× faster than
+        ``r_e`` under load and biased motor RPM ~3 % high.  Switching to
+        ``r_e`` (which represents the actual revolutions-per-unit-distance
+        relationship) eliminates that bias.
 
         Backward-compat path (no fz) collapses to the static config
-        radius, which on this telemetry sits *closer* to the measured
-        ``r_e`` than the loaded ``r_l`` does — a pure coincidence of
-        FSAE-typical loads, not a justification for skipping the
-        physics routing.
+        radius and should also agree with telemetry within the AiM noise
+        floor (~2 %).
         """
         df = pd.read_csv(
             TELEMETRY, encoding="latin1", low_memory=False, skiprows=[1],
@@ -344,13 +350,13 @@ class TestTelemetryKinematic:
         residual_loaded = abs(rpm_pred_loaded - rpm_meas) / rpm_meas
         residual_static = abs(rpm_pred_static - rpm_meas) / rpm_meas
 
-        # The static-loaded-radius (r_l) routing carries a ~3 % bias on
-        # this telemetry because real rolling uses r_e ≈ r0 - δ/3, not
-        # r_l = r0 - δ.  Bound the residual at 4 % to catch routing
-        # regressions while documenting the known r_e gap.
-        assert residual_loaded < 0.04, (
-            f"loaded-radius routing residual blew past the r_l/r_e "
-            f"gap envelope: v={v_ms:.2f} m/s, Fz={fz_per_tire:.1f} N, "
+        # Effective-rolling-radius routing should match telemetry within
+        # ~1 % (AiM noise floor + tyre-pressure/temperature drift over
+        # the stint).  This bound was 4 % when the routing used r_l;
+        # tightened after switching to r_e (Pacejka §1.3.3).
+        assert residual_loaded < 0.01, (
+            f"effective-rolling-radius routing residual exceeded 1 %: "
+            f"v={v_ms:.2f} m/s, Fz={fz_per_tire:.1f} N, "
             f"predicted RPM={rpm_pred_loaded:.0f}, "
             f"telemetry={rpm_meas:.0f}, residual={residual_loaded:.2%}"
         )

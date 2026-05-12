@@ -150,10 +150,16 @@ class PowertrainModel:
         """Effective rolling radius (m) for a given tire normal load.
 
         When a Pacejka tire model is attached, returns
-        ``tire_model.loaded_radius(fz)`` — the static loaded radius from
-        PAC2002 vertical stiffness (linear spring formulation).  When no
-        tire model is attached, or ``fz`` is ``None``, returns the
-        configured ``rolling_radius_m`` (the static / unloaded value).
+        ``tire_model.effective_rolling_radius(fz)`` — the kinematic
+        radius ``r_e ≈ r0 - δ/3`` per Pacejka §1.3.3, where δ is the
+        tyre vertical deflection under load.  This is the correct
+        radius for the velocity-RPM identity ``v = ω_w · r_e``; the
+        static load-bearing radius ``r_l = r0 - δ`` shrinks ~3× faster
+        than ``r_e`` under load and is the wrong choice for kinematics
+        (using ``r_l`` here biases motor RPM ~3 % high under FSAE
+        downforce loads).  When no tire model is attached, or ``fz`` is
+        ``None``, returns the configured ``rolling_radius_m`` (the
+        static / unloaded value).
 
         The ``fz`` argument is the mean per-tire normal load (N), not the
         total vertical force on the car.  Callers are responsible for
@@ -161,12 +167,13 @@ class PowertrainModel:
         precedent — see plan U4 default).
 
         References:
-            Pacejka, *Tyre and Vehicle Dynamics* 3e (2012) §1.3, §4.3.6.
+            Pacejka, *Tyre and Vehicle Dynamics* 3e (2012) §1.3.3, §4.3.6.
+            Genta, *Motor Vehicle Dynamics* §2.1.
             Adams Tire 2018 PAC2002 docs (Stackpole/Hoosier export).
         """
         if fz is None or self._tire_model is None:
             return self.rolling_radius_m
-        return float(self._tire_model.loaded_radius(float(fz)))
+        return float(self._tire_model.effective_rolling_radius(float(fz)))
 
     # ------------------------------------------------------------------
     # Speed / RPM conversion
