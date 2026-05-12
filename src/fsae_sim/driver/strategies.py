@@ -1,6 +1,6 @@
 """Driver strategy implementations.
 
-Two strategies:
+Three strategies:
 
 - ``ReplayStrategy``: reproduces recorded driver inputs (torque, throttle,
   brake) from AiM telemetry through the engine's force model. Used by the
@@ -9,11 +9,17 @@ Two strategies:
 - ``CalibratedStrategy`` (name="driver"): zone-based driver model fitted
   from per-segment lap-mean telemetry. The production strategy used by
   the backend baseline and the Simulate-page override path.
+- ``AdaptiveStrategy`` (name="adaptive"): envelope-following driver (Wave
+  4a — pure feedforward). Wraps an :class:`fsae_sim.driver.adaptive.
+  AdaptiveDriver` so the rest of the engine can address it through the
+  same ``DriverStrategy`` protocol. Wave 4b will add the PI corrector,
+  energy shaper, and end-to-end engine integration.
 """
 
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -33,6 +39,10 @@ from fsae_sim.analysis.telemetry_analysis import (
     collapse_to_zones,
     _detect_lap_boundaries_safe,
 )
+
+if TYPE_CHECKING:
+    from fsae_sim.driver.adaptive import AdaptiveDriver, AdaptiveDriverParams
+    from fsae_sim.vehicle.powertrain_model import PowertrainModel
 
 
 # D-24: module-level action thresholds for ReplayStrategy.decide.
@@ -801,3 +811,79 @@ class CalibratedStrategy(DriverStrategy):
                 label=label,
             ))
         return cls(driver_zones, track.num_segments, name=name)
+
+
+class AdaptiveStrategy(DriverStrategy):
+    """Envelope-following adaptive driver (Wave 4a — feedforward core).
+
+    Wraps an :class:`fsae_sim.driver.adaptive.AdaptiveDriver` so the
+    engine can address it through the same :class:`DriverStrategy`
+    protocol used by :class:`ReplayStrategy` and :class:`CalibratedStrategy`.
+
+    Wave 4a behavior: pure feedforward envelope tracking. Inverse force-
+    balance solve on the firmware-faithful pedal -> wheel-force chain.
+    No PI corrector, no energy shaper, no telemetry — the only inputs
+    are the pre-computed speed envelope and the live BMS current limit.
+
+    PREDICTION-mode compatible: ``uses_observed_speed_caps == False`` so
+    :class:`fsae_sim.sim.engine.SimulationEngine` accepts this strategy
+    when ``mode == SimulationMode.PREDICTION``.
+
+    Wave 4b will add: PI velocity-error corrector, LBP/LS stint-energy
+    shaping, end-to-end engine swap-in, and Michigan endurance regression.
+    """
+
+    name = "adaptive"
+
+    def __init__(
+        self,
+        dynamics: VehicleDynamics,
+        powertrain: "PowertrainModel",
+        track: Track,
+        params: "AdaptiveDriverParams | None" = None,
+    ) -> None:
+        # Local import: AdaptiveDriver imports several heavy types and
+        # is not a hot path at module load time.
+        from fsae_sim.driver.adaptive import AdaptiveDriver, AdaptiveDriverParams
+
+        self._track = track
+        self._params = params if params is not None else AdaptiveDriverParams()
+        self._driver = AdaptiveDriver(
+            dynamics=dynamics, powertrain=powertrain, params=self._params,
+        )
+
+    # ------------------------------------------------------------------
+    # Configuration plumbing (mirrors the CalibratedStrategy/Replay API)
+    # ------------------------------------------------------------------
+
+    @property
+    def driver(self) -> "AdaptiveDriver":
+        return self._driver
+
+    @property
+    def params(self) -> "AdaptiveDriverParams":
+        return self._params
+
+    @property
+    def uses_observed_speed_caps(self) -> bool:
+        """Adaptive strategy is PREDICTION-safe: no telemetry caps."""
+        return False
+
+    def set_envelope(self, v_max: np.ndarray) -> None:
+        """Hook called by the engine after :class:`SpeedEnvelope.compute`.
+
+        Mirrors the same method on calibrated/replay strategies that
+        consume the pre-computed envelope.
+        """
+        self._driver.set_envelope(v_max)
+
+    def set_bms_limit(self, bms_current_limit_a: float) -> None:
+        """Hook for the engine's per-lap BMS-refresh path."""
+        self._driver.set_bms_limit(bms_current_limit_a)
+
+    # ------------------------------------------------------------------
+    # DriverStrategy protocol
+    # ------------------------------------------------------------------
+
+    def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
+        return self._driver.decide(state, upcoming)
