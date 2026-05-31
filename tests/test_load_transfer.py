@@ -335,6 +335,17 @@ class TestTireLoads:
         expected = weight + aero_f + aero_r
         assert total == pytest.approx(expected, abs=0.01)
 
+    def test_nan_lateral_g_propagates_to_loads(
+        self, model: LoadTransferModel,
+    ) -> None:
+        """Bad lateral acceleration must not become plausible static loads."""
+        loads = model.tire_loads(
+            speed_ms=10.0,
+            lateral_g=float("nan"),
+            longitudinal_g=0.0,
+        )
+        assert all(math.isnan(load) for load in loads)
+
 
 # ---------------------------------------------------------------------------
 # Constructor / attribute exposure
@@ -475,6 +486,21 @@ def _replace_tracks(
     )
 
 
+def _replace_roll_stiffness(
+    suspension: SuspensionConfig, front_nm_per_deg: float, rear_nm_per_deg: float,
+) -> SuspensionConfig:
+    return SuspensionConfig(
+        roll_stiffness_front_nm_per_deg=front_nm_per_deg,
+        roll_stiffness_rear_nm_per_deg=rear_nm_per_deg,
+        roll_center_height_front_mm=suspension.roll_center_height_front_mm,
+        roll_center_height_rear_mm=suspension.roll_center_height_rear_mm,
+        roll_camber_front_deg_per_deg=suspension.roll_camber_front_deg_per_deg,
+        roll_camber_rear_deg_per_deg=suspension.roll_camber_rear_deg_per_deg,
+        front_track_mm=suspension.front_track_mm,
+        rear_track_mm=suspension.rear_track_mm,
+    )
+
+
 class TestTrackWidthValidation:
     """NF-40: reject malformed SuspensionConfig with zero/negative tracks."""
 
@@ -497,4 +523,26 @@ class TestTrackWidthValidation:
     ) -> None:
         bad = _replace_tracks(suspension, -10.0, suspension.rear_track_mm)
         with pytest.raises(ValueError):
+            LoadTransferModel(vehicle=vehicle, suspension=bad)
+
+
+class TestRollStiffnessValidation:
+    """Reject malformed SuspensionConfig roll stiffness values."""
+
+    def test_zero_total_roll_stiffness_raises_value_error(
+        self, vehicle: VehicleParams, suspension: SuspensionConfig,
+    ) -> None:
+        bad = _replace_roll_stiffness(suspension, 0.0, 0.0)
+        with pytest.raises(ValueError, match="roll stiffness"):
+            LoadTransferModel(vehicle=vehicle, suspension=bad)
+
+    def test_negative_roll_stiffness_raises_value_error(
+        self, vehicle: VehicleParams, suspension: SuspensionConfig,
+    ) -> None:
+        bad = _replace_roll_stiffness(
+            suspension,
+            -1.0,
+            suspension.roll_stiffness_rear_nm_per_deg,
+        )
+        with pytest.raises(ValueError, match="roll stiffness"):
             LoadTransferModel(vehicle=vehicle, suspension=bad)

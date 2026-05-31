@@ -97,6 +97,18 @@ class LoadTransferModel:
             suspension.roll_stiffness_rear_nm_per_deg * 180.0 / math.pi
         )
         self._k_roll_total: float = self.roll_stiffness_front + self.roll_stiffness_rear
+        if (
+            self.roll_stiffness_front < 0.0
+            or self.roll_stiffness_rear < 0.0
+            or self._k_roll_total <= 0.0
+        ):
+            raise ValueError(
+                "SuspensionConfig roll stiffness values must be non-negative "
+                "and sum to a positive value "
+                f"(front={suspension.roll_stiffness_front_nm_per_deg!r} "
+                f"Nm/deg, rear={suspension.roll_stiffness_rear_nm_per_deg!r} "
+                "Nm/deg)."
+            )
 
         # Roll axis height at CG (linear interpolation along wheelbase)
         # CG position from front axle = (1 - weight_dist_front) * wheelbase
@@ -106,6 +118,72 @@ class LoadTransferModel:
             + (self.rc_rear - self.rc_front) * dist_cg_from_front / vehicle.wheelbase_m
         )
 
+        # Hot-path constants. ``tire_loads`` is called >4M times on a
+        # 22-lap replay, so collapsing the per-call arithmetic to a few
+        # multiplies removes meaningful overhead without touching physics.
+        # Air density is read once (env config is immutable) and the
+        # full coefficient chain for each output term is folded.
+        env = getattr(vehicle, "environment", None)
+        rho = AIR_DENSITY if env is None else env.air_density_kg_m3
+        self._air_density_kg_m3: float = rho
+
+        mass = float(vehicle.mass_kg)
+        mg = mass * GRAVITY
+        self._mg = mg
+        self._mass_kg = mass
+
+        # Static loads — fully constant, never changes during a sim.
+        front_axle = mg * weight_dist_front
+        rear_axle = mg * (1.0 - weight_dist_front)
+        fl_s = fr_s = front_axle / 2.0
+        rl_s = rr_s = rear_axle / 2.0
+        self._static_loads_tuple: tuple[float, float, float, float] = (
+            fl_s, fr_s, rl_s, rr_s,
+        )
+
+        # Aero downforce per axle.
+        # ``delta_axle = 0.5 * rho * cl_a * dist * v²``. Fold the
+        # constants so per-call cost is one multiply + (v*v).
+        half_rho_cla = 0.5 * rho * vehicle.downforce_coefficient
+        self._half_rho_cla = half_rho_cla
+        self._half_rho_cla_front = half_rho_cla * downforce_dist_front
+        self._half_rho_cla_rear = half_rho_cla * (1.0 - downforce_dist_front)
+        # Per-tire (split 50/50 left-right per axle) — used directly by
+        # ``tire_loads`` so we save a divide-by-two per per-tire add.
+        self._half_rho_cla_front_per_tire = self._half_rho_cla_front / 2.0
+        self._half_rho_cla_rear_per_tire = self._half_rho_cla_rear / 2.0
+
+        # Longitudinal transfer: ``delta_long = mass * g * cg_h / wheelbase * accel_g``.
+        # Pre-fold the constant prefix; per-call this is a single multiply.
+        self._long_transfer_coeff = (
+            mg * cg_height_m / vehicle.wheelbase_m
+        )
+        # Halved version (half goes to each tire on an axle).
+        self._long_transfer_coeff_per_tire = self._long_transfer_coeff / 2.0
+
+        # Lateral transfer: geometric + elastic = K_axle × |lateral_g|.
+        mass_front = mass * weight_dist_front
+        mass_rear = mass * (1.0 - weight_dist_front)
+        roll_arm = cg_height_m - self._rc_at_cg
+        roll_moment_per_g = mg * roll_arm  # = mass * g * roll_arm
+
+        geo_front_coeff = mass_front * GRAVITY * self.rc_front / self.front_track
+        geo_rear_coeff = mass_rear * GRAVITY * self.rc_rear / self.rear_track
+        elastic_front_coeff = (
+            roll_moment_per_g
+            * self.roll_stiffness_front
+            / self._k_roll_total
+            / self.front_track
+        )
+        elastic_rear_coeff = (
+            roll_moment_per_g
+            * self.roll_stiffness_rear
+            / self._k_roll_total
+            / self.rear_track
+        )
+        self._lat_transfer_coeff_front = geo_front_coeff + elastic_front_coeff
+        self._lat_transfer_coeff_rear = geo_rear_coeff + elastic_rear_coeff
+
     def static_loads(self) -> tuple[float, float, float, float]:
         """Return static tire loads from weight distribution.
 
@@ -114,22 +192,15 @@ class LoadTransferModel:
         Returns:
             (FL, FR, RL, RR) normal loads in Newtons.
         """
-        weight = self._vehicle.mass_kg * GRAVITY
-        front_axle = weight * self._weight_dist_front
-        rear_axle = weight * (1.0 - self._weight_dist_front)
-        fl = fr = front_axle / 2.0
-        rl = rr = rear_axle / 2.0
-        return (fl, fr, rl, rr)
+        return self._static_loads_tuple
 
     def _air_density(self) -> float:
-        """Air density (kg/m^3) from ``vehicle.environment`` with ISA fallback.
+        """Air density (kg/m^3) cached at construction.
 
-        See :class:`fsae_sim.vehicle.environment.EnvironmentConfig`.
+        Reads ``vehicle.environment`` once on init (frozen dataclass) and
+        falls back to ``physics_constants.AIR_DENSITY`` when absent.
         """
-        env = getattr(self._vehicle, "environment", None)
-        if env is None:
-            return AIR_DENSITY
-        return env.air_density_kg_m3
+        return self._air_density_kg_m3
 
     def aero_loads(self, speed_ms: float) -> tuple[float, float]:
         """Return aerodynamic downforce per axle.
@@ -143,11 +214,11 @@ class LoadTransferModel:
         Returns:
             (delta_front, delta_rear) downforce in Newtons per axle.
         """
-        dynamic_pressure = 0.5 * self._air_density() * speed_ms * speed_ms
-        total_downforce = dynamic_pressure * self._vehicle.downforce_coefficient
-        delta_front = total_downforce * self._downforce_dist_front
-        delta_rear = total_downforce * (1.0 - self._downforce_dist_front)
-        return (delta_front, delta_rear)
+        v_sq = speed_ms * speed_ms
+        return (
+            self._half_rho_cla_front * v_sq,
+            self._half_rho_cla_rear * v_sq,
+        )
 
     def longitudinal_transfer(self, accel_g: float) -> float:
         """Return longitudinal load transfer for a given acceleration.
@@ -162,13 +233,7 @@ class LoadTransferModel:
         Returns:
             Load transfer in Newtons (added to rear axle, subtracted from front).
         """
-        return (
-            self._vehicle.mass_kg
-            * accel_g
-            * GRAVITY
-            * self._cg_height_m
-            / self._vehicle.wheelbase_m
-        )
+        return self._long_transfer_coeff * accel_g
 
     def lateral_transfer(
         self, lateral_g: float, speed_ms: float
@@ -188,30 +253,13 @@ class LoadTransferModel:
             (delta_front, delta_rear) lateral load transfer magnitudes
             in Newtons.
         """
-        abs_lat_g = abs(lateral_g)
+        abs_lat_g = -lateral_g if lateral_g < 0.0 else lateral_g
         if abs_lat_g < 1e-12:
             return (0.0, 0.0)
-
-        mass_front = self._vehicle.mass_kg * self._weight_dist_front
-        mass_rear = self._vehicle.mass_kg * (1.0 - self._weight_dist_front)
-
-        # Geometric (direct) transfer through roll centre
-        geo_front = mass_front * abs_lat_g * GRAVITY * self.rc_front / self.front_track
-        geo_rear = mass_rear * abs_lat_g * GRAVITY * self.rc_rear / self.rear_track
-
-        # Elastic transfer through roll stiffness distribution
-        total_lateral_force = self._vehicle.mass_kg * abs_lat_g * GRAVITY
-        roll_arm = self._cg_height_m - self._rc_at_cg
-        roll_moment = total_lateral_force * roll_arm
-
-        elastic_front = (
-            roll_moment * self.roll_stiffness_front / self._k_roll_total / self.front_track
+        return (
+            self._lat_transfer_coeff_front * abs_lat_g,
+            self._lat_transfer_coeff_rear * abs_lat_g,
         )
-        elastic_rear = (
-            roll_moment * self.roll_stiffness_rear / self._k_roll_total / self.rear_track
-        )
-
-        return (geo_front + elastic_front, geo_rear + elastic_rear)
 
     def tire_loads(
         self,
@@ -237,36 +285,37 @@ class LoadTransferModel:
         Returns:
             (FL, FR, RL, RR) normal loads in Newtons, each >= 0.
         """
-        fl_s, fr_s, rl_s, rr_s = self.static_loads()
+        fl_s, fr_s, rl_s, rr_s = self._static_loads_tuple
 
-        # Aero downforce (split 50/50 left-right per axle)
-        aero_f, aero_r = self.aero_loads(speed_ms)
-        fl = fl_s + aero_f / 2.0
-        fr = fr_s + aero_f / 2.0
-        rl = rl_s + aero_r / 2.0
-        rr = rr_s + aero_r / 2.0
+        # Aero downforce (split 50/50 left-right per axle).
+        v_sq = speed_ms * speed_ms
+        aero_f_per_tire = self._half_rho_cla_front_per_tire * v_sq
+        aero_r_per_tire = self._half_rho_cla_rear_per_tire * v_sq
+        fl = fl_s + aero_f_per_tire
+        fr = fr_s + aero_f_per_tire
+        rl = rl_s + aero_r_per_tire
+        rr = rr_s + aero_r_per_tire
 
-        # Longitudinal transfer (positive = rear gains)
-        delta_long = self.longitudinal_transfer(longitudinal_g)
-        fl -= delta_long / 2.0
-        fr -= delta_long / 2.0
-        rl += delta_long / 2.0
-        rr += delta_long / 2.0
+        # Longitudinal transfer (positive = rear gains).  Per-tire
+        # coefficient already halved at construction.
+        delta_long_per_tire = self._long_transfer_coeff_per_tire * longitudinal_g
+        fl -= delta_long_per_tire
+        fr -= delta_long_per_tire
+        rl += delta_long_per_tire
+        rr += delta_long_per_tire
 
-        # Lateral transfer
-        delta_lat_f, delta_lat_r = self.lateral_transfer(lateral_g, speed_ms)
-        if lateral_g > 0:
-            # Right turn: left tires gain, right tires lose
+        # Lateral transfer.  Inline the abs() / coefficient lookup so
+        # ``lateral_transfer`` only has to be called when an external
+        # caller asks for the per-axle delta.
+        abs_lat_g = -lateral_g if lateral_g < 0.0 else lateral_g
+        if not abs_lat_g < 1e-12:
+            sign_lat = 1.0 if lateral_g > 0.0 else -1.0
+            delta_lat_f = self._lat_transfer_coeff_front * abs_lat_g * sign_lat
+            delta_lat_r = self._lat_transfer_coeff_rear * abs_lat_g * sign_lat
             fl += delta_lat_f
             fr -= delta_lat_f
             rl += delta_lat_r
             rr -= delta_lat_r
-        else:
-            # Left turn: right tires gain, left tires lose
-            fl -= delta_lat_f
-            fr += delta_lat_f
-            rl -= delta_lat_r
-            rr += delta_lat_r
 
         # Clamp to non-negative (tire cannot pull the ground) while
         # preserving vertical equilibrium: any negative portion is

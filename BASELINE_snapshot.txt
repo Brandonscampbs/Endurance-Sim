@@ -1,0 +1,38 @@
+=== calibrated ===
+  segments         : 44286
+  laps_completed   : 22
+  total_time_s     : 1558.084424
+  net_energy_kwh   : 3.150340480
+  discharge_kwh    : 3.150340480
+  regen_kwh        : 0.000000000
+  net_charge_ah    : 7.797536
+  final_soc        : 51.680358
+  envelope_recomp. : 8
+  hash[speed_ms              ] = dacdb6274bc53445
+  hash[soc_pct               ] = c87e6cdb1f13ac94
+  hash[pack_current_a        ] = cd9eba68b7e16c6a
+  hash[motor_torque_nm       ] = 5d1d75ccc7d8299f
+  hash[drive_force_n         ] = c14a071f931ba2f7
+  hash[regen_force_n         ] = accc41dc289330fb
+  hash[brake_force_n         ] = 7a781a96a97558b0
+  hash[resistance_force_n    ] = 1ee60dc661be111f
+  hash[electrical_power_w    ] = 58ede3fc8b8fbd20
+=== replay ===
+  segments         : 44212
+  laps_completed   : 21
+  total_time_s     : 1604.402662
+  net_energy_kwh   : 3.251840076
+  discharge_kwh    : 3.306118686
+  regen_kwh        : 0.054278609
+  net_charge_ah    : 8.092801
+  final_soc        : 50.032697
+  envelope_recomp. : 8
+  hash[speed_ms              ] = f98a28791bf339fc
+  hash[soc_pct               ] = 5cb25d95f2ae53b7
+  hash[pack_current_a        ] = a159385e2ae9ff79
+  hash[motor_torque_nm       ] = 151f8f0366e2b6c7
+  hash[drive_force_n         ] = 8e21dd3c6bda0cd9
+  hash[regen_force_n         ] = ff4f00d24c0794c9
+  hash[brake_force_n         ] = c61035f695dfc383
+  hash[resistance_force_n    ] = da04be8c3697ef60
+  hash[electrical_power_w    ] = 40f1b0ed15b9e4f7

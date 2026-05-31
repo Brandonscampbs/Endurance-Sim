@@ -86,6 +86,23 @@ class VehicleDynamics:
         self._traction_force_cache: dict[int, float] = {}
         self._braking_force_cache: dict[int, float] = {}
 
+        # Hot-path constants. Resolve air density once per construction
+        # rather than per-call (env config is immutable mid-sim), and
+        # pre-fold the dimensional constants used in drag/downforce/grade
+        # so each per-segment call collapses to a couple of multiplies.
+        # This preserves the same formulas, with only floating-point
+        # roundoff-level differences from the changed operation order.
+        env = getattr(vehicle, "environment", None)
+        rho = AIR_DENSITY_KG_M3 if env is None else env.air_density_kg_m3
+        self._air_density_kg_m3: float = rho
+        self._half_rho_cda: float = (
+            0.5 * rho * vehicle.drag_coefficient * vehicle.frontal_area_m2
+        )
+        self._half_rho_cla: float = 0.5 * rho * vehicle.downforce_coefficient
+        self._mass_kg: float = float(vehicle.mass_kg)
+        self._mg: float = self._mass_kg * GRAVITY_M_S2
+        self._rolling_resistance: float = float(vehicle.rolling_resistance)
+
         # Effective mass: bare mass + rotational inertia of spinning components.
         # Use the configured rolling radius so motor RPM, wheel force, and
         # rotational inertia all share one driveline geometry.
@@ -126,45 +143,29 @@ class VehicleDynamics:
     # ------------------------------------------------------------------
 
     def _air_density(self) -> float:
-        """Air density (kg/m^3) from the attached ``EnvironmentConfig``.
+        """Air density (kg/m^3) cached at construction time.
 
-        Falls back to the ``physics_constants.AIR_DENSITY_KG_M3`` ISA
-        constant when ``vehicle.environment`` is not present (legacy
-        constructions that bypassed the dataclass default).
+        Kept for backwards compatibility with tests / external callers
+        that introspect the resolved density. Construction reads the
+        ``EnvironmentConfig`` once (or ``physics_constants.AIR_DENSITY_KG_M3``
+        when absent) so the per-call overhead disappears.
         """
-        env = getattr(self.vehicle, "environment", None)
-        if env is None:
-            return AIR_DENSITY_KG_M3
-        return env.air_density_kg_m3
+        return self._air_density_kg_m3
 
     def drag_force(self, speed_ms: float) -> float:
         """Aerodynamic drag (N).  F = 0.5 * rho * Cd * A * v^2."""
         v = abs(speed_ms)
-        return (
-            0.5
-            * self._air_density()
-            * self.vehicle.drag_coefficient
-            * self.vehicle.frontal_area_m2
-            * v * v
-        )
+        return self._half_rho_cda * v * v
 
     def downforce(self, speed_ms: float) -> float:
         """Aerodynamic downforce (N). F = 0.5 * rho * ClA * v^2."""
         v = abs(speed_ms)
-        return (
-            0.5
-            * self._air_density()
-            * self.vehicle.downforce_coefficient
-            * v * v
-        )
+        return self._half_rho_cla * v * v
 
     def rolling_resistance_force(self, speed_ms: float = 0.0) -> float:
         """Rolling resistance (N).  Increases with downforce."""
-        normal_force = (
-            self.vehicle.mass_kg * GRAVITY_M_S2
-            + self.downforce(speed_ms)
-        )
-        return normal_force * self.vehicle.rolling_resistance
+        normal_force = self._mg + self.downforce(speed_ms)
+        return normal_force * self._rolling_resistance
 
     def grade_force(self, grade: float) -> float:
         """Grade resistance (N).  Positive grade = uphill = positive force opposing motion.
@@ -172,8 +173,7 @@ class VehicleDynamics:
         ``grade`` is rise/run (dimensionless).
         """
         # sin(atan(grade)) for small grades ≈ grade, but exact is better
-        angle = math.atan(grade)
-        return self.vehicle.mass_kg * GRAVITY_M_S2 * math.sin(angle)
+        return self._mg * math.sin(math.atan(grade))
 
     def cornering_drag(self, speed_ms: float, curvature: float) -> float:
         """Drag force (N) from tire slip angles during cornering.
@@ -194,7 +194,7 @@ class VehicleDynamics:
             return 0.0
 
         # Total lateral force needed for the turn
-        f_lat_total = self.vehicle.mass_kg * speed_ms ** 2 * abs(curvature)
+        f_lat_total = self._mass_kg * speed_ms ** 2 * abs(curvature)
 
         if (
             self.tire_model is not None
@@ -224,9 +224,7 @@ class VehicleDynamics:
         """
         mu_peak = 1.5
         alpha_peak = 0.15  # rad, typical FSAE tire
-        c_alpha_total = (
-            self.vehicle.mass_kg * GRAVITY_M_S2 * mu_peak / alpha_peak
-        )
+        c_alpha_total = self._mg * mu_peak / alpha_peak
         return f_lat_total ** 2 / c_alpha_total
 
     def _find_slip_angle(
@@ -505,7 +503,7 @@ class VehicleDynamics:
         if cached is not None:
             return cached
 
-        mg = self.vehicle.mass_kg * GRAVITY_M_S2
+        mg = self._mg
         long_g = 0.3  # initial guess
         for _ in range(8):  # converges in 2-3 iters for physical values
             _, _, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, long_g)
@@ -590,7 +588,7 @@ class VehicleDynamics:
         if cached is not None:
             return cached
 
-        mg = self.vehicle.mass_kg * GRAVITY_M_S2
+        mg = self._mg
         long_g = -1.0  # initial guess (hard braking)
         for _ in range(8):
             fl, fr, rl, rr = self.load_transfer.tire_loads(speed_ms, 0.0, long_g)
