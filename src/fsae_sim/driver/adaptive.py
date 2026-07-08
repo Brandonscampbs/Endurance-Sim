@@ -130,6 +130,11 @@ class AdaptiveDriverParams:
     energy_shaper: EnergyShaper | None = None  # Wave 4b
     energy_budget_kwh: float | None = None  # legacy / helper for ad-hoc setups
     energy_shaper_strategy: str = "FCFB"  # legacy / helper
+    regen_enabled: bool = True
+    """When false, decel commands use friction braking only."""
+
+    friction_brake_enabled: bool = True
+    """When false, decel commands do not request hydraulic brake force."""
 
 
 # ---------------------------------------------------------------------------
@@ -514,8 +519,11 @@ class AdaptiveDriver:
         # Regen ceiling at this rpm — driver can recover up to this
         # without touching mechanical brakes.
         rpm = self._pt.motor_rpm_from_speed(v_op_ms)
-        regen_torque_max = self._pt.max_motor_torque(rpm)
-        f_regen_max = self._pt.wheel_force(regen_torque_max)  # positive
+        if self._params.regen_enabled:
+            regen_torque_max = self._pt.max_motor_torque(rpm)
+            f_regen_max = self._pt.wheel_force(regen_torque_max)  # positive
+        else:
+            f_regen_max = 0.0
 
         f_regen_used = min(f_decel_required_n, max(0.0, f_regen_max))
         f_friction_needed = max(0.0, f_decel_required_n - f_regen_used)
@@ -537,7 +545,9 @@ class AdaptiveDriver:
         if friction_capacity_n <= 0.0:
             friction_capacity_n = peak_brake_force_n
 
-        if friction_capacity_n <= 1e-6:
+        if not self._params.friction_brake_enabled:
+            brake_pct_friction = 0.0
+        elif friction_capacity_n <= 1e-6:
             brake_pct_friction = 0.0
         else:
             brake_pct_friction = min(

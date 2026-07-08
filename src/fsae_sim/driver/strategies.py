@@ -890,6 +890,28 @@ class AdaptiveStrategy(DriverStrategy):
         """Adaptive strategy is PREDICTION-safe: no telemetry caps."""
         return False
 
+    def bind_models(
+        self,
+        dynamics: VehicleDynamics,
+        powertrain: "PowertrainModel",
+    ) -> None:
+        """Use the engine's exact tire/load-transfer/powertrain models.
+
+        ``from_config`` constructs lightweight models so the strategy can
+        be instantiated before the engine exists. The engine later builds
+        the production models with tire, load-transfer, cornering-solver,
+        motor-efficiency, and inverter-delivery maps attached; rebuild the
+        wrapped driver around those so the inverse pedal solve matches the
+        forward simulation.
+        """
+        from fsae_sim.driver.adaptive import AdaptiveDriver
+
+        self._driver = AdaptiveDriver(
+            dynamics=dynamics,
+            powertrain=powertrain,
+            params=self._params,
+        )
+
     def set_envelope(self, v_max: np.ndarray) -> None:
         """Hook called by the engine after :class:`SpeedEnvelope.compute`.
 
@@ -930,3 +952,6 @@ class AdaptiveStrategy(DriverStrategy):
 
     def decide(self, state: SimState, upcoming: list[Segment]) -> ControlCommand:
         return self._driver.decide(state, upcoming)
+
+
+from fsae_sim.driver.ideal import CoastOptimalParams, CoastOptimalStrategy  # noqa: E402

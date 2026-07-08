@@ -4,5 +4,13 @@ from fsae_sim.driver.strategy import (
     DriverStrategy,
     SimState,
 )
+from fsae_sim.driver.ideal import CoastOptimalParams, CoastOptimalStrategy
 
-__all__ = ["ControlAction", "ControlCommand", "DriverStrategy", "SimState"]
+__all__ = [
+    "ControlAction",
+    "ControlCommand",
+    "DriverStrategy",
+    "SimState",
+    "CoastOptimalParams",
+    "CoastOptimalStrategy",
+]

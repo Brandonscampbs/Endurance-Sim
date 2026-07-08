@@ -275,6 +275,10 @@ class SimulationEngine:
                 vehicle.vehicle, powertrain_config=vehicle.powertrain,
             )
 
+        bind_models = getattr(self.strategy, "bind_models", None)
+        if bind_models is not None:
+            bind_models(self.dynamics, self.powertrain)
+
         self._envelope = SpeedEnvelope(self.dynamics, self.powertrain, self.track)
 
     def run(
@@ -596,6 +600,9 @@ class SimulationEngine:
         def _bms_lap_refresh() -> None:
             nonlocal v_max, envelope_recomputes, envelope_recompute_ms_total
             bms_limit_now = self.battery_model.max_discharge_current(temp, soc)
+            set_bms_limit = getattr(self.strategy, "set_bms_limit", None)
+            if set_bms_limit is not None:
+                set_bms_limit(bms_limit_now)
             bms_limit_a_per_lap.append(float(bms_limit_now))
             last_built = self._envelope.last_built_bms_limit_a
             if (
